@@ -51,6 +51,9 @@ pub struct EventsArgs {
     /// Target device short_id for --remote-fetch (e.g., NUVA)
     #[arg(long)]
     pub device: Option<String>,
+    /// Filter by project
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -1302,6 +1305,14 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     // Add user SQL WHERE clause
     if let Some(ref sql) = sql_where {
         filter_query.push_str(&format!(" AND ({sql})"));
+    }
+
+    // Filter by project
+    if let Some(ref project) = args.project {
+        let escaped = project.replace('\'', "''");
+        filter_query.push_str(&format!(
+            " AND instance IN (SELECT name FROM instances WHERE project = '{escaped}')"
+        ));
     }
 
     // Wait mode

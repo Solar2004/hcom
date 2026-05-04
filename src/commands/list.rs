@@ -659,8 +659,6 @@ use crate::tools::args_common::shell_quote;
 /// With a name: shows details for that specific stopped instance.
 /// Uses human-friendly formatting rather than raw JSON for readability.
 fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
-    use rusqlite::params;
-
     let show_all = args.all;
     let last_n: usize = args.last.unwrap_or(20);
     let filter_name = args.name.as_deref();
@@ -668,31 +666,40 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
     let now = crate::shared::time::now_epoch_f64();
 
     let limit = if show_all { 10000 } else { last_n };
+    let project = args.project.as_deref();
 
-    let (query, param) = if let Some(name) = filter_name {
-        let name = crate::instances::resolve_display_name_or_stopped(db, name)
+    let mut sql: String;
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(name) = filter_name {
+        let resolved = crate::instances::resolve_display_name_or_stopped(db, name)
             .unwrap_or_else(|| name.to_string());
-        // Fix: fetch up to 10000 events for named instance (was LIMIT 1)
-        (
-            "SELECT instance, timestamp, data FROM events
-             WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'
-             AND instance = ?
-             ORDER BY id DESC LIMIT 10000"
-                .to_string(),
-            name,
-        )
+        sql = "SELECT instance, timestamp, data FROM events
+               WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'
+               AND instance = ?"
+            .to_string();
+        param_values.push(Box::new(resolved));
+        if let Some(p) = project {
+            sql.push_str(" AND instance IN (SELECT name FROM instances WHERE project = ?)");
+            param_values.push(Box::new(p.to_string()));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT 10000");
     } else {
-        (
-            format!(
-                "SELECT instance, timestamp, data FROM events
-                 WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'
-                 ORDER BY id DESC LIMIT {limit}"
-            ),
-            String::new(),
-        )
-    };
+        sql = format!(
+            "SELECT instance, timestamp, data FROM events
+             WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'"
+        );
+        if let Some(p) = project {
+            sql.push_str(" AND instance IN (SELECT name FROM instances WHERE project = ?)");
+            param_values.push(Box::new(p.to_string()));
+        }
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT {limit}"));
+    }
 
-    let Ok(mut stmt) = db.conn().prepare(&query) else {
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|b| b.as_ref()).collect();
+
+    let Ok(mut stmt) = db.conn().prepare(&sql) else {
         eprintln!("Error: failed to query stopped events");
         return 1;
     };
@@ -711,16 +718,13 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
         })
     };
 
-    let entries: Vec<StoppedEntry> = if filter_name.is_some() {
-        stmt.query_map(params![param], row_mapper)
-    } else {
-        stmt.query_map([], row_mapper)
-    }
-    .ok()
-    .into_iter()
-    .flatten()
-    .filter_map(|r| r.ok())
-    .collect();
+    let entries: Vec<StoppedEntry> = stmt
+        .query_map(param_refs.as_slice(), row_mapper)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.ok())
+        .collect();
 
     if entries.is_empty() {
         if let Some(name) = filter_name {

@@ -1,7 +1,11 @@
 //! `hcom send` command — send messages to hcom instances.
 
+use std::collections::HashMap;
+use std::fs;
 use std::io::{IsTerminal, Read as IoRead};
+use std::path::PathBuf;
 
+use crate::agent_prompts;
 use crate::db::HcomDb;
 use crate::identity;
 use crate::instance_lifecycle;
@@ -408,6 +412,13 @@ pub fn send_message(
 
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
+
+    // Periodic agent prompt reminder — every N messages, re-send the agent prompt
+    if !delivered_to.is_empty() && identity.kind != SenderKind::System {
+        if let Err(e) = check_and_send_reminders(db, &delivered_to) {
+            crate::log::log_error("send", "reminder_failed", &e);
+        }
+    }
 
     Ok(delivered_to)
 }
@@ -1098,6 +1109,77 @@ fn cli_context_build_prefix(
     } else {
         format!("[{prefix} {id_ref}]")
     }
+}
+
+// ── Periodic agent prompt reminder ──────────────────────────────────────
+
+/// Default number of messages between agent prompt reminders.
+const REMIND_INTERVAL: i32 = 10;
+
+/// Path to the reminder state file: ~/.hcom/remind_state.json
+fn get_remind_state_path() -> PathBuf {
+    let hcom_dir = crate::config::Config::get().hcom_dir;
+    hcom_dir.join("remind_state.json")
+}
+
+/// Load the reminder state from disk.
+/// Returns a map of instance_name → messages_since_last_reminder.
+fn load_remind_state(path: &PathBuf) -> HashMap<String, i32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Save the reminder state to disk.
+fn save_remind_state(path: &PathBuf, state: &HashMap<String, i32>) {
+    if let Ok(json) = serde_json::to_string(state) {
+        let _ = fs::write(path, &json);
+    }
+}
+
+/// Send a system reminder message containing the agent prompt to a recipient.
+fn send_reminder_message(db: &HcomDb, recipient: &str, prompt: &str) {
+    let data = serde_json::json!({
+        "from": "hcom-system",
+        "sender_kind": "system",
+        "scope": "mentions",
+        "mentions": [recipient],
+        "text": format!("[SYSTEM PROMPT REMINDER]\n\n{}", prompt),
+        "intent": "inform",
+        "delivered_to": [recipient],
+    });
+
+    if let Err(e) = db.log_event("message", &format!("sys_hcom-system"), &data) {
+        crate::log::log_error("send", "reminder_log_failed", &format!("{e}"));
+    }
+
+    instance_lifecycle::notify_all_instances(db);
+}
+
+/// Check if any delivered-to instance needs a periodic agent prompt reminder.
+/// Every `REMIND_INTERVAL` messages to an instance that has an agent prompt file,
+/// re-send the prompt as an informational message.
+fn check_and_send_reminders(db: &HcomDb, delivered_to: &[String]) -> Result<(), String> {
+    let state_path = get_remind_state_path();
+    let mut state = load_remind_state(&state_path);
+
+    for recipient in delivered_to {
+        if !agent_prompts::get_agent_prompt_path(recipient).exists() {
+            continue;
+        }
+        let counter = state.entry(recipient.clone()).or_insert(0);
+        *counter += 1;
+        if *counter >= REMIND_INTERVAL {
+            *counter = 0;
+            if let Some(prompt) = agent_prompts::load_agent_prompt(recipient) {
+                send_reminder_message(db, recipient, &prompt);
+            }
+        }
+    }
+
+    save_remind_state(&state_path, &state);
+    Ok(())
 }
 
 #[cfg(test)]

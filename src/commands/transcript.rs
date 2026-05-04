@@ -44,6 +44,9 @@ pub struct TranscriptArgs {
     /// Exchange range (flag form)
     #[arg(long = "range")]
     pub range_flag: Option<String>,
+    /// Filter by project
+    #[arg(long)]
+    pub project: Option<String>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -1988,6 +1991,7 @@ fn cmd_transcript_search(
     db: &HcomDb,
     args: &TranscriptSearchArgs,
     ctx: Option<&CommandContext>,
+    project: Option<&str>,
 ) -> i32 {
     let live_mode = args.live;
     let all_mode = args.all;
@@ -2233,33 +2237,41 @@ fn cmd_transcript_search(
         }
         return 0;
     } else {
+        let project_filter = project.map(|p| p.replace('\'', "''"));
+
         // Active instances
-        if let Ok(mut stmt) = db.conn().prepare(
-            "SELECT name, transcript_path, tool FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
-        ) {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            }) {
-                for (name, path, tool) in rows.flatten() {
-                    if let Some(agent) = agent_filter {
-                        if !tool.contains(agent.as_str()) { continue; }
+        {
+            let mut sql = "SELECT name, transcript_path, tool FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''".to_string();
+            if let Some(ref p) = project_filter {
+                sql.push_str(&format!(" AND project = '{p}'"));
+            }
+            if let Ok(mut stmt) = db.conn().prepare(&sql) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                }) {
+                    for (name, path, tool) in rows.flatten() {
+                        if let Some(agent) = agent_filter {
+                            if !tool.contains(agent.as_str()) { continue; }
+                        }
+                        if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
+                        seen.insert(name.clone());
+                        paths.push((name, path, tool));
                     }
-                    if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
-                    seen.insert(name.clone());
-                    paths.push((name, path, tool));
                 }
             }
         }
 
         // Stopped instances from life event snapshots (C2/C3 fix)
         if !live_mode {
-            if let Ok(mut stmt) = db.conn().prepare(
-                "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
-            ) {
+            let mut sql = "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL".to_string();
+            if let Some(ref p) = project_filter {
+                sql.push_str(&format!(" AND instance IN (SELECT name FROM instances WHERE project = '{p}')"));
+            }
+            if let Ok(mut stmt) = db.conn().prepare(&sql) {
                 if let Ok(rows) = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -2404,7 +2416,7 @@ fn cmd_transcript_search(
 }
 
 /// Timeline: `hcom transcript timeline [--last N] [--full] [--json]`
-fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
+fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs, project: Option<&str>) -> i32 {
     let json_mode = args.json;
     let full_mode = args.full;
     let detailed = args.detailed;
@@ -2414,32 +2426,38 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
     let mut all_entries: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
+    let project_filter = project.map(|p| p.replace('\'', "''"));
+
     // Active instances
-    if let Ok(mut stmt) = db.conn().prepare(
-        "SELECT name, transcript_path, tool, session_id FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        }) {
-            for (name, path, tool, sid) in rows.flatten() {
-                seen.insert(name.clone());
-                if let Ok(exchanges) =
-                    get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)
-                {
-                    for ex in exchanges {
-                        all_entries.push(json!({
-                            "instance": name,
-                            "position": ex.position,
-                            "user": ex.user,
-                            "action": if full_mode { ex.action.clone() } else { summarize_action(&ex.action) },
-                            "timestamp": ex.timestamp,
-                            "files": ex.files,
-                        }));
+    {
+        let mut sql = "SELECT name, transcript_path, tool, session_id FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''".to_string();
+        if let Some(ref p) = project_filter {
+            sql.push_str(&format!(" AND project = '{p}'"));
+        }
+        if let Ok(mut stmt) = db.conn().prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            }) {
+                for (name, path, tool, sid) in rows.flatten() {
+                    seen.insert(name.clone());
+                    if let Ok(exchanges) =
+                        get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)
+                    {
+                        for ex in exchanges {
+                            all_entries.push(json!({
+                                "instance": name,
+                                "position": ex.position,
+                                "user": ex.user,
+                                "action": if full_mode { ex.action.clone() } else { summarize_action(&ex.action) },
+                                "timestamp": ex.timestamp,
+                                "files": ex.files,
+                            }));
+                        }
                     }
                 }
             }
@@ -2447,32 +2465,36 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
     }
 
     // Stopped instances from life event snapshots
-    if let Ok(mut stmt) = db.conn().prepare(
-        "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        }) {
-            for (name, path, tool, sid) in rows.flatten() {
-                if seen.contains(&name) { continue; }
-                seen.insert(name.clone());
-                if let Ok(exchanges) =
-                    get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)
-                {
-                    for ex in exchanges {
-                        all_entries.push(json!({
-                            "instance": name,
-                            "position": ex.position,
-                            "user": ex.user,
-                            "action": if full_mode { ex.action.clone() } else { summarize_action(&ex.action) },
-                            "timestamp": ex.timestamp,
-                            "files": ex.files,
-                        }));
+    {
+        let mut sql = "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL".to_string();
+        if let Some(ref p) = project_filter {
+            sql.push_str(&format!(" AND instance IN (SELECT name FROM instances WHERE project = '{p}')"));
+        }
+        if let Ok(mut stmt) = db.conn().prepare(&sql) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            }) {
+                for (name, path, tool, sid) in rows.flatten() {
+                    if seen.contains(&name) { continue; }
+                    seen.insert(name.clone());
+                    if let Ok(exchanges) =
+                        get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)
+                    {
+                        for ex in exchanges {
+                            all_entries.push(json!({
+                                "instance": name,
+                                "position": ex.position,
+                                "user": ex.user,
+                                "action": if full_mode { ex.action.clone() } else { summarize_action(&ex.action) },
+                                "timestamp": ex.timestamp,
+                                "files": ex.files,
+                            }));
+                        }
                     }
                 }
             }
@@ -2575,10 +2597,10 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
     // Handle subcommands
     match &args.subcmd {
         Some(TranscriptSubcmd::Search(search_args)) => {
-            return cmd_transcript_search(db, search_args, ctx);
+            return cmd_transcript_search(db, search_args, ctx, args.project.as_deref());
         }
         Some(TranscriptSubcmd::Timeline(timeline_args)) => {
-            return cmd_transcript_timeline(db, timeline_args);
+            return cmd_transcript_timeline(db, timeline_args, args.project.as_deref());
         }
         None => {}
     }
@@ -2661,6 +2683,22 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         eprintln!("Usage: hcom transcript @instance [N | N-M] [--full] [--json]");
         return 1;
     };
+
+    // Filter by project (view mode)
+    if let Some(ref project) = args.project {
+        let belongs = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM instances WHERE name = ? AND project = ?",
+                rusqlite::params![&instance_name, project],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !belongs {
+            eprintln!("Error: Instance '{instance_name}' is not in project '{project}'");
+            return 1;
+        }
+    }
 
     // Parse range
     let (range_start, range_end) = if let Some(ref r) = range_str {
