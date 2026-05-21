@@ -189,21 +189,11 @@ pub fn add_hook_trust_bypass_if_supported(codex_args: &[String]) -> Vec<String> 
 /// If user also provided developer_instructions, bootstrap comes first,
 /// then separator, then user content.
 ///
-/// Skip for exec/review subcommands (not interactive launch).
 pub fn add_codex_developer_instructions(
     codex_args: &[String],
     bootstrap_text: &str,
 ) -> Vec<String> {
     let spec = resolve_codex_args(Some(codex_args), None);
-
-    // Skip non-interactive modes. Resume/fork need fresh bootstrap because
-    // the canonical instance name changes and stale embedded hcom context can
-    // point the child session at the parent identity.
-    if let Some(ref sub) = spec.subcommand {
-        if matches!(sub.as_str(), "exec" | "e" | "review") {
-            return codex_args.to_vec();
-        }
-    }
 
     // Check if developer_instructions already exists in -c flags
     let mut existing_dev_instructions: Option<String> = None;
@@ -657,13 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_developer_instructions_skip_exec() {
-        let args = s(&["exec", "echo", "hi"]);
-        let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
-        assert_eq!(result, args);
-    }
-
-    #[test]
     fn test_add_developer_instructions_keeps_resume() {
         let args = s(&["resume"]);
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
@@ -719,11 +702,10 @@ mod tests {
     }
 
     #[test]
-    fn test_add_developer_instructions_preserves_subcommand() {
-        let args = s(&["mcp", "-m", "o3"]);
+    fn test_add_developer_instructions_preserves_fork_subcommand() {
+        let args = s(&["fork", "-m", "o3"]);
         let result = add_codex_developer_instructions(&args, "BOOTSTRAP");
-        // mcp subcommand should be first
-        assert_eq!(result[0], "mcp");
+        assert_eq!(result[0], "fork");
         assert_eq!(result[1], "-c");
     }
 

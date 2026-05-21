@@ -52,32 +52,10 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "--exclude-dynamic-system-prompt-sections",
     "--chrome",
     "--no-chrome",
-    "--init",
-    "--init-only",
-    "--maintenance",
-    "--json",
     "-v",
     "--version",
     "-h",
     "--help",
-    "--force",
-    "--claudeai",
-    "--console",
-    "--sso",
-    "--text",
-    "--client-secret",
-    "-a",
-    "--all",
-    "--available",
-    "--dry-run",
-    "-f",
-    "--push",
-    "--keep-data",
-    "--prune",
-    "-y",
-    "--yes",
-    "-i",
-    "--interactive",
 ];
 
 /// Flags with optional values (--resume, --debug, etc.).
@@ -86,7 +64,6 @@ const OPTIONAL_VALUE_FLAGS: &[&str] = &[
     "-r",
     "--debug",
     "-d",
-    "--teleport",
     "--from-pr",
     "-w",
     "--worktree",
@@ -130,34 +107,17 @@ const VALUE_FLAGS: &[&str] = &[
     "--permission-prompt-tool",
     "--plugin-dir",
     "--plugin-url",
-    "--remote",
     "--remote-control-session-name-prefix",
     "--session-id",
     "--setting-sources",
     "--settings",
     "--system-prompt",
     "--system-prompt-file",
-    "--teammate-mode",
-    "--timeout",
     "--tools",
-    "--cwd",
-    "--email",
-    "--callback-port",
-    "--client-id",
-    "-e",
-    "--env",
-    "--header",
-    "-s",
-    "--scope",
-    "-t",
-    "--transport",
-    "-m",
-    "--message",
 ];
 
-/// Case-sensitive value flags. Claude uses `-H` for `--header`; lowercasing it
-/// would collide with `-h` help.
-const CASE_SENSITIVE_VALUE_FLAGS: &[&str] = &["-H"];
+/// Case-sensitive value flags. Claude root help currently has none.
+const CASE_SENSITIVE_VALUE_FLAGS: &[&str] = &[];
 
 /// Normalized representation of Claude CLI arguments.
 #[derive(Debug, Clone)]
@@ -1017,18 +977,6 @@ mod tests {
         );
         assert_eq!(spec.get_flag_value("--tmux"), Some("classic".to_string()));
         assert_eq!(spec.get_flag_value("--name"), Some("demo".to_string()));
-    }
-
-    #[test]
-    fn test_parse_uppercase_header_flag_is_not_help() {
-        let spec = parse_tokens(&["mcp", "add", "-H", "X-Api-Key: secret"], SourceType::Cli);
-
-        assert!(!spec.has_errors(), "{:?}", spec.errors);
-        assert!(!spec.has_flag(&["-h"], &[]));
-        assert_eq!(
-            spec.get_flag_value("-H"),
-            Some("X-Api-Key: secret".to_string())
-        );
     }
 
     #[test]

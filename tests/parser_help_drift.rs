@@ -112,6 +112,19 @@ fn collect_help_pages(tool: &str, style: CommandStyle, max_depth: usize) -> Vec<
     pages
 }
 
+fn collect_help_pages_for_paths(tool: &str, command_paths: &[&[&str]]) -> Vec<HelpPage> {
+    command_paths
+        .iter()
+        .map(|path| {
+            let command_path = path.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let mut args = command_path.clone();
+            args.push("--help".to_string());
+            let text = help(tool, &args);
+            HelpPage { command_path, text }
+        })
+        .collect()
+}
+
 fn option_tokens(page: &HelpPage) -> Vec<HelpOption> {
     let mut options = Vec::new();
 
@@ -438,49 +451,28 @@ fn command_display(tool: &str, command_path: &[String]) -> String {
     }
 }
 
-fn assert_root_commands_match_parser(path: &str, kind: &str, root_help: &str, style: CommandStyle) {
-    let tables = parser_tables(path, kind);
-    let missing = command_tokens(root_help, style)
-        .into_iter()
-        .filter(|command| command != "help" && !tables.subcommands.contains(command))
-        .collect::<Vec<_>>();
-
-    assert!(
-        missing.is_empty(),
-        "{path} parser subcommand table is missing installed {kind} root commands: {missing:?}"
-    );
-}
-
 #[test]
 #[ignore = "manual release drift guard: requires installed upstream CLIs on PATH"]
 fn installed_gemini_help_is_represented_in_parser_tables() {
-    let pages = collect_help_pages("gemini", CommandStyle::Prefixed("gemini"), 2);
+    let pages = collect_help_pages("gemini", CommandStyle::Prefixed("gemini"), 0);
     assert_help_options_match_parser("src/tools/gemini_args.rs", "gemini", &pages);
-    assert_root_commands_match_parser(
-        "src/tools/gemini_args.rs",
-        "gemini",
-        &pages[0].text,
-        CommandStyle::Prefixed("gemini"),
-    );
 }
 
 #[test]
 #[ignore = "manual release drift guard: requires installed upstream CLIs on PATH"]
 fn installed_codex_help_is_represented_in_parser_tables() {
-    let pages = collect_help_pages("codex", CommandStyle::Bare, 2);
-    assert_help_options_match_parser("src/tools/codex_args.rs", "codex", &pages);
-    assert_root_commands_match_parser(
-        "src/tools/codex_args.rs",
+    let mut pages = collect_help_pages("codex", CommandStyle::Bare, 0);
+    pages.extend(collect_help_pages_for_paths(
         "codex",
-        &pages[0].text,
-        CommandStyle::Bare,
-    );
+        &[&["resume"], &["fork"]],
+    ));
+    assert_help_options_match_parser("src/tools/codex_args.rs", "codex", &pages);
 }
 
 #[test]
 #[ignore = "manual release drift guard: requires installed upstream CLIs on PATH"]
 fn installed_claude_help_is_represented_in_parser_tables() {
-    let pages = collect_help_pages("claude", CommandStyle::Bare, 2);
+    let pages = collect_help_pages("claude", CommandStyle::Bare, 0);
     assert_help_options_match_parser("src/hooks/claude_args.rs", "claude", &pages);
 }
 

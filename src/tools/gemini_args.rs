@@ -9,26 +9,6 @@ use super::args_common::{
     shell_split, toggle_flag,
 };
 
-const SUBCOMMANDS: &[&str] = &[
-    "mcp",
-    "extensions",
-    "extension",
-    "hooks",
-    "hook",
-    "skills",
-    "skill",
-    "gemma",
-];
-
-fn subcommand_alias(s: &str) -> &str {
-    match s {
-        "extension" => "extensions",
-        "hook" => "hooks",
-        "skill" => "skills",
-        _ => s,
-    }
-}
-
 fn flag_aliases() -> &'static HashMap<&'static str, &'static str> {
     static ALIASES: OnceLock<HashMap<&str, &str>> = OnceLock::new();
     ALIASES.get_or_init(|| {
@@ -335,17 +315,12 @@ impl GeminiArgsSpec {
         json_output: Option<bool>,
         stream_json: Option<bool>,
         prompt: Option<&str>,
-        subcommand: Option<Option<&str>>,
+        _subcommand: Option<Option<&str>>,
         yolo: Option<bool>,
         approval_mode: Option<&str>,
         include_directories: Option<&[String]>,
     ) -> GeminiArgsSpec {
         let mut tokens = self.clean_tokens.clone();
-        let mut new_subcommand = self.subcommand.clone();
-
-        if let Some(sub_opt) = subcommand {
-            new_subcommand = sub_opt.map(|s| s.to_string());
-        }
 
         if let Some(y) = yolo {
             tokens = toggle_flag(&tokens, "--yolo", y);
@@ -378,13 +353,7 @@ impl GeminiArgsSpec {
             }
         }
 
-        let mut combined = Vec::new();
-        if let Some(ref sub) = new_subcommand {
-            combined.push(sub.clone());
-        }
-        combined.extend(tokens);
-
-        parse_tokens(&combined, self.source)
+        parse_tokens(&tokens, self.source)
     }
 }
 
@@ -416,11 +385,6 @@ pub fn resolve_gemini_args(cli_args: Option<&[String]>, env_value: Option<&str>)
 
 /// Merge env and CLI specs with smart precedence rules.
 pub fn merge_gemini_args(env_spec: &GeminiArgsSpec, cli_spec: &GeminiArgsSpec) -> GeminiArgsSpec {
-    let final_subcommand = cli_spec
-        .subcommand
-        .clone()
-        .or_else(|| env_spec.subcommand.clone());
-
     let final_positionals: Vec<String> = if !cli_spec.positional_tokens.is_empty() {
         if cli_spec.positional_tokens == [""] {
             vec![]
@@ -477,13 +441,7 @@ pub fn merge_gemini_args(env_spec: &GeminiArgsSpec, cli_spec: &GeminiArgsSpec) -
         merged.push(pos.clone());
     }
 
-    let mut combined = Vec::new();
-    if let Some(ref sub) = final_subcommand {
-        combined.push(sub.clone());
-    }
-    combined.extend(merged);
-
-    parse_tokens(&combined, SourceType::Cli)
+    parse_tokens(&merged, SourceType::Cli)
 }
 
 /// Check for conflicting flag combinations.
@@ -564,7 +522,7 @@ fn parse_tokens_with_errors(
     let mut positional_indexes: Vec<usize> = Vec::new();
     let mut flag_values: HashMap<String, FlagValue> = HashMap::new();
 
-    let mut subcommand: Option<String> = None;
+    let subcommand: Option<String> = None;
     let mut is_headless = false;
     let mut is_json = false;
     let mut is_yolo = false;
@@ -575,16 +533,6 @@ fn parse_tokens_with_errors(
     let mut after_double_dash = false;
 
     let mut i: usize = 0;
-
-    // Check for subcommand as first token
-    if !raw_tokens.is_empty() {
-        let first_lower = raw_tokens[0].to_lowercase();
-        if SUBCOMMANDS.contains(&first_lower.as_str()) {
-            let normalized = subcommand_alias(&first_lower);
-            subcommand = Some(normalized.to_string());
-            i = 1;
-        }
-    }
 
     while i < raw_tokens.len() {
         let token = &raw_tokens[i];
@@ -893,27 +841,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_subcommand() {
-        let args = sv(&["mcp", "--model", "gemini-2.0"]);
-        let spec = parse_tokens(&args, SourceType::Cli);
-        assert_eq!(spec.subcommand, Some("mcp".to_string()));
-        assert_eq!(
-            spec.get_flag_value("--model"),
-            Some(FlagValue::Single("gemini-2.0".to_string()))
-        );
-    }
-
-    #[test]
-    fn test_parse_subcommand_alias() {
-        let args = sv(&["extension"]);
-        let spec = parse_tokens(&args, SourceType::Cli);
-        assert_eq!(spec.subcommand, Some("extensions".to_string()));
-    }
-
-    #[test]
     fn test_parse_new_current_value_flags_not_positionals() {
         let args = sv(&[
-            "gemma",
             "--skip-trust",
             "--acp",
             "--policy",
@@ -926,7 +855,7 @@ mod tests {
         ]);
         let spec = parse_tokens(&args, SourceType::Cli);
 
-        assert_eq!(spec.subcommand, Some("gemma".to_string()));
+        assert!(spec.subcommand.is_none());
         assert!(!spec.has_errors(), "{:?}", spec.errors);
         assert!(spec.positional_tokens.is_empty());
         assert!(spec.has_flag(&["--skip-trust"], &[]));
@@ -1119,16 +1048,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_tokens_with_subcommand() {
-        let args = sv(&["mcp", "--model", "gemini-2.0"]);
-        let spec = parse_tokens(&args, SourceType::Cli);
-        let tokens = spec.rebuild_tokens(true, true);
-        assert_eq!(tokens[0], "mcp");
-    }
-
-    #[test]
-    fn test_rebuild_tokens_without_subcommand() {
-        let args = sv(&["mcp", "--model", "gemini-2.0"]);
+    fn test_rebuild_tokens_ignores_subcommand_parameter() {
+        let args = sv(&["--model", "gemini-2.0"]);
         let spec = parse_tokens(&args, SourceType::Cli);
         let tokens = spec.rebuild_tokens(true, false);
         assert_eq!(tokens[0], "--model");
