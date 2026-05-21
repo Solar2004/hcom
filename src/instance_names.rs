@@ -391,10 +391,10 @@ pub fn allocate_subagent_instance(db: &HcomDb, info: &SubagentAllocation) -> Res
 
     let mut max_n: u32 = 0;
     for name in &names {
-        if let Some(suffix) = name.strip_prefix(&pattern) {
-            if let Ok(n) = suffix.parse::<u32>() {
-                max_n = max_n.max(n);
-            }
+        if let Some(suffix) = name.strip_prefix(&pattern)
+            && let Ok(n) = suffix.parse::<u32>()
+        {
+            max_n = max_n.max(n);
         }
     }
 

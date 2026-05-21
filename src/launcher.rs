@@ -237,10 +237,10 @@ fn write_system_prompt_file(system_prompt: &str, tool: &str) -> String {
     let filepath = get_system_prompt_path(tool);
 
     // Only write if content differs
-    if let Ok(existing) = fs::read_to_string(&filepath) {
-        if existing == system_prompt {
-            return filepath.to_string_lossy().to_string();
-        }
+    if let Ok(existing) = fs::read_to_string(&filepath)
+        && existing == system_prompt
+    {
+        return filepath.to_string_lossy().to_string();
     }
 
     if let Err(e) = fs::write(&filepath, system_prompt) {
@@ -464,21 +464,20 @@ pub fn create_runner_script(
     let mut path_dirs: Vec<String> = Vec::new();
 
     // Dev mode: prepend the worktree's Cargo output dir
-    if let Ok(dev_root) = std::env::var("HCOM_DEV_ROOT") {
-        if let Some(bin) = crate::shared::dev_root_binary(Path::new(&dev_root)) {
-            if let Some(dir) = bin.parent() {
-                path_dirs.push(dir.to_string_lossy().into_owned());
-            }
-        }
+    if let Ok(dev_root) = std::env::var("HCOM_DEV_ROOT")
+        && let Some(bin) = crate::shared::dev_root_binary(Path::new(&dev_root))
+        && let Some(dir) = bin.parent()
+    {
+        path_dirs.push(dir.to_string_lossy().into_owned());
     }
 
     for bin_name in &[tool, "hcom", "python3", "node"] {
-        if let Some(bin_path) = terminal::which_bin(bin_name) {
-            if let Some(dir) = Path::new(&bin_path).parent() {
-                let d = dir.to_string_lossy().to_string();
-                if !path_dirs.contains(&d) {
-                    path_dirs.push(d);
-                }
+        if let Some(bin_path) = terminal::which_bin(bin_name)
+            && let Some(dir) = Path::new(&bin_path).parent()
+        {
+            let d = dir.to_string_lossy().to_string();
+            if !path_dirs.contains(&d) {
+                path_dirs.push(d);
             }
         }
     }
@@ -841,11 +840,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     // System prompt file for Gemini/Codex
-    if let Some(ref sp) = params.system_prompt {
-        if normalized == LaunchTool::Gemini {
-            let path = write_system_prompt_file(sp, "gemini");
-            base_env.insert("GEMINI_SYSTEM_MD".to_string(), path);
-        }
+    if let Some(ref sp) = params.system_prompt
+        && normalized == LaunchTool::Gemini
+    {
+        let path = write_system_prompt_file(sp, "gemini");
+        base_env.insert("GEMINI_SYSTEM_MD".to_string(), path);
     }
 
     let working_dir = params.cwd.as_deref().unwrap_or(".");
@@ -954,10 +953,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         };
 
         // Process ID export: allow custom env var name
-        if let Ok(export_var) = std::env::var("HCOM_PROCESS_ID_EXPORT") {
-            if !export_var.is_empty() {
-                instance_env.insert(export_var, process_id.clone());
-            }
+        if let Ok(export_var) = std::env::var("HCOM_PROCESS_ID_EXPORT")
+            && !export_var.is_empty()
+        {
+            instance_env.insert(export_var, process_id.clone());
         }
 
         // Name/process export vars

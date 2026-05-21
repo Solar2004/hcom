@@ -204,12 +204,11 @@ pub(crate) fn parse_claude_jsonl(
                                 });
 
                                 // Extract edit info for Edit tools
-                                if normalized == "Edit" {
-                                    if let Some(edit) =
+                                if normalized == "Edit"
+                                    && let Some(edit) =
                                         extract_edit_info(&tool_use_result, &tool_input)
-                                    {
-                                        current_edits.push(edit);
-                                    }
+                                {
+                                    current_edits.push(edit);
                                 }
 
                                 if is_err {
@@ -296,10 +295,10 @@ pub(crate) fn parse_claude_jsonl(
                                             .to_string()
                                     });
 
-                                if let Some(ref f) = file {
-                                    if !current_files.contains(f) {
-                                        current_files.push(f.clone());
-                                    }
+                                if let Some(ref f) = file
+                                    && !current_files.contains(f)
+                                {
+                                    current_files.push(f.clone());
                                 }
 
                                 // Don't push tool to current_tools here in detailed mode —

@@ -86,16 +86,16 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
                     // Extract file paths from tool args
                     if let Some(obj) = args.as_object() {
                         for field in &["file", "path", "file_path", "directory"] {
-                            if let Some(val) = obj.get(*field).and_then(|v| v.as_str()) {
-                                if !val.is_empty() {
-                                    let fname = Path::new(val)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(val)
-                                        .to_string();
-                                    if !current_files.contains(&fname) {
-                                        current_files.push(fname.clone());
-                                    }
+                            if let Some(val) = obj.get(*field).and_then(|v| v.as_str())
+                                && !val.is_empty()
+                            {
+                                let fname = Path::new(val)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(val)
+                                    .to_string();
+                                if !current_files.contains(&fname) {
+                                    current_files.push(fname.clone());
                                 }
                             }
                         }

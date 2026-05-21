@@ -70,10 +70,10 @@ impl TranscriptWatcher {
         let mut edits_logged = 0;
 
         // Check if file was truncated/replaced
-        if let Ok(metadata) = path.metadata() {
-            if metadata.len() < self.file_pos {
-                self.file_pos = 0;
-            }
+        if let Ok(metadata) = path.metadata()
+            && metadata.len() < self.file_pos
+        {
+            self.file_pos = 0;
         }
 
         // Open and seek to last position

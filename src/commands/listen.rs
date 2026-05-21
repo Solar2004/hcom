@@ -284,16 +284,16 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
     );
 
     // Cleanup: clear cmd:listen detail if still set
-    if let Ok(Some(current)) = db.get_instance_full(&instance_name) {
-        if current.status_detail == "cmd:listen" {
-            set_status(
-                db,
-                &instance_name,
-                ST_LISTENING,
-                "ready",
-                Default::default(),
-            );
-        }
+    if let Ok(Some(current)) = db.get_instance_full(&instance_name)
+        && current.status_detail == "cmd:listen"
+    {
+        set_status(
+            db,
+            &instance_name,
+            ST_LISTENING,
+            "ready",
+            Default::default(),
+        );
     }
 
     // Cleanup notify endpoint
@@ -354,12 +354,12 @@ fn listen_loop(
         let messages = db.get_unread_messages(instance_name);
         if !messages.is_empty() {
             // Advance cursor
-            if let Some(last) = messages.last() {
-                if let Some(id) = last.event_id {
-                    let mut updates = serde_json::Map::new();
-                    updates.insert("last_event_id".into(), serde_json::json!(id));
-                    instances::update_instance_position(db, instance_name, &updates);
-                }
+            if let Some(last) = messages.last()
+                && let Some(id) = last.event_id
+            {
+                let mut updates = serde_json::Map::new();
+                updates.insert("last_event_id".into(), serde_json::json!(id));
+                instances::update_instance_position(db, instance_name, &updates);
             }
 
             // Set status based on tool type
@@ -452,29 +452,29 @@ fn listen_with_filter(
     let recent_query = format!(
         "SELECT id, type, instance, data FROM events_v WHERE timestamp > ? AND ({sql_filter}) ORDER BY id DESC LIMIT 1"
     );
-    if let Ok(mut stmt) = db.conn().prepare(&recent_query) {
-        if let Ok(row) = stmt.query_row(rusqlite::params![lookback_ts], |row| {
+    if let Ok(mut stmt) = db.conn().prepare(&recent_query)
+        && let Ok(row) = stmt.query_row(rusqlite::params![lookback_ts], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
             ))
-        }) {
-            if json_output {
-                let data: serde_json::Value = serde_json::from_str(&row.3).unwrap_or_default();
-                let j = serde_json::json!({
-                    "event_id": row.0,
-                    "type": row.1,
-                    "instance": row.2,
-                    "data": data,
-                });
-                println!("{}", serde_json::to_string(&j).unwrap_or_default());
-            } else {
-                println!("[Match found] #{} {}:{}", row.0, row.1, row.2);
-            }
-            return 0;
+        })
+    {
+        if json_output {
+            let data: serde_json::Value = serde_json::from_str(&row.3).unwrap_or_default();
+            let j = serde_json::json!({
+                "event_id": row.0,
+                "type": row.1,
+                "instance": row.2,
+                "data": data,
+            });
+            println!("{}", serde_json::to_string(&j).unwrap_or_default());
+        } else {
+            println!("[Match found] #{} {}:{}", row.0, row.1, row.2);
         }
+        return 0;
     }
 
     // Create temp subscription — SHA256 over instance+filter+time to avoid collisions
@@ -589,12 +589,12 @@ fn filter_listen_loop(
         let messages = db.get_unread_messages(instance_name);
         if !messages.is_empty() {
             // Advance cursor
-            if let Some(last) = messages.last() {
-                if let Some(id) = last.event_id {
-                    let mut updates = serde_json::Map::new();
-                    updates.insert("last_event_id".into(), serde_json::json!(id));
-                    instances::update_instance_position(db, instance_name, &updates);
-                }
+            if let Some(last) = messages.last()
+                && let Some(id) = last.event_id
+            {
+                let mut updates = serde_json::Map::new();
+                updates.insert("last_event_id".into(), serde_json::json!(id));
+                instances::update_instance_position(db, instance_name, &updates);
             }
 
             // Check for subscription notification

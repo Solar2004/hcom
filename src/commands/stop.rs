@@ -26,12 +26,11 @@ fn resolve_initiator(
     ctx: Option<&CommandContext>,
     explicit_name: Option<&str>,
 ) -> String {
-    if let Some(c) = ctx {
-        if let Some(ref id) = c.identity {
-            if matches!(id.kind, SenderKind::Instance) {
-                return id.name.clone();
-            }
-        }
+    if let Some(c) = ctx
+        && let Some(ref id) = c.identity
+        && matches!(id.kind, SenderKind::Instance)
+    {
+        return id.name.clone();
     }
     if let Some(name) = explicit_name {
         return name.to_string();

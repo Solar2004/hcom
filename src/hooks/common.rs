@@ -641,10 +641,10 @@ pub fn find_last_bind_marker(transcript_path: &str) -> Option<String> {
             // Find closing bracket
             if let Some(end_offset) = buf[idx..].iter().position(|&b| b == b']') {
                 let marker_bytes = &buf[idx..idx + end_offset + 1];
-                if let Ok(marker_str) = std::str::from_utf8(marker_bytes) {
-                    if let Some(caps) = BIND_MARKER_RE.captures(marker_str) {
-                        return Some(caps[1].to_string());
-                    }
+                if let Ok(marker_str) = std::str::from_utf8(marker_bytes)
+                    && let Some(caps) = BIND_MARKER_RE.captures(marker_str)
+                {
+                    return Some(caps[1].to_string());
                 }
             }
         }
@@ -736,19 +736,20 @@ pub fn init_hook_context(
 
     // Path 1: Process binding (hcom-launched instances)
     let process_start = Instant::now();
-    if let Some(ref process_id) = ctx.process_id {
-        if let Ok(Some(name)) = db.get_process_binding(process_id) {
-            instance_name = Some(name);
-        }
+    if let Some(ref process_id) = ctx.process_id
+        && let Ok(Some(name)) = db.get_process_binding(process_id)
+    {
+        instance_name = Some(name);
     }
     let process_ms = process_start.elapsed().as_secs_f64() * 1000.0;
 
     // Path 2: Session binding
     let binding_start = Instant::now();
-    if instance_name.is_none() && !session_id.is_empty() {
-        if let Ok(Some(name)) = db.get_session_binding(session_id) {
-            instance_name = Some(name);
-        }
+    if instance_name.is_none()
+        && !session_id.is_empty()
+        && let Ok(Some(name)) = db.get_session_binding(session_id)
+    {
+        instance_name = Some(name);
     }
     let binding_ms = binding_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -789,15 +790,15 @@ pub fn init_hook_context(
         );
     }
 
-    if ctx.is_background {
-        if let Some(ref bg_name) = ctx.background_name {
-            updates.insert("background".into(), serde_json::json!(true));
-            let log_file = ctx.hcom_dir.join(".tmp").join("logs").join(bg_name);
-            updates.insert(
-                "background_log_file".into(),
-                Value::String(log_file.to_string_lossy().to_string()),
-            );
-        }
+    if ctx.is_background
+        && let Some(ref bg_name) = ctx.background_name
+    {
+        updates.insert("background".into(), serde_json::json!(true));
+        let log_file = ctx.hcom_dir.join(".tmp").join("logs").join(bg_name);
+        updates.insert(
+            "background_log_file".into(),
+            Value::String(log_file.to_string_lossy().to_string()),
+        );
     }
 
     // Check if session matches (resume detection)
@@ -1007,17 +1008,14 @@ fn stop_instance_inner(
                 let kitty_listen_on = ti.kitty_listen_on;
                 let zellij_session_name = ti.zellij_session_name;
                 // Fallback: process_bindings table
-                if proc_id.is_empty() {
-                    if let Ok(mut stmt) = db
+                if proc_id.is_empty()
+                    && let Ok(mut stmt) = db
                         .conn()
                         .prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?")
-                    {
-                        if let Ok(val) =
-                            stmt.query_row(params![instance_name], |row| row.get::<_, String>(0))
-                        {
-                            proc_id = val;
-                        }
-                    }
+                    && let Ok(val) =
+                        stmt.query_row(params![instance_name], |row| row.get::<_, String>(0))
+                {
+                    proc_id = val;
                 }
                 // Grab notify/inject ports before DB cleanup deletes them
                 let mut notify_port: u16 = 0;
@@ -1025,16 +1023,15 @@ fn stop_instance_inner(
                 if let Ok(mut stmt) = db
                     .conn()
                     .prepare("SELECT kind, port FROM notify_endpoints WHERE instance = ?")
-                {
-                    if let Ok(rows) = stmt.query_map(params![instance_name], |row| {
+                    && let Ok(rows) = stmt.query_map(params![instance_name], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    }) {
-                        for row in rows.flatten() {
-                            match row.0.as_str() {
-                                "pty" => notify_port = row.1 as u16,
-                                "inject" => inject_port = row.1 as u16,
-                                _ => {}
-                            }
+                    })
+                {
+                    for row in rows.flatten() {
+                        match row.0.as_str() {
+                            "pty" => notify_port = row.1 as u16,
+                            "inject" => inject_port = row.1 as u16,
+                            _ => {}
                         }
                     }
                 }

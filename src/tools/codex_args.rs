@@ -373,10 +373,10 @@ impl CodexArgsSpec {
 
 /// Resolve Codex args from CLI (highest precedence) or env string.
 pub fn resolve_codex_args(cli_args: Option<&[String]>, env_value: Option<&str>) -> CodexArgsSpec {
-    if let Some(args) = cli_args {
-        if !args.is_empty() {
-            return parse_tokens(args, SourceType::Cli);
-        }
+    if let Some(args) = cli_args
+        && !args.is_empty()
+    {
+        return parse_tokens(args, SourceType::Cli);
     }
 
     if let Some(env_str) = env_value {
@@ -442,16 +442,17 @@ pub fn merge_codex_args(env_spec: &CodexArgsSpec, cli_spec: &CodexArgsSpec) -> C
         if env_pos_set.contains(&i) {
             continue;
         }
-        if let Some(flag_name) = extract_flag_name_from_token(token) {
-            if cli_flag_names.contains(&flag_name) && !lookup.repeatable_set.contains(&flag_name) {
-                if !token.contains('=') && i + 1 < env_spec.clean_tokens.len() {
-                    let next = &env_spec.clean_tokens[i + 1];
-                    if !looks_like_flag(&next.to_lowercase()) {
-                        skip_next = true;
-                    }
+        if let Some(flag_name) = extract_flag_name_from_token(token)
+            && cli_flag_names.contains(&flag_name)
+            && !lookup.repeatable_set.contains(&flag_name)
+        {
+            if !token.contains('=') && i + 1 < env_spec.clean_tokens.len() {
+                let next = &env_spec.clean_tokens[i + 1];
+                if !looks_like_flag(&next.to_lowercase()) {
+                    skip_next = true;
                 }
-                continue;
             }
+            continue;
         }
         merged.push(token.clone());
     }

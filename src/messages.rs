@@ -186,10 +186,11 @@ fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String 
         }
         let target_lower = target.to_lowercase();
         for fn_ in full_names {
-            if let Some((prefix, _device)) = fn_.split_once(':') {
-                if prefix.to_lowercase() == target_lower && seen.insert(fn_.clone()) {
-                    suggestions.push(format!("@{}", fn_));
-                }
+            if let Some((prefix, _device)) = fn_.split_once(':')
+                && prefix.to_lowercase() == target_lower
+                && seen.insert(fn_.clone())
+            {
+                suggestions.push(format!("@{}", fn_));
             }
         }
     }
@@ -582,12 +583,11 @@ pub fn format_hook_messages(
 
     // Per-instance hints from data
     let mut hints = String::new();
-    if let Some(data) = get_instance_data(instance_name) {
-        if let Some(h) = data.get("hints").and_then(|v| v.as_str()) {
-            if !h.is_empty() {
-                hints = h.to_string();
-            }
-        }
+    if let Some(data) = get_instance_data(instance_name)
+        && let Some(h) = data.get("hints").and_then(|v| v.as_str())
+        && !h.is_empty()
+    {
+        hints = h.to_string();
     }
     if hints.is_empty() {
         hints = get_config_hints();
@@ -615,12 +615,10 @@ pub fn format_hook_messages(
             if let Some(intent) = msg.get("intent").and_then(|v| v.as_str()) {
                 let tip_key = format!("recv:intent:{}", intent);
                 let (seen, mark) = tip_fn(instance_name, &tip_key);
-                if !seen {
-                    if let Some(tip_text) = get_tip_text(&tip_key) {
-                        mark();
-                        result = format!("{}\n{}", result, tip_text);
-                        break; // Only show one tip per delivery
-                    }
+                if !seen && let Some(tip_text) = get_tip_text(&tip_key) {
+                    mark();
+                    result = format!("{}\n{}", result, tip_text);
+                    break; // Only show one tip per delivery
                 }
             }
         }
@@ -790,19 +788,18 @@ pub fn compute_read_receipts(
             let inst_data = active_instances.get(inst_name);
 
             // Remote instance: compare msg_ts (timestamp-based)
-            if let Some(data) = inst_data {
-                if data
+            if let Some(data) = inst_data
+                && data
                     .get("origin_device_id")
                     .and_then(|v| v.as_str())
                     .is_some_and(|s| !s.is_empty())
+            {
+                if let Some(ts) = remote_msg_ts.get(inst_name)
+                    && ts >= msg_timestamp
                 {
-                    if let Some(ts) = remote_msg_ts.get(inst_name) {
-                        if ts >= msg_timestamp {
-                            read_by.push(inst_name.clone());
-                        }
-                    }
-                    continue;
+                    read_by.push(inst_name.clone());
                 }
+                continue;
             }
 
             // Local instance: check for deliver event after message
@@ -810,12 +807,12 @@ pub fn compute_read_receipts(
                 // External senders (no session_id, no parent, not remote) only count
                 // as "read" if they were explicitly @mentioned in the message text.
                 // This prevents false-positive read receipts for external watchers.
-                if let Some(data) = inst_data {
-                    if is_external_sender_data(data) {
-                        let inst_tag = data.get("tag").and_then(|v| v.as_str());
-                        if !is_mentioned(msg_text, inst_name, inst_tag) {
-                            continue;
-                        }
+                if let Some(data) = inst_data
+                    && is_external_sender_data(data)
+                {
+                    let inst_tag = data.get("tag").and_then(|v| v.as_str());
+                    if !is_mentioned(msg_text, inst_name, inst_tag) {
+                        continue;
                     }
                 }
                 read_by.push(inst_name.clone());

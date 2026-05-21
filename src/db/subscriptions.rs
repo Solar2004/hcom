@@ -280,10 +280,11 @@ pub(crate) fn get_thread_members(db: &HcomDb, thread: &str) -> Vec<String> {
         let caller = serde_json::from_str::<serde_json::Value>(&value)
             .ok()
             .and_then(|sub| sub.get("caller").and_then(|v| v.as_str()).map(String::from));
-        if let Some(caller) = caller {
-            if active_instances.contains(&caller) && seen.insert(caller.clone()) {
-                members.push(caller);
-            }
+        if let Some(caller) = caller
+            && active_instances.contains(&caller)
+            && seen.insert(caller.clone())
+        {
+            members.push(caller);
         }
     }
     members
@@ -368,10 +369,10 @@ pub(crate) fn process_logged_event(
             }
         }
 
-        if let Some(rid) = reply_to_id {
-            if !msg_sender.is_empty() {
-                cancel_request_watches_by_reply_id(db, msg_sender, rid);
-            }
+        if let Some(rid) = reply_to_id
+            && !msg_sender.is_empty()
+        {
+            cancel_request_watches_by_reply_id(db, msg_sender, rid);
         }
     }
 
@@ -657,14 +658,15 @@ pub(crate) fn cancel_request_watches_by_reply_id(db: &HcomDb, sender: &str, repl
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
 
-        if target == sender && req_id == reply_to_id {
-            if let Err(e) = db.kv_set(key, None) {
-                crate::log::log_error(
-                    "db",
-                    "cancel_request_watches_by_reply.kv_set",
-                    &format!("{e}"),
-                );
-            }
+        if target == sender
+            && req_id == reply_to_id
+            && let Err(e) = db.kv_set(key, None)
+        {
+            crate::log::log_error(
+                "db",
+                "cancel_request_watches_by_reply.kv_set",
+                &format!("{e}"),
+            );
         }
     }
 }
@@ -847,30 +849,30 @@ fn format_sub_notification(
                     .unwrap_or("?")
                     .to_string(),
             );
-            if let Some(ctx) = data.get("context").and_then(|v| v.as_str()) {
-                if !ctx.is_empty() {
-                    parts.push(ctx.to_string());
-                    if let Some(detail) = data.get("detail").and_then(|v| v.as_str()) {
-                        if !detail.is_empty() {
-                            let truncated = if detail.len() > 40 {
-                                if ctx.contains("Bash") {
-                                    let end = (0..=37)
-                                        .rev()
-                                        .find(|&i| detail.is_char_boundary(i))
-                                        .unwrap_or(0);
-                                    format!("{}...", &detail[..end])
-                                } else {
-                                    let start = (detail.len().saturating_sub(37)..=detail.len())
-                                        .find(|&i| detail.is_char_boundary(i))
-                                        .unwrap_or(detail.len());
-                                    format!("...{}", &detail[start..])
-                                }
-                            } else {
-                                detail.to_string()
-                            };
-                            parts.push(truncated);
+            if let Some(ctx) = data.get("context").and_then(|v| v.as_str())
+                && !ctx.is_empty()
+            {
+                parts.push(ctx.to_string());
+                if let Some(detail) = data.get("detail").and_then(|v| v.as_str())
+                    && !detail.is_empty()
+                {
+                    let truncated = if detail.len() > 40 {
+                        if ctx.contains("Bash") {
+                            let end = (0..=37)
+                                .rev()
+                                .find(|&i| detail.is_char_boundary(i))
+                                .unwrap_or(0);
+                            format!("{}...", &detail[..end])
+                        } else {
+                            let start = (detail.len().saturating_sub(37)..=detail.len())
+                                .find(|&i| detail.is_char_boundary(i))
+                                .unwrap_or(detail.len());
+                            format!("...{}", &detail[start..])
                         }
-                    }
+                    } else {
+                        detail.to_string()
+                    };
+                    parts.push(truncated);
                 }
             }
         }
@@ -881,10 +883,10 @@ fn format_sub_notification(
                     .unwrap_or("?")
                     .to_string(),
             );
-            if let Some(by) = data.get("by").and_then(|v| v.as_str()) {
-                if !by.is_empty() {
-                    parts.push(format!("by:{}", by));
-                }
+            if let Some(by) = data.get("by").and_then(|v| v.as_str())
+                && !by.is_empty()
+            {
+                parts.push(format!("by:{}", by));
             }
         }
         _ => {}

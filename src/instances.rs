@@ -86,13 +86,13 @@ pub fn update_instance_position(
 ) {
     let mut update_copy = updates.clone();
     for bool_field in &["tcp_mode", "background", "name_announced"] {
-        if let Some(val) = update_copy.get(*bool_field) {
-            if let Some(b) = val.as_bool() {
-                update_copy.insert(
-                    (*bool_field).to_string(),
-                    serde_json::json!(if b { 1 } else { 0 }),
-                );
-            }
+        if let Some(val) = update_copy.get(*bool_field)
+            && let Some(b) = val.as_bool()
+        {
+            update_copy.insert(
+                (*bool_field).to_string(),
+                serde_json::json!(if b { 1 } else { 0 }),
+            );
         }
     }
 

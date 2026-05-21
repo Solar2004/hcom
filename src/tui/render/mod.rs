@@ -856,14 +856,14 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         RelayHealth::Error { reason, detail, .. } => {
             // Show short detail only for worker-reported errors — StalePidfile
             // and Ghost are operational anomalies the user can't act on inline.
-            if matches!(reason, RelayErrorReason::Reported) {
-                if let Some(err) = detail {
-                    let truncated: String = err.chars().take(20).collect();
-                    right.push(Span::styled(
-                        format!("{} ", truncated),
-                        Style::default().fg(palette::RED),
-                    ));
-                }
+            if matches!(reason, RelayErrorReason::Reported)
+                && let Some(err) = detail
+            {
+                let truncated: String = err.chars().take(20).collect();
+                right.push(Span::styled(
+                    format!("{} ", truncated),
+                    Style::default().fg(palette::RED),
+                ));
             }
             right.push(Span::styled(
                 "\u{21c4}  ",

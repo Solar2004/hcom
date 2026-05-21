@@ -532,13 +532,12 @@ fn run_pty_test(tool: &str) {
                 if line.is_empty() {
                     continue;
                 }
-                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
-                    if ev["type"].as_str() == Some("life")
-                        && ev["data"]["action"].as_str() == Some("ready")
-                        && ev["id"].as_i64().unwrap_or(0) > pre_launch_id
-                    {
-                        return ev["instance"].as_str().map(|s| s.to_string());
-                    }
+                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line)
+                    && ev["type"].as_str() == Some("life")
+                    && ev["data"]["action"].as_str() == Some("ready")
+                    && ev["id"].as_i64().unwrap_or(0) > pre_launch_id
+                {
+                    return ev["instance"].as_str().map(|s| s.to_string());
                 }
             }
             None
@@ -928,13 +927,12 @@ fn run_pty_test_opencode() {
                 if line.is_empty() {
                     continue;
                 }
-                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
-                    if ev["type"].as_str() == Some("life")
-                        && ev["data"]["action"].as_str() == Some("ready")
-                        && ev["id"].as_i64().unwrap_or(0) > pre_launch_id
-                    {
-                        return ev["instance"].as_str().map(|s| s.to_string());
-                    }
+                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line)
+                    && ev["type"].as_str() == Some("life")
+                    && ev["data"]["action"].as_str() == Some("ready")
+                    && ev["id"].as_i64().unwrap_or(0) > pre_launch_id
+                {
+                    return ev["instance"].as_str().map(|s| s.to_string());
                 }
             }
             None

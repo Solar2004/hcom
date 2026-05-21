@@ -209,12 +209,12 @@ pub fn maybe_deliver_pending_messages(
     }
 
     // Advance cursor — update last_event_id on the instance
-    if let Some(last) = messages.last() {
-        if let Some(id) = last.event_id {
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(id));
-            instances::update_instance_position(db, &identity.name, &updates);
-        }
+    if let Some(last) = messages.last()
+        && let Some(id) = last.event_id
+    {
+        let mut updates = serde_json::Map::new();
+        updates.insert("last_event_id".into(), serde_json::json!(id));
+        instances::update_instance_position(db, &identity.name, &updates);
     }
 
     // Format with divider

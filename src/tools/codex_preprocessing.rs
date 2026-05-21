@@ -111,7 +111,7 @@ fn parse_codex_cli_version(output: &str) -> Option<(u64, u64, u64)> {
             let patch = parts.next()?.parse().ok()?;
             Some((major, minor, patch))
         })
-        .last()
+        .next_back()
 }
 
 fn codex_supports_bypass_hook_trust() -> bool {

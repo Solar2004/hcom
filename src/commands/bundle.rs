@@ -168,8 +168,8 @@ pub struct BundleCreateArgs {
 /// Returns bundle data with `event_id` and `timestamp` injected.
 fn get_bundle_by_id(db: &HcomDb, id_or_prefix: &str) -> Option<Value> {
     // Try numeric event ID first
-    if let Ok(event_id) = id_or_prefix.parse::<i64>() {
-        if let Ok(row) = db.conn().query_row(
+    if let Ok(event_id) = id_or_prefix.parse::<i64>()
+        && let Ok(row) = db.conn().query_row(
             "SELECT id, timestamp, data FROM events WHERE id = ? AND type = 'bundle'",
             rusqlite::params![event_id],
             |row| {
@@ -178,15 +178,14 @@ fn get_bundle_by_id(db: &HcomDb, id_or_prefix: &str) -> Option<Value> {
                 let data_str: String = row.get(2)?;
                 Ok((id, ts, data_str))
             },
-        ) {
-            if let Ok(mut data) = serde_json::from_str::<Value>(&row.2) {
-                if let Some(obj) = data.as_object_mut() {
-                    obj.insert("event_id".into(), json!(row.0));
-                    obj.insert("timestamp".into(), json!(row.1));
-                }
-                return Some(data);
-            }
+        )
+        && let Ok(mut data) = serde_json::from_str::<Value>(&row.2)
+    {
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("event_id".into(), json!(row.0));
+            obj.insert("timestamp".into(), json!(row.1));
         }
+        return Some(data);
     }
 
     // Try bundle_id prefix match
@@ -783,35 +782,35 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
     let mut transcript_text: Option<String> = None;
     let mut transcript_range: Option<String> = None;
 
-    if let Some(ref tpath) = transcript_path {
-        if Path::new(tpath).exists() {
-            let tq = TranscriptQuery {
-                path: tpath,
-                agent: &tool,
-                last: last_transcript,
-                detailed: false,
-                session_id: bundle_session_id.as_deref(),
-            };
-            match get_exchanges_pub(&tq) {
-                Ok(exchanges) if !exchanges.is_empty() => {
-                    let first_pos = exchanges
-                        .first()
-                        .and_then(|e| e.get("position").and_then(|v| v.as_u64()))
-                        .unwrap_or(1);
-                    let last_pos = exchanges
-                        .last()
-                        .and_then(|e| e.get("position").and_then(|v| v.as_u64()))
-                        .unwrap_or(first_pos);
-                    transcript_range = Some(format!("{first_pos}-{last_pos}"));
+    if let Some(ref tpath) = transcript_path
+        && Path::new(tpath).exists()
+    {
+        let tq = TranscriptQuery {
+            path: tpath,
+            agent: &tool,
+            last: last_transcript,
+            detailed: false,
+            session_id: bundle_session_id.as_deref(),
+        };
+        match get_exchanges_pub(&tq) {
+            Ok(exchanges) if !exchanges.is_empty() => {
+                let first_pos = exchanges
+                    .first()
+                    .and_then(|e| e.get("position").and_then(|v| v.as_u64()))
+                    .unwrap_or(1);
+                let last_pos = exchanges
+                    .last()
+                    .and_then(|e| e.get("position").and_then(|v| v.as_u64()))
+                    .unwrap_or(first_pos);
+                transcript_range = Some(format!("{first_pos}-{last_pos}"));
 
-                    match format_exchanges_pub(&tq, &agent, false) {
-                        Ok(text) => transcript_text = Some(text),
-                        Err(e) => transcript_text = Some(format!("Error reading transcript: {e}")),
-                    }
+                match format_exchanges_pub(&tq, &agent, false) {
+                    Ok(text) => transcript_text = Some(text),
+                    Err(e) => transcript_text = Some(format!("Error reading transcript: {e}")),
                 }
-                Err(e) => transcript_text = Some(format!("Error reading transcript: {e}")),
-                _ => {}
             }
+            Err(e) => transcript_text = Some(format!("Error reading transcript: {e}")),
+            _ => {}
         }
     }
 
@@ -878,18 +877,17 @@ fn cmd_bundle_prepare(db: &HcomDb, args: &BundlePrepareArgs, ctx: Option<&Comman
                 let data: Value = serde_json::from_str(data_str).unwrap_or(json!({}));
 
                 // Extract file paths from status events ("/" in path or common extensions)
-                if let Some(detail) = data.get("detail").and_then(|v| v.as_str()) {
-                    if detail.starts_with('/')
+                if let Some(detail) = data.get("detail").and_then(|v| v.as_str())
+                    && (detail.starts_with('/')
                         || detail.contains("/")
                         || detail.ends_with(".py")
                         || detail.ends_with(".ts")
                         || detail.ends_with(".js")
                         || detail.ends_with(".md")
                         || detail.ends_with(".json")
-                        || detail.ends_with(".rs")
-                    {
-                        all_files.push(detail.to_string());
-                    }
+                        || detail.ends_with(".rs"))
+                {
+                    all_files.push(detail.to_string());
                 }
             }
         }
@@ -1250,24 +1248,24 @@ fn query_bundle_event_categories(db: &HcomDb, agent: &str, last_events: usize) -
     for (label, query, params) in &categories {
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let mut events = Vec::new();
-        if let Ok(mut stmt) = db.conn().prepare(query) {
-            if let Ok(rows) = stmt.query_map(param_refs.as_slice(), |row| {
+        if let Ok(mut stmt) = db.conn().prepare(query)
+            && let Ok(rows) = stmt.query_map(param_refs.as_slice(), |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                 ))
-            }) {
-                for (id, ts, inst, data_str) in rows.flatten() {
-                    let data: Value = serde_json::from_str(&data_str).unwrap_or(json!({}));
-                    events.push(json!({
-                        "id": id,
-                        "timestamp": ts,
-                        "instance": inst,
-                        "data": data,
-                    }));
-                }
+            })
+        {
+            for (id, ts, inst, data_str) in rows.flatten() {
+                let data: Value = serde_json::from_str(&data_str).unwrap_or(json!({}));
+                events.push(json!({
+                    "id": id,
+                    "timestamp": ts,
+                    "instance": inst,
+                    "data": data,
+                }));
             }
         }
         result.insert(label.to_string(), json!(events));

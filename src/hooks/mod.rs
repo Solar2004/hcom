@@ -138,10 +138,10 @@ impl HookPayload {
     /// Extract an optional string from the first matching key.
     fn opt_str_field(raw: &Value, keys: &[&str]) -> Option<String> {
         for key in keys {
-            if let Some(s) = raw.get(*key).and_then(|v| v.as_str()) {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
+            if let Some(s) = raw.get(*key).and_then(|v| v.as_str())
+                && !s.is_empty()
+            {
+                return Some(s.to_string());
             }
         }
         None

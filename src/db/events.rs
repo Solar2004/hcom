@@ -225,10 +225,10 @@ impl HcomDb {
         self.log_event_with_ts("life", name, &event_data, None)?;
 
         // Check batch completion and send launcher notification
-        if launcher != "unknown" {
-            if let Some(ref bid) = batch_id {
-                self.check_batch_completion(&launcher, bid)?;
-            }
+        if launcher != "unknown"
+            && let Some(ref bid) = batch_id
+        {
+            self.check_batch_completion(&launcher, bid)?;
         }
 
         Ok(())

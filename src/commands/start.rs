@@ -83,30 +83,28 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     // BLOCK DURING ACTIVE TASKS: prevents subagents from corrupting parent/sibling instances.
     // When a subagent runs --as or bare start, process_id resolves to the parent which has
     // running_tasks.active=True. Only --name <agent_id> (explicit initiator) bypasses this gate.
-    if rebind_target.is_some() || orphan_target.is_some() || instance_name.is_none() {
-        if let Ok(ident) =
+    if (rebind_target.is_some() || orphan_target.is_some() || instance_name.is_none())
+        && let Ok(ident) =
             identity::resolve_identity(&db, None, None, None, ctx.process_id.as_deref(), None, None)
-        {
-            if let Some(inst_data) = &ident.instance_data {
-                let rt_str = inst_data
-                    .get("running_tasks")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let rt = instances::parse_running_tasks(Some(rt_str));
-                if rt.active {
-                    if rebind_target.is_some() {
-                        println!("[HCOM] Cannot use --as while Tasks are running.");
-                    } else if orphan_target.is_some() {
-                        println!("[HCOM] Cannot use --orphan while Tasks are running.");
-                    } else {
-                        println!(
-                            "[HCOM] Cannot run 'hcom start' from within a Task subagent.\n\
+        && let Some(inst_data) = &ident.instance_data
+    {
+        let rt_str = inst_data
+            .get("running_tasks")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let rt = instances::parse_running_tasks(Some(rt_str));
+        if rt.active {
+            if rebind_target.is_some() {
+                println!("[HCOM] Cannot use --as while Tasks are running.");
+            } else if orphan_target.is_some() {
+                println!("[HCOM] Cannot use --orphan while Tasks are running.");
+            } else {
+                println!(
+                    "[HCOM] Cannot run 'hcom start' from within a Task subagent.\n\
                              Subagents must use: hcom start --name <your-agent-id>"
-                        );
-                    }
-                    return Ok(1);
-                }
+                );
             }
+            return Ok(1);
         }
     }
 
@@ -430,15 +428,16 @@ fn start_rebind(
 
     // Resolve session_id from process binding or existing instance
     let mut session_id: Option<String> = None;
-    if let Some(ref process_id) = ctx.process_id {
-        if let Ok(Some((sid, _))) = db.get_process_binding_full(process_id) {
-            session_id = sid.filter(|s| !s.is_empty());
-        }
+    if let Some(ref process_id) = ctx.process_id
+        && let Ok(Some((sid, _))) = db.get_process_binding_full(process_id)
+    {
+        session_id = sid.filter(|s| !s.is_empty());
     }
-    if session_id.is_none() && !current_name.is_empty() {
-        if let Ok(Some(current_data)) = db.get_instance_full(current_name) {
-            session_id = current_data.session_id.filter(|s| !s.is_empty());
-        }
+    if session_id.is_none()
+        && !current_name.is_empty()
+        && let Ok(Some(current_data)) = db.get_instance_full(current_name)
+    {
+        session_id = current_data.session_id.filter(|s| !s.is_empty());
     }
 
     let target_meta = load_rebind_target_metadata(db, &target_name).ok();
@@ -456,12 +455,11 @@ fn start_rebind(
     }
 
     // Skip delete for remote instances (origin_device_id)
-    if let Some(ref td) = target_data {
-        if td.origin_device_id.is_none() || td.origin_device_id.as_deref() == Some("") {
-            if let Err(e) = db.delete_instance(&target_name) {
-                eprintln!("[hcom] warn: delete_instance failed for {target_name}: {e}");
-            }
-        }
+    if let Some(ref td) = target_data
+        && (td.origin_device_id.is_none() || td.origin_device_id.as_deref() == Some(""))
+        && let Err(e) = db.delete_instance(&target_name)
+    {
+        eprintln!("[hcom] warn: delete_instance failed for {target_name}: {e}");
     }
 
     // Clean up target's bindings
@@ -473,10 +471,11 @@ fn start_rebind(
     }
 
     // Delete old identity if different from target
-    if !current_name.is_empty() && current_name != target_name {
-        if let Err(e) = db.delete_instance(current_name) {
-            eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
-        }
+    if !current_name.is_empty()
+        && current_name != target_name
+        && let Err(e) = db.delete_instance(current_name)
+    {
+        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
     }
 
     // Create fresh instance with the target name
@@ -512,10 +511,10 @@ fn start_rebind(
     }
 
     // Create bindings
-    if let Some(ref sid) = session_id {
-        if let Err(e) = db.set_session_binding(sid, &target_name) {
-            eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
-        }
+    if let Some(ref sid) = session_id
+        && let Err(e) = db.set_session_binding(sid, &target_name)
+    {
+        eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
     }
     if let Some(ref process_id) = ctx.process_id {
         let sid = session_id.as_deref().unwrap_or("");
@@ -524,10 +523,11 @@ fn start_rebind(
         }
 
         // Migrate notify endpoints before notify so wake reaches correct port
-        if !current_name.is_empty() && current_name != target_name {
-            if let Err(e) = db.migrate_notify_endpoints(current_name, &target_name) {
-                eprintln!("[hcom] warn: migrate_notify_endpoints failed: {e}");
-            }
+        if !current_name.is_empty()
+            && current_name != target_name
+            && let Err(e) = db.migrate_notify_endpoints(current_name, &target_name)
+        {
+            eprintln!("[hcom] warn: migrate_notify_endpoints failed: {e}");
         }
 
         crate::notify::wake(db, &target_name, crate::notify::WakeKind::DELIVERY_LOOPS);
@@ -626,27 +626,26 @@ fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMe
         .collect();
 
     for data_str in &rows {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
-            if data.get("action").and_then(|v| v.as_str()) == Some("stopped") {
-                if let Some(snapshot) = data.get("snapshot") {
-                    return Ok(RebindTargetMetadata {
-                        tool: snapshot
-                            .get("tool")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        directory: snapshot
-                            .get("directory")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        last_event_id: snapshot
-                            .get("last_event_id")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0),
-                    });
-                }
-            }
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
+            && data.get("action").and_then(|v| v.as_str()) == Some("stopped")
+            && let Some(snapshot) = data.get("snapshot")
+        {
+            return Ok(RebindTargetMetadata {
+                tool: snapshot
+                    .get("tool")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                directory: snapshot
+                    .get("directory")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                last_event_id: snapshot
+                    .get("last_event_id")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+            });
         }
     }
 
@@ -670,46 +669,44 @@ fn start_bare(
         .is_some();
 
     // Vanilla tool detection: auto-install hooks for unmanaged AI tools
-    if !has_valid_identity {
-        if let Some(vanilla_tool) = ctx.detect_vanilla_tool() {
-            // Auto-install hooks if missing
-            let hooks_installed = match vanilla_tool {
-                "claude" => crate::hooks::claude::verify_claude_hooks_installed(None, false),
-                "gemini" => crate::hooks::gemini::verify_gemini_hooks_installed(false),
-                "codex" => {
-                    crate::hooks::codex::verify_codex_hooks_installed(false)
-                        && crate::hooks::codex::codex_current_feature_enabled()
-                }
-                _ => true,
+    if !has_valid_identity && let Some(vanilla_tool) = ctx.detect_vanilla_tool() {
+        // Auto-install hooks if missing
+        let hooks_installed = match vanilla_tool {
+            "claude" => crate::hooks::claude::verify_claude_hooks_installed(None, false),
+            "gemini" => crate::hooks::gemini::verify_gemini_hooks_installed(false),
+            "codex" => {
+                crate::hooks::codex::verify_codex_hooks_installed(false)
+                    && crate::hooks::codex::codex_current_feature_enabled()
+            }
+            _ => true,
+        };
+        if !hooks_installed {
+            let tool_display = match vanilla_tool {
+                "claude" => "Claude Code",
+                "gemini" => "Gemini CLI",
+                "codex" => "Codex",
+                _ => vanilla_tool,
             };
-            if !hooks_installed {
-                let tool_display = match vanilla_tool {
-                    "claude" => "Claude Code",
-                    "gemini" => "Gemini CLI",
-                    "codex" => "Codex",
-                    _ => vanilla_tool,
-                };
-                println!("Installing {} hooks...", vanilla_tool);
-                let include_perms = crate::config::load_config_snapshot().core.auto_approve;
-                let ok = match vanilla_tool {
-                    "claude" => crate::hooks::claude::setup_claude_hooks(include_perms),
-                    "gemini" => crate::hooks::gemini::setup_gemini_hooks(include_perms),
-                    "codex" => crate::hooks::codex::setup_codex_hooks(include_perms),
-                    _ => false,
-                };
-                if ok {
-                    println!("\nRestart {tool_display} to enable automatic message delivery.");
-                    println!("Then run: hcom start");
-                } else {
-                    eprintln!("Failed to install hooks. Run: hcom hooks add {vanilla_tool}");
-                }
-                return Ok(1);
+            println!("Installing {} hooks...", vanilla_tool);
+            let include_perms = crate::config::load_config_snapshot().core.auto_approve;
+            let ok = match vanilla_tool {
+                "claude" => crate::hooks::claude::setup_claude_hooks(include_perms),
+                "gemini" => crate::hooks::gemini::setup_gemini_hooks(include_perms),
+                "codex" => crate::hooks::codex::setup_codex_hooks(include_perms),
+                _ => false,
+            };
+            if ok {
+                println!("\nRestart {tool_display} to enable automatic message delivery.");
+                println!("Then run: hcom start");
+            } else {
+                eprintln!("Failed to install hooks. Run: hcom hooks add {vanilla_tool}");
             }
+            return Ok(1);
+        }
 
-            // Gemini: ensure hooksConfig.enabled is set (self-heal for v0.26.0+)
-            if vanilla_tool == "gemini" {
-                let _ = crate::hooks::gemini::ensure_hooks_enabled();
-            }
+        // Gemini: ensure hooksConfig.enabled is set (self-heal for v0.26.0+)
+        if vanilla_tool == "gemini" {
+            let _ = crate::hooks::gemini::ensure_hooks_enabled();
         }
     }
 
@@ -724,23 +721,20 @@ fn start_bare(
 
     // Remote instances are relay mirrors. Starting them remotely is intentionally
     // unsupported because the useful remote lifecycle operations are launch/resume/kill.
-    if let Ok(Some(ref existing)) = db.get_instance_full(&name) {
-        if crate::instances::is_remote_instance(existing) {
-            bail!(
-                "Remote start is not supported for '{name}'. Start it on the owning device instead."
-            );
-        }
+    if let Ok(Some(ref existing)) = db.get_instance_full(&name)
+        && crate::instances::is_remote_instance(existing)
+    {
+        bail!("Remote start is not supported for '{name}'. Start it on the owning device instead.");
     }
 
     // Check if already exists and active (only for explicit names —
     // generate_unique_name creates a placeholder row we must skip past)
-    if explicit_name.is_some() {
-        if let Ok(Some(existing)) = db.get_instance_full(&name) {
-            if existing.status != "stopped" {
-                println!("hcom already started for {}", name);
-                return Ok(0);
-            }
-        }
+    if explicit_name.is_some()
+        && let Ok(Some(existing)) = db.get_instance_full(&name)
+        && existing.status != "stopped"
+    {
+        println!("hcom already started for {}", name);
+        return Ok(0);
     }
 
     instance_binding::initialize_instance_in_position_file(
@@ -761,10 +755,10 @@ fn start_bare(
     );
 
     // Bind process if we have a process_id
-    if let Some(ref process_id) = ctx.process_id {
-        if let Err(e) = db.set_process_binding(process_id, "", &name) {
-            eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
-        }
+    if let Some(ref process_id) = ctx.process_id
+        && let Err(e) = db.set_process_binding(process_id, "", &name)
+    {
+        eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
 
     // Print bootstrap

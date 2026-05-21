@@ -133,10 +133,10 @@ pub fn resolve_display_name(db: &HcomDb, input_name: &str) -> Option<String> {
         if name.is_empty() {
             continue;
         }
-        if let Ok(Some(data)) = db.get_instance_full(name) {
-            if data.tag.as_deref() == Some(tag) {
-                return Some(name.to_string());
-            }
+        if let Ok(Some(data)) = db.get_instance_full(name)
+            && data.tag.as_deref() == Some(tag)
+        {
+            return Some(name.to_string());
         }
     }
     None
@@ -231,27 +231,27 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     }
 
     // 2. Agent ID lookup (Claude Code sends short IDs like 'a6d9caf')
-    if let Ok(Some(instance_name)) = db.get_instance_by_agent_id(&resolved_name) {
-        if let Ok(Some(data)) = db.get_instance(&instance_name) {
-            crate::log::log_info(
-                "identity",
-                "resolve_from_name",
-                &format!(
-                    "name={}, method=agent_id, resolved={}",
-                    resolved_name, instance_name
-                ),
-            );
-            return Ok(SenderIdentity {
-                kind: SenderKind::Instance,
-                name: instance_name,
-                session_id: data
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()),
-                instance_data: Some(data),
-            });
-        }
+    if let Ok(Some(instance_name)) = db.get_instance_by_agent_id(&resolved_name)
+        && let Ok(Some(data)) = db.get_instance(&instance_name)
+    {
+        crate::log::log_info(
+            "identity",
+            "resolve_from_name",
+            &format!(
+                "name={}, method=agent_id, resolved={}",
+                resolved_name, instance_name
+            ),
+        );
+        return Ok(SenderIdentity {
+            kind: SenderKind::Instance,
+            name: instance_name,
+            session_id: data
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string()),
+            instance_data: Some(data),
+        });
     }
 
     // 3. Not found
@@ -308,159 +308,155 @@ fn resolve_identity_with_expectation(
     }
 
     // 2. Explicit session_id (internal use)
-    if let Some(sid) = session_id {
-        if !sid.is_empty() {
-            let resolved_name = db
-                .get_session_binding(sid)
-                .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    if let Some(sid) = session_id
+        && !sid.is_empty()
+    {
+        let resolved_name = db
+            .get_session_binding(sid)
+            .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
 
-            match resolved_name {
-                Some(inst_name) => {
-                    let data = db
-                        .get_instance(&inst_name)
-                        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+        match resolved_name {
+            Some(inst_name) => {
+                let data = db
+                    .get_instance(&inst_name)
+                    .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
 
-                    match data {
-                        Some(d) => {
-                            crate::log::log_info(
-                                "identity",
-                                "resolve",
-                                &format!("method=session_id, name={}", inst_name),
-                            );
-                            return Ok(SenderIdentity {
-                                kind: SenderKind::Instance,
-                                name: inst_name,
-                                session_id: Some(sid.to_string()),
-                                instance_data: Some(d),
-                            });
-                        }
-                        None => {
-                            return Err(HcomError::NotFound(
-                                "Instance not found for session_id".to_string(),
-                            ));
-                        }
+                match data {
+                    Some(d) => {
+                        crate::log::log_info(
+                            "identity",
+                            "resolve",
+                            &format!("method=session_id, name={}", inst_name),
+                        );
+                        return Ok(SenderIdentity {
+                            kind: SenderKind::Instance,
+                            name: inst_name,
+                            session_id: Some(sid.to_string()),
+                            instance_data: Some(d),
+                        });
+                    }
+                    None => {
+                        return Err(HcomError::NotFound(
+                            "Instance not found for session_id".to_string(),
+                        ));
                     }
                 }
-                None => {
-                    crate::log::log_warn(
-                        "identity",
-                        "resolve.session_id_not_found",
-                        &format!("session_id={}", &sid[..sid.len().min(8)]),
-                    );
-                    return Err(HcomError::NotFound(
-                        "Instance not found for session_id".to_string(),
-                    ));
-                }
+            }
+            None => {
+                crate::log::log_warn(
+                    "identity",
+                    "resolve.session_id_not_found",
+                    &format!("session_id={}", &sid[..sid.len().min(8)]),
+                );
+                return Err(HcomError::NotFound(
+                    "Instance not found for session_id".to_string(),
+                ));
             }
         }
     }
 
     // 3. Strict instance lookup (--name NAME)
-    if let Some(n) = name {
-        if !n.is_empty() {
-            return resolve_from_name(db, n);
-        }
+    if let Some(n) = name
+        && !n.is_empty()
+    {
+        return resolve_from_name(db, n);
     }
 
     // 4. Auto-detect from process binding (hcom-launched instances)
-    if let Some(pid) = process_id {
-        if !pid.is_empty() {
-            let bound_name = db
-                .get_process_binding(pid)
-                .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+    if let Some(pid) = process_id
+        && !pid.is_empty()
+    {
+        let bound_name = db
+            .get_process_binding(pid)
+            .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
 
-            match bound_name {
-                Some(inst_name) => {
-                    let data = db
-                        .get_instance(&inst_name)
-                        .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
+        match bound_name {
+            Some(inst_name) => {
+                let data = db
+                    .get_instance(&inst_name)
+                    .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
 
-                    match data {
-                        Some(d) => {
-                            let has_session = d
-                                .get("session_id")
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|s| !s.is_empty());
+                match data {
+                    Some(d) => {
+                        let has_session = d
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.is_empty());
 
-                            // Opportunistic Codex session binding for command-time recovery.
-                            // Native SessionStart is the primary binding path; this keeps
-                            // resume/orphan flows tolerant if a command arrives first.
-                            // Uses bind_session_to_process for proper resume/placeholder handling.
-                            let mut final_name = inst_name.clone();
-                            if !has_session {
-                                if let Some(thread_id) = codex_thread_id {
-                                    if !thread_id.is_empty() {
-                                        if let Some(resolved) =
-                                            crate::instance_binding::bind_session_to_process(
-                                                db, thread_id, process_id,
-                                            )
-                                        {
-                                            final_name = resolved;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Re-read instance data — session_id may have been set during binding
-                            let final_data = db
-                                .get_instance(&final_name)
-                                .map_err(|e| HcomError::DatabaseError(e.to_string()))?
-                                .unwrap_or(d);
-
-                            let sid = final_data
-                                .get("session_id")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.to_string());
-
-                            crate::log::log_info(
-                                "identity",
-                                "resolve",
-                                &format!(
-                                    "method=process_binding, name={}, process_id={}",
-                                    final_name, pid
-                                ),
-                            );
-                            return Ok(SenderIdentity {
-                                kind: SenderKind::Instance,
-                                name: final_name,
-                                session_id: sid,
-                                instance_data: Some(final_data),
-                            });
+                        // Opportunistic Codex session binding for command-time recovery.
+                        // Native SessionStart is the primary binding path; this keeps
+                        // resume/orphan flows tolerant if a command arrives first.
+                        // Uses bind_session_to_process for proper resume/placeholder handling.
+                        let mut final_name = inst_name.clone();
+                        if !has_session
+                            && let Some(thread_id) = codex_thread_id
+                            && !thread_id.is_empty()
+                            && let Some(resolved) = crate::instance_binding::bind_session_to_process(
+                                db, thread_id, process_id,
+                            )
+                        {
+                            final_name = resolved;
                         }
-                        None => {
-                            crate::log::log_warn(
-                                "identity",
-                                "resolve.process_instance_missing",
-                                &format!("process_id={}, bound_name={}", pid, inst_name),
-                            );
-                            return Err(HcomError::NotFound(instance_not_found_error_for(
-                                db, &inst_name,
-                            )));
-                        }
+
+                        // Re-read instance data — session_id may have been set during binding
+                        let final_data = db
+                            .get_instance(&final_name)
+                            .map_err(|e| HcomError::DatabaseError(e.to_string()))?
+                            .unwrap_or(d);
+
+                        let sid = final_data
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+
+                        crate::log::log_info(
+                            "identity",
+                            "resolve",
+                            &format!(
+                                "method=process_binding, name={}, process_id={}",
+                                final_name, pid
+                            ),
+                        );
+                        return Ok(SenderIdentity {
+                            kind: SenderKind::Instance,
+                            name: final_name,
+                            session_id: sid,
+                            instance_data: Some(final_data),
+                        });
                     }
-                }
-                None => {
-                    if identity_expected {
+                    None => {
                         crate::log::log_warn(
                             "identity",
-                            "resolve.process_binding_expired",
-                            &format!("process_id={}", pid),
+                            "resolve.process_instance_missing",
+                            &format!("process_id={}, bound_name={}", pid, inst_name),
                         );
+                        return Err(HcomError::NotFound(instance_not_found_error_for(
+                            db, &inst_name,
+                        )));
                     }
-                    return Err(HcomError::IdentityRequired(
-                        "Session expired. Run 'hcom start' to reconnect.".to_string(),
-                    ));
                 }
+            }
+            None => {
+                if identity_expected {
+                    crate::log::log_warn(
+                        "identity",
+                        "resolve.process_binding_expired",
+                        &format!("process_id={}", pid),
+                    );
+                }
+                return Err(HcomError::IdentityRequired(
+                    "Session expired. Run 'hcom start' to reconnect.".to_string(),
+                ));
             }
         }
     }
 
     // 5. Transcript marker fallback (hook extension point)
-    if let Some(fallback) = transcript_fallback {
-        if let Some(identity) = fallback(db) {
-            return Ok(identity);
-        }
+    if let Some(fallback) = transcript_fallback
+        && let Some(identity) = fallback(db)
+    {
+        return Ok(identity);
     }
 
     // 6. No identity

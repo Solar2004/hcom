@@ -278,13 +278,11 @@ fn relay_status(db: &HcomDb) -> i32 {
         "SELECT origin_device_id, COUNT(*) as cnt FROM instances \
          WHERE origin_device_id IS NOT NULL AND origin_device_id != '' \
          GROUP BY origin_device_id",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }) {
-            for row in rows.filter_map(|r| r.ok()) {
-                agent_counts.insert(row.0, row.1);
-            }
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        for row in rows.filter_map(|r| r.ok()) {
+            agent_counts.insert(row.0, row.1);
         }
     }
 

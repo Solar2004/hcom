@@ -413,10 +413,11 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
             };
             if let Some(json) = output {
                 let mut stdout = std::io::stdout().lock();
-                if serde_json::to_writer(&mut stdout, &json).is_ok() && stdout.flush().is_ok() {
-                    if let Some(ack) = delivery_ack.as_ref() {
-                        common::commit_delivery_ack(db, ack);
-                    }
+                if serde_json::to_writer(&mut stdout, &json).is_ok()
+                    && stdout.flush().is_ok()
+                    && let Some(ack) = delivery_ack.as_ref()
+                {
+                    common::commit_delivery_ack(db, ack);
                 }
             }
             0
@@ -496,10 +497,10 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
 ///
 /// Priority: CODEX_HOME env var → tool_config_root()/.codex
 fn codex_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CODEX_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Ok(dir) = std::env::var("CODEX_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     crate::runtime_env::tool_config_root().join(".codex")
 }
@@ -887,7 +888,7 @@ fn fetch_codex_hcom_hook_entries() -> Result<Vec<CodexHookTrustEntry>, String> {
             let json: Value = serde_json::from_str(&value).map_err(|e| e.to_string())?;
             return parse_hcom_hook_entries_from_hooks_list(&json);
         }
-        return test_hcom_hook_entries_from_hooks_json(&get_codex_hooks_path());
+        test_hcom_hook_entries_from_hooks_json(&get_codex_hooks_path())
     }
 
     #[cfg(not(test))]
@@ -1060,7 +1061,7 @@ fn codex_cli_version_output_for_hook_trust() -> Result<String, String> {
     #[cfg(not(test))]
     {
         static CACHE: OnceLock<Result<String, String>> = OnceLock::new();
-        return CACHE
+        CACHE
             .get_or_init(|| {
                 let output = Command::new("codex")
                     .arg("--version")
@@ -1072,7 +1073,7 @@ fn codex_cli_version_output_for_hook_trust() -> Result<String, String> {
                 text.push_str(&String::from_utf8_lossy(&output.stderr));
                 Ok(text.trim().to_string())
             })
-            .clone();
+            .clone()
     }
 
     #[cfg(test)]
@@ -1433,10 +1434,10 @@ fn ensure_codex_feature_enabled(
 }
 
 fn remove_codex_hooks_aliases(doc: &mut DocumentMut, feature_key: CodexHooksFeatureKey) {
-    if let Some(features) = doc.get_mut("features") {
-        if let Some(table) = features.as_table_like_mut() {
-            table.remove("codex_hooks");
-        }
+    if let Some(features) = doc.get_mut("features")
+        && let Some(table) = features.as_table_like_mut()
+    {
+        table.remove("codex_hooks");
     }
 
     if feature_key != CodexHooksFeatureKey::Hooks {
@@ -1569,15 +1570,12 @@ fn verify_hooks_json_value(json: &Value) -> Result<(), VerifyFailReason> {
             "type": "command",
             "command": expected_command,
         });
-        let matching_group = groups.iter().find(|group| {
-            let matcher_ok = match matcher {
-                Some(expected) => group.get("matcher").and_then(|v| v.as_str()) == Some(*expected),
-                None => {
-                    group.get("matcher").is_none()
-                        || group.get("matcher").and_then(|v| v.as_str()) == Some("")
-                }
-            };
-            matcher_ok
+        let matching_group = groups.iter().find(|group| match matcher {
+            Some(expected) => group.get("matcher").and_then(|v| v.as_str()) == Some(*expected),
+            None => {
+                group.get("matcher").is_none()
+                    || group.get("matcher").and_then(|v| v.as_str()) == Some("")
+            }
         });
         let Some(group) = matching_group else {
             return Err(VerifyFailReason::HookCommandMissing {

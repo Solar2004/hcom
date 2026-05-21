@@ -111,11 +111,13 @@ pub fn do_resume(
                 );
             }
         }
-        if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
-            if let Ok(plan) = prepare_resume_plan(&db, &name, fork, extra_args, flags) {
-                print_resume_preview(&plan, &hcom_config, &name, fork);
-                return Ok(0);
-            }
+        if ctx.is_inside_ai_tool()
+            && !flags.go
+            && should_preview_resume_rpc(extra_args)
+            && let Ok(plan) = prepare_resume_plan(&db, &name, fork, extra_args, flags)
+        {
+            print_resume_preview(&plan, &hcom_config, &name, fork);
+            return Ok(0);
         }
 
         let launcher_name =
@@ -218,17 +220,17 @@ fn resolve_name_to_plan(
     // Bounded by MAX_HOPS in case of pathological DB state.
     for _ in 0..8 {
         if is_session_id(&current) {
-            if let Ok(Some(bound)) = db.get_session_binding(&current) {
-                if matches!(db.get_instance_full(&bound), Ok(Some(_))) {
-                    bail!(
-                        "Session {} is currently active as '{}' — run hcom kill {} first",
-                        current,
-                        bound,
-                        bound
-                    );
-                }
-                // Stale binding: events are authoritative. Fall through.
+            if let Ok(Some(bound)) = db.get_session_binding(&current)
+                && matches!(db.get_instance_full(&bound), Ok(Some(_)))
+            {
+                bail!(
+                    "Session {} is currently active as '{}' — run hcom kill {} first",
+                    current,
+                    bound,
+                    bound
+                );
             }
+            // Stale binding: events are authoritative. Fall through.
             if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&current) {
                 current = instance_name;
                 continue;
@@ -239,28 +241,26 @@ fn resolve_name_to_plan(
 
         if matches!(db.get_instance_full(&current), Ok(None) | Err(_))
             && crate::relay::control::split_device_suffix(&current).is_none()
+            && let Some(session_id) = resolve_thread_name(&current)?
         {
-            if let Some(session_id) = resolve_thread_name(&current)? {
-                if let Ok(Some(bound)) = db.get_session_binding(&session_id) {
-                    if matches!(db.get_instance_full(&bound), Ok(Some(_))) {
-                        bail!(
-                            "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
-                            session_id,
-                            current,
-                            bound,
-                            bound
-                        );
-                    }
-                    // Stale binding: fall through to events.
-                }
-                if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id)
-                {
-                    current = instance_name;
-                    continue;
-                }
-                let plan = build_adopt_plan(db, &session_id, fork, extra_args, flags)?;
-                return Ok((session_id, plan));
+            if let Ok(Some(bound)) = db.get_session_binding(&session_id)
+                && matches!(db.get_instance_full(&bound), Ok(Some(_)))
+            {
+                bail!(
+                    "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
+                    session_id,
+                    current,
+                    bound,
+                    bound
+                );
             }
+            // Stale binding: fall through to events.
+            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
+                current = instance_name;
+                continue;
+            }
+            let plan = build_adopt_plan(db, &session_id, fork, extra_args, flags)?;
+            return Ok((session_id, plan));
         }
 
         let plan = prepare_resume_plan(db, &current, fork, extra_args, flags)?;
@@ -305,10 +305,8 @@ fn prepare_resume_plan_from_source(
         display_name,
     ) = match source {
         ResumeSource::Instance { name } => {
-            if !fork {
-                if let Ok(Some(_)) = db.get_instance_full(name) {
-                    bail!("'{}' is still active — run hcom kill {} first", name, name);
-                }
+            if !fork && let Ok(Some(_)) = db.get_instance_full(name) {
+                bail!("'{}' is still active — run hcom kill {} first", name, name);
             }
             let (tool, sid, largs, tag, bg, leid, snap) = if fork {
                 load_instance_data(db, name)?
@@ -797,55 +795,54 @@ fn load_stopped_snapshot(
         .collect();
 
     for data_str in &rows {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
-            if data.get("action").and_then(|v| v.as_str()) == Some("stopped") {
-                if let Some(snapshot) = data.get("snapshot") {
-                    let tool = snapshot
-                        .get("tool")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let session_id = snapshot
-                        .get("session_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let launch_args = snapshot
-                        .get("launch_args")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let tag = snapshot
-                        .get("tag")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let background = snapshot
-                        .get("background")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                        != 0;
-                    let last_event_id = snapshot
-                        .get("last_event_id")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let directory = snapshot
-                        .get("directory")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
+            && data.get("action").and_then(|v| v.as_str()) == Some("stopped")
+            && let Some(snapshot) = data.get("snapshot")
+        {
+            let tool = snapshot
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session_id = snapshot
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let launch_args = snapshot
+                .get("launch_args")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tag = snapshot
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let background = snapshot
+                .get("background")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                != 0;
+            let last_event_id = snapshot
+                .get("last_event_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let directory = snapshot
+                .get("directory")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
-                    return Ok((
-                        tool,
-                        session_id,
-                        launch_args,
-                        tag,
-                        background,
-                        last_event_id,
-                        directory,
-                    ));
-                }
-            }
+            return Ok((
+                tool,
+                session_id,
+                launch_args,
+                tag,
+                background,
+                last_event_id,
+                directory,
+            ));
         }
     }
 
@@ -1061,16 +1058,16 @@ fn resolve_claude_thread_name(name: &str) -> Result<Option<String>> {
                 };
                 last_title = Some((title, session_id));
             }
-            if let Some((title, session_id)) = last_title {
-                if title == name {
-                    let when = sub_entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .map(format_system_time)
-                        .unwrap_or_else(|| "unknown".to_string());
-                    matches.push(ThreadMatch { session_id, when });
-                }
+            if let Some((title, session_id)) = last_title
+                && title == name
+            {
+                let when = sub_entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(format_system_time)
+                    .unwrap_or_else(|| "unknown".to_string());
+                matches.push(ThreadMatch { session_id, when });
             }
         }
     }
@@ -1187,10 +1184,10 @@ fn is_opencode_session_id(s: &str) -> bool {
 /// it's absent) so callers can surface a useful "searched here" message.
 fn opencode_data_dir() -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            candidates.push(std::path::PathBuf::from(xdg).join("opencode"));
-        }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        candidates.push(std::path::PathBuf::from(xdg).join("opencode"));
     }
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".local/share/opencode"));
@@ -1247,16 +1244,16 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
 
     // 2. Claude: iterate project dirs, check for exact filename
     let projects_dir = claude_config_dir().join("projects");
-    if projects_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    let candidate = entry.path().join(format!("{}.jsonl", session_id));
-                    if candidate.exists() {
-                        let path_str = candidate.to_string_lossy().to_string();
-                        let tool = detect_agent_type(&path_str).to_string();
-                        return Some((tool, Some(path_str)));
-                    }
+    if projects_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&projects_dir)
+    {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let candidate = entry.path().join(format!("{}.jsonl", session_id));
+                if candidate.exists() {
+                    let path_str = candidate.to_string_lossy().to_string();
+                    let tool = detect_agent_type(&path_str).to_string();
+                    return Some((tool, Some(path_str)));
                 }
             }
         }
@@ -1317,10 +1314,10 @@ fn scan_lines_for_cwd(
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
-        if let Some(cwd) = pick(&parsed) {
-            if !cwd.is_empty() {
-                return Some(cwd.to_string());
-            }
+        if let Some(cwd) = pick(&parsed)
+            && !cwd.is_empty()
+        {
+            return Some(cwd.to_string());
         }
     }
     None

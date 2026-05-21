@@ -37,10 +37,10 @@ fn parse_value_arg(argv: &[String], flags: &[&str]) -> Option<String> {
                 return argv.get(idx + 1).cloned();
             }
             let prefix = format!("{flag}=");
-            if let Some(value) = token.strip_prefix(&prefix) {
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+            if let Some(value) = token.strip_prefix(&prefix)
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
             }
         }
     }
@@ -225,20 +225,20 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     // `crate::notify::wake` which TCP-wakes the plugin's
     // deliverPendingToIdle(). If last_event_id is still 0, ALL historical
     // events get delivered.
-    if let Ok(Some(existing)) = db.get_instance_full(&instance_name) {
-        if existing.last_event_id == 0 {
-            let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")
-                .ok()
-                .and_then(|s| s.parse().ok());
-            let current_max = db.get_last_event_id();
-            let new_id = match launch_event_id {
-                Some(lei) if lei <= current_max => lei,
-                _ => current_max,
-            };
-            let mut id_updates = serde_json::Map::new();
-            id_updates.insert("last_event_id".into(), serde_json::json!(new_id));
-            instances::update_instance_position(db, &instance_name, &id_updates);
-        }
+    if let Ok(Some(existing)) = db.get_instance_full(&instance_name)
+        && existing.last_event_id == 0
+    {
+        let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let current_max = db.get_last_event_id();
+        let new_id = match launch_event_id {
+            Some(lei) if lei <= current_max => lei,
+            _ => current_max,
+        };
+        let mut id_updates = serde_json::Map::new();
+        id_updates.insert("last_event_id".into(), serde_json::json!(new_id));
+        instances::update_instance_position(db, &instance_name, &id_updates);
     }
 
     lifecycle::set_status(

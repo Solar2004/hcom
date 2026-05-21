@@ -323,17 +323,17 @@ pub fn config_get(key: &str) -> (String, &'static str) {
     let content = load_config_content();
     if let Ok(table) = content.parse::<toml::Table>() {
         // Try nested path first
-        if let Some(dotted_path) = toml_path_for_key(&field_name) {
-            if let Some(val) = get_nested_toml(&table, dotted_path) {
-                let val_str = match &val {
-                    toml::Value::String(s) => s.clone(),
-                    toml::Value::Integer(n) => n.to_string(),
-                    toml::Value::Boolean(b) => b.to_string(),
-                    toml::Value::Float(f) => f.to_string(),
-                    other => other.to_string(),
-                };
-                return (val_str, "toml");
-            }
+        if let Some(dotted_path) = toml_path_for_key(&field_name)
+            && let Some(val) = get_nested_toml(&table, dotted_path)
+        {
+            let val_str = match &val {
+                toml::Value::String(s) => s.clone(),
+                toml::Value::Integer(n) => n.to_string(),
+                toml::Value::Boolean(b) => b.to_string(),
+                toml::Value::Float(f) => f.to_string(),
+                other => other.to_string(),
+            };
+            return (val_str, "toml");
         }
         // Fallback: try flat key (for legacy configs) — skip non-scalar values
         // (e.g. table.get("terminal") returns the whole [terminal] section when
@@ -1548,10 +1548,10 @@ pub fn terminal_help_text(show_current: bool) -> String {
         let preset = TERMINAL_PRESETS.iter().find(|(n, _)| *n == preset_name);
         #[allow(unused_variables)]
         if let Some((name, p)) = preset {
-            if let Some(bin) = p.binary {
-                if crate::terminal::which_bin(bin).is_some() {
-                    return true;
-                }
+            if let Some(bin) = p.binary
+                && crate::terminal::which_bin(bin).is_some()
+            {
+                return true;
             }
             #[cfg(target_os = "macos")]
             {
@@ -1776,13 +1776,13 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
         }
         // Include TOML-defined presets not in built-ins
         let toml_path = crate::paths::config_toml_path();
-        if let Some(toml_presets) = crate::config::load_toml_presets(&toml_path) {
-            if let Some(table) = toml_presets.as_table() {
-                for name in table.keys() {
-                    if !TERMINAL_PRESETS.iter().any(|(n, _)| *n == name.as_str()) {
-                        let marker = if *name == current { " ← current" } else { "" };
-                        println!("  {}{}", name, marker);
-                    }
+        if let Some(toml_presets) = crate::config::load_toml_presets(&toml_path)
+            && let Some(table) = toml_presets.as_table()
+        {
+            for name in table.keys() {
+                if !TERMINAL_PRESETS.iter().any(|(n, _)| *n == name.as_str()) {
+                    let marker = if *name == current { " ← current" } else { "" };
+                    println!("  {}{}", name, marker);
                 }
             }
         }
@@ -1916,10 +1916,10 @@ fn kitty_conf_has(path: &Path, key: &str) -> Option<String> {
             continue;
         }
         let mut parts = line.splitn(2, |c: char| c.is_whitespace());
-        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-            if k == key {
-                return Some(v.trim().to_string());
-            }
+        if let (Some(k), Some(v)) = (parts.next(), parts.next())
+            && k == key
+        {
+            return Some(v.trim().to_string());
         }
     }
     None
@@ -1954,15 +1954,16 @@ fn kitty_setup() -> i32 {
         return 0;
     }
 
-    if let Some(ref rc_val) = has_rc {
-        if rc_val != "yes" && rc_val != "socket" {
-            eprintln!(
-                "Error: allow_remote_control is '{rc_val}' in {}",
-                conf.display()
-            );
-            eprintln!("  Change to 'yes' or 'socket', then restart kitty");
-            return 1;
-        }
+    if let Some(ref rc_val) = has_rc
+        && rc_val != "yes"
+        && rc_val != "socket"
+    {
+        eprintln!(
+            "Error: allow_remote_control is '{rc_val}' in {}",
+            conf.display()
+        );
+        eprintln!("  Change to 'yes' or 'socket', then restart kitty");
+        return 1;
     }
 
     let mut lines_to_add = Vec::new();

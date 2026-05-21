@@ -18,11 +18,10 @@ fn load_preview_state(db: &HcomDb) -> ResetPreviewState {
     let mut local_instances = Vec::new();
     if let Ok(mut stmt) = db.conn().prepare(
         "SELECT name FROM instances WHERE origin_device_id IS NULL OR origin_device_id = ''",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for name in rows.filter_map(|r| r.ok()) {
-                local_instances.push(name);
-            }
+    ) && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
+    {
+        for name in rows.filter_map(|r| r.ok()) {
+            local_instances.push(name);
         }
     }
 

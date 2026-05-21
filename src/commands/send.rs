@@ -346,14 +346,14 @@ pub fn send_message(
                 data["reply_to_local"] = serde_json::json!(local_id);
 
                 // Ack-on-ack loop prevention
-                if env.intent.as_ref().map(|i| i.as_str()) == Some("ack") {
-                    if let Some(parent_intent) = get_intent_from_event(db, local_id) {
-                        if parent_intent == "ack" {
-                            return Err("Ack-on-ack loop detected. Message blocked.".to_string());
-                        }
-                        if parent_intent == "inform" {
-                            return Err("Cannot ack an inform - informational messages don't need acknowledgment.".to_string());
-                        }
+                if env.intent.as_ref().map(|i| i.as_str()) == Some("ack")
+                    && let Some(parent_intent) = get_intent_from_event(db, local_id)
+                {
+                    if parent_intent == "ack" {
+                        return Err("Ack-on-ack loop detected. Message blocked.".to_string());
+                    }
+                    if parent_intent == "inform" {
+                        return Err("Cannot ack an inform - informational messages don't need acknowledgment.".to_string());
                     }
                 }
             }
@@ -619,17 +619,14 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             .or_else(|| identity::resolve_identity(db, None, None, None, None, None, None).ok());
         match actor {
             Some(ref actor) if matches!(actor.kind, SenderKind::Instance) => {
-                if let Some(ref data) = actor.instance_data {
-                    if data
+                if let Some(ref data) = actor.instance_data
+                    && data
                         .get("parent_name")
                         .and_then(|v| v.as_str())
                         .is_some_and(|s| !s.is_empty())
-                    {
-                        eprintln!(
-                            "Error: Subagents cannot use --from/-b (external sender spoofing)"
-                        );
-                        return 1;
-                    }
+                {
+                    eprintln!("Error: Subagents cannot use --from/-b (external sender spoofing)");
+                    return 1;
                 }
             }
             _ => {}
@@ -675,10 +672,10 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     if let Some(ref reply_to) = envelope.reply_to {
         if let Some(local_id) = resolve_reply_to_local(db, reply_to) {
-            if envelope.thread.is_none() {
-                if let Some(parent_thread) = get_thread_from_event(db, local_id) {
-                    envelope.thread = Some(parent_thread);
-                }
+            if envelope.thread.is_none()
+                && let Some(parent_thread) = get_thread_from_event(db, local_id)
+            {
+                envelope.thread = Some(parent_thread);
             }
         } else {
             eprintln!("Error: Invalid --reply-to: event not found or not a message");
@@ -919,12 +916,12 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         let messages = db.get_unread_messages(&sender_identity.name);
         if !messages.is_empty() {
             // Advance cursor
-            if let Some(last) = messages.last() {
-                if let Some(id) = last.event_id {
-                    let mut updates = serde_json::Map::new();
-                    updates.insert("last_event_id".into(), serde_json::json!(id));
-                    instances::update_instance_position(db, &sender_identity.name, &updates);
-                }
+            if let Some(last) = messages.last()
+                && let Some(id) = last.event_id
+            {
+                let mut updates = serde_json::Map::new();
+                updates.insert("last_event_id".into(), serde_json::json!(id));
+                instances::update_instance_position(db, &sender_identity.name, &updates);
             }
 
             // Separate subagent messages from main messages
@@ -987,11 +984,11 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // Show intent tip
-    if let Some(ref intent) = envelope.intent {
-        if matches!(sender_identity.kind, SenderKind::Instance) {
-            let tip_key = format!("send:intent:{}", intent.as_str());
-            crate::core::tips::maybe_show_tip(db, &sender_identity.name, &tip_key, false);
-        }
+    if let Some(ref intent) = envelope.intent
+        && matches!(sender_identity.kind, SenderKind::Instance)
+    {
+        let tip_key = format!("send:intent:{}", intent.as_str());
+        crate::core::tips::maybe_show_tip(db, &sender_identity.name, &tip_key, false);
     }
 
     crate::relay::worker::ensure_worker(true);

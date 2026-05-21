@@ -88,34 +88,30 @@ pub fn is_in_wake_grace_with_persistence(db: Option<&crate::db::HcomDb>) -> bool
         Err(_) => return false,
     };
 
-    if state.last_mono.is_none() {
-        if let Some(db) = db {
-            if let Ok(Some(persisted_wall)) = db.kv_get("_wake_last_wall") {
-                if let Ok(last_wall) = persisted_wall.parse::<f64>() {
-                    let wall_elapsed = now_wall - last_wall;
-                    if wall_elapsed > 30.0 && wall_elapsed < 3600.0 {
-                        crate::log::log_info(
-                            "cleanup",
-                            "sleep_wake_detected",
-                            &format!(
-                                "drift={:.0}s (cross-process), grace={:.0}s",
-                                wall_elapsed, WAKE_GRACE_PERIOD
-                            ),
-                        );
-                        state.grace_until_mono =
-                            Some(now_mono + std::time::Duration::from_secs_f64(WAKE_GRACE_PERIOD));
-                    }
-                    if let Ok(Some(grace_until)) = db.kv_get("_wake_grace_until") {
-                        if let Ok(grace_wall) = grace_until.parse::<f64>() {
-                            if now_wall < grace_wall {
-                                let remaining = grace_wall - now_wall;
-                                state.grace_until_mono =
-                                    Some(now_mono + std::time::Duration::from_secs_f64(remaining));
-                            }
-                        }
-                    }
-                }
-            }
+    if state.last_mono.is_none()
+        && let Some(db) = db
+        && let Ok(Some(persisted_wall)) = db.kv_get("_wake_last_wall")
+        && let Ok(last_wall) = persisted_wall.parse::<f64>()
+    {
+        let wall_elapsed = now_wall - last_wall;
+        if wall_elapsed > 30.0 && wall_elapsed < 3600.0 {
+            crate::log::log_info(
+                "cleanup",
+                "sleep_wake_detected",
+                &format!(
+                    "drift={:.0}s (cross-process), grace={:.0}s",
+                    wall_elapsed, WAKE_GRACE_PERIOD
+                ),
+            );
+            state.grace_until_mono =
+                Some(now_mono + std::time::Duration::from_secs_f64(WAKE_GRACE_PERIOD));
+        }
+        if let Ok(Some(grace_until)) = db.kv_get("_wake_grace_until")
+            && let Ok(grace_wall) = grace_until.parse::<f64>()
+            && now_wall < grace_wall
+        {
+            let remaining = grace_wall - now_wall;
+            state.grace_until_mono = Some(now_mono + std::time::Duration::from_secs_f64(remaining));
         }
     }
 
@@ -540,12 +536,11 @@ pub fn set_status(
             crate::log::log_error("core", "db.error", &format!("ready event: {e}"));
         }
 
-        if launcher != "unknown" {
-            if let Some(ref bid) = batch_id {
-                if let Err(e) = db.check_batch_completion(&launcher, bid) {
-                    crate::log::log_error("core", "db.error", &format!("batch notification: {e}"));
-                }
-            }
+        if launcher != "unknown"
+            && let Some(ref bid) = batch_id
+            && let Err(e) = db.check_batch_completion(&launcher, bid)
+        {
+            crate::log::log_error("core", "db.error", &format!("batch notification: {e}"));
         }
     }
 

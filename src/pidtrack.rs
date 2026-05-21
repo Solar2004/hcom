@@ -262,10 +262,10 @@ pub fn get_orphan_processes(
     // Filter to alive processes only
     let mut alive: HashMap<String, PidEntry> = HashMap::new();
     for (pid_str, entry) in &data {
-        if let Ok(pid) = pid_str.parse::<u32>() {
-            if is_alive(pid) {
-                alive.insert(pid_str.clone(), entry.clone());
-            }
+        if let Ok(pid) = pid_str.parse::<u32>()
+            && is_alive(pid)
+        {
+            alive.insert(pid_str.clone(), entry.clone());
         }
     }
 

@@ -177,14 +177,12 @@ pub(crate) fn parse_opencode_sqlite(
     for msg in &messages {
         if let Ok(mut parts_stmt) =
             conn.prepare("SELECT data FROM part WHERE message_id = ? ORDER BY id ASC")
-        {
-            if let Ok(rows) =
+            && let Ok(rows) =
                 parts_stmt.query_map(rusqlite::params![msg.id], |row| row.get::<_, String>(0))
-            {
-                for data_str in rows.flatten() {
-                    if let Ok(v) = serde_json::from_str::<Value>(&data_str) {
-                        parts_by_msg.entry(msg.id.clone()).or_default().push(v);
-                    }
+        {
+            for data_str in rows.flatten() {
+                if let Ok(v) = serde_json::from_str::<Value>(&data_str) {
+                    parts_by_msg.entry(msg.id.clone()).or_default().push(v);
                 }
             }
         }
@@ -270,10 +268,10 @@ pub(crate) fn parse_opencode_sqlite(
                         {
                             continue;
                         }
-                        if let Some(text) = p.get("text").and_then(|v| v.as_str()) {
-                            if !text.is_empty() {
-                                action_parts.push(text.to_string());
-                            }
+                        if let Some(text) = p.get("text").and_then(|v| v.as_str())
+                            && !text.is_empty()
+                        {
+                            action_parts.push(text.to_string());
                         }
                     }
                     "tool" => {
@@ -286,16 +284,16 @@ pub(crate) fn parse_opencode_sqlite(
                         // Extract file paths
                         if let Some(obj) = input.as_object() {
                             for field in &["file_path", "filePath", "path", "pattern", "file"] {
-                                if let Some(val) = obj.get(*field).and_then(|v| v.as_str()) {
-                                    if !val.is_empty() {
-                                        let fname = Path::new(val)
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or(val)
-                                            .to_string();
-                                        if !files.contains(&fname) {
-                                            files.push(fname);
-                                        }
+                                if let Some(val) = obj.get(*field).and_then(|v| v.as_str())
+                                    && !val.is_empty()
+                                {
+                                    let fname = Path::new(val)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(val)
+                                        .to_string();
+                                    if !files.contains(&fname) {
+                                        files.push(fname);
                                     }
                                 }
                             }

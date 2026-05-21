@@ -196,10 +196,8 @@ impl HcomDb {
         }
 
         // Emit ready event and batch notification on first status update
-        if is_new {
-            if let Err(e) = self.emit_ready_event(name, status, context) {
-                crate::log::log_error("db", "set_status.emit_ready_event", &format!("{e}"));
-            }
+        if is_new && let Err(e) = self.emit_ready_event(name, status, context) {
+            crate::log::log_error("db", "set_status.emit_ready_event", &format!("{e}"));
         }
 
         Ok(())

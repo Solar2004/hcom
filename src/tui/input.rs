@@ -182,11 +182,11 @@ impl App {
     pub fn handle_paste(&mut self, text: &str) {
         let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
         if self.ui.mode == InputMode::Relay {
-            if let Some(ref mut popup) = self.ui.relay_popup {
-                if popup.editing_token {
-                    for c in clean.chars() {
-                        insert_at(&mut popup.token_input, &mut popup.token_cursor, c);
-                    }
+            if let Some(ref mut popup) = self.ui.relay_popup
+                && popup.editing_token
+            {
+                for c in clean.chars() {
+                    insert_at(&mut popup.token_input, &mut popup.token_cursor, c);
                 }
             }
         } else if self.ui.mode == InputMode::Launch && self.ui.launch.editing.is_some() {
@@ -284,11 +284,11 @@ impl App {
             }
             KeyCode::Char('y') => {
                 // y = "Yes" shortcut, not applicable to OrphanAction
-                if let Some(confirm) = self.ui.confirm.as_ref() {
-                    if !matches!(confirm.action, ConfirmAction::OrphanAction(_)) {
-                        let confirm = self.ui.confirm.take().unwrap();
-                        self.execute_confirm(confirm.action);
-                    }
+                if let Some(confirm) = self.ui.confirm.as_ref()
+                    && !matches!(confirm.action, ConfirmAction::OrphanAction(_))
+                {
+                    let confirm = self.ui.confirm.take().unwrap();
+                    self.execute_confirm(confirm.action);
                 }
             }
             _ => {}

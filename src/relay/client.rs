@@ -217,21 +217,16 @@ impl MqttRelay {
         thread::spawn(move || {
             let mut connection = connection;
             let mut conn_backoff = Backoff::new();
-            loop {
-                match connection.recv() {
-                    Ok(notification) => {
-                        let is_error = notification.is_err();
-                        if event_tx.send(notification).is_err() {
-                            break;
-                        }
-                        if is_error {
-                            thread::sleep(conn_backoff.wait_duration());
-                            conn_backoff.increase();
-                        } else {
-                            conn_backoff.reset();
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(notification) = connection.recv() {
+                let is_error = notification.is_err();
+                if event_tx.send(notification).is_err() {
+                    break;
+                }
+                if is_error {
+                    thread::sleep(conn_backoff.wait_duration());
+                    conn_backoff.increase();
+                } else {
+                    conn_backoff.reset();
                 }
             }
         });
@@ -368,7 +363,10 @@ impl MqttRelay {
                         let err_msg = format!("{:?}", conn_err);
 
                         // Log first error, then every 10th
-                        if connected || consecutive_errors <= 1 || consecutive_errors % 10 == 0 {
+                        if connected
+                            || consecutive_errors <= 1
+                            || consecutive_errors.is_multiple_of(10)
+                        {
                             log::log_warn(
                                 "relay",
                                 "relay.disconnected",
@@ -433,7 +431,10 @@ impl MqttRelay {
                         consecutive_errors += 1;
                         let err_msg = format!("{:?}", conn_err);
 
-                        if connected || consecutive_errors <= 1 || consecutive_errors % 10 == 0 {
+                        if connected
+                            || consecutive_errors <= 1
+                            || consecutive_errors.is_multiple_of(10)
+                        {
                             log::log_warn(
                                 "relay",
                                 "relay.disconnected",

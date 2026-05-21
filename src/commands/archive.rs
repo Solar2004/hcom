@@ -134,18 +134,16 @@ fn query_archive_counts(
         .query_row("SELECT COUNT(*) FROM instances", [], |r| r.get(0))
         .unwrap_or(0);
 
-    if here_filter {
-        if let Some(cwd) = cwd {
-            let has_match: bool = conn
-                .query_row(
-                    "SELECT 1 FROM instances WHERE directory = ?1 LIMIT 1",
-                    rusqlite::params![cwd],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
-            if !has_match {
-                return None;
-            }
+    if here_filter && let Some(cwd) = cwd {
+        let has_match: bool = conn
+            .query_row(
+                "SELECT 1 FROM instances WHERE directory = ?1 LIMIT 1",
+                rusqlite::params![cwd],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_match {
+            return None;
         }
     }
 
@@ -158,10 +156,11 @@ fn resolve_archive<'a>(
     archives: &'a [serde_json::Value],
 ) -> Option<&'a serde_json::Value> {
     // Try as index
-    if let Ok(idx) = selector.parse::<usize>() {
-        if idx >= 1 && idx <= archives.len() {
-            return Some(&archives[idx - 1]);
-        }
+    if let Ok(idx) = selector.parse::<usize>()
+        && idx >= 1
+        && idx <= archives.len()
+    {
+        return Some(&archives[idx - 1]);
     }
 
     // Try as name or prefix match

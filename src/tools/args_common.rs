@@ -226,10 +226,8 @@ pub fn rebuild_tokens_from(
     include_subcommand: bool,
 ) -> Vec<String> {
     let mut tokens = Vec::new();
-    if include_subcommand {
-        if let Some(sub) = subcommand {
-            tokens.push(sub.to_string());
-        }
+    if include_subcommand && let Some(sub) = subcommand {
+        tokens.push(sub.to_string());
     }
     if include_positionals {
         tokens.extend(clean_tokens.iter().cloned());

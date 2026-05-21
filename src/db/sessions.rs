@@ -134,10 +134,10 @@ impl HcomDb {
         };
 
         for data in rows.flatten() {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
-                if Self::should_deliver_to(&json, name) {
-                    return true;
-                }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data)
+                && Self::should_deliver_to(&json, name)
+            {
+                return true;
             }
         }
         false
@@ -167,37 +167,34 @@ impl HcomDb {
         }
 
         // Check for existing binding to different instance
-        if let Some(existing) = self.get_session_binding(session_id)? {
-            if existing != instance_name {
-                // Check if this is a subagent trying to bind without --name <agent_id>
-                if let Ok(Some(inst)) = self.get_instance(&existing) {
-                    if let Some(rt) = inst.get("running_tasks").and_then(|v| v.as_str()) {
-                        if let Ok(tasks) = serde_json::from_str::<serde_json::Value>(rt) {
-                            if let Some(subs) = tasks.get("subagents").and_then(|v| v.as_array()) {
-                                if !subs.is_empty() {
-                                    let ids: Vec<&str> = subs
-                                        .iter()
-                                        .filter_map(|s| s.get("agent_id").and_then(|v| v.as_str()))
-                                        .collect();
-                                    bail!(
-                                        "Session bound to parent '{}'. \
+        if let Some(existing) = self.get_session_binding(session_id)?
+            && existing != instance_name
+        {
+            // Check if this is a subagent trying to bind without --name <agent_id>
+            if let Ok(Some(inst)) = self.get_instance(&existing)
+                && let Some(rt) = inst.get("running_tasks").and_then(|v| v.as_str())
+                && let Ok(tasks) = serde_json::from_str::<serde_json::Value>(rt)
+                && let Some(subs) = tasks.get("subagents").and_then(|v| v.as_array())
+                && !subs.is_empty()
+            {
+                let ids: Vec<&str> = subs
+                    .iter()
+                    .filter_map(|s| s.get("agent_id").and_then(|v| v.as_str()))
+                    .collect();
+                bail!(
+                    "Session bound to parent '{}'. \
                                          Subagents must use: hcom start --name <agent_id>\n\
                                          Active agent_ids: {}",
-                                        existing,
-                                        ids.join(", ")
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                bail!(
-                    "Session {}... already bound to {}, cannot bind to {}",
-                    &session_id[..session_id.len().min(8)],
                     existing,
-                    instance_name
+                    ids.join(", ")
                 );
             }
+            bail!(
+                "Session {}... already bound to {}, cannot bind to {}",
+                &session_id[..session_id.len().min(8)],
+                existing,
+                instance_name
+            );
         }
 
         let now = now_epoch_f64();

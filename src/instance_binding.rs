@@ -92,20 +92,17 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         .copied()
         .collect();
 
-    if !missing.is_empty() {
-        if let Ok(Some(pos)) = db.get_instance_full(instance_name) {
-            if let Some(old_json) = &pos.launch_context {
-                if let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json) {
-                    for k in &missing {
-                        if let Some(val) = old_ctx.get(*k) {
-                            if let Some(s) = val.as_str() {
-                                if !s.is_empty() {
-                                    ctx.insert(k.to_string(), val.clone());
-                                }
-                            }
-                        }
-                    }
-                }
+    if !missing.is_empty()
+        && let Ok(Some(pos)) = db.get_instance_full(instance_name)
+        && let Some(old_json) = &pos.launch_context
+        && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
+    {
+        for k in &missing {
+            if let Some(val) = old_ctx.get(*k)
+                && let Some(s) = val.as_str()
+                && !s.is_empty()
+            {
+                ctx.insert(k.to_string(), val.clone());
             }
         }
     }
@@ -177,51 +174,48 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
     ];
     let mut env_map = serde_json::Map::new();
     for key in &env_keys {
-        if let Ok(val) = std::env::var(key) {
-            if !val.is_empty() {
-                env_map.insert((*key).to_string(), serde_json::json!(val));
-            }
+        if let Ok(val) = std::env::var(key)
+            && !val.is_empty()
+        {
+            env_map.insert((*key).to_string(), serde_json::json!(val));
         }
     }
     ctx.insert("env".into(), serde_json::Value::Object(env_map));
 
     // Pane IDs are late-bound. The launcher already persisted the effective preset.
-    if let Ok(preset_name) = std::env::var("HCOM_LAUNCHED_PRESET") {
-        if !preset_name.is_empty() {
-            if let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name) {
-                if let Ok(pane_id) = std::env::var(pane_id_env) {
-                    if !pane_id.is_empty() {
-                        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
-                    }
-                }
-            }
-        }
+    if let Ok(preset_name) = std::env::var("HCOM_LAUNCHED_PRESET")
+        && !preset_name.is_empty()
+        && let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name)
+        && let Ok(pane_id) = std::env::var(pane_id_env)
+        && !pane_id.is_empty()
+    {
+        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
     }
 
     // Process ID for kitty close-by-env matching
-    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID") {
-        if !pid.is_empty() {
-            ctx.insert("process_id".into(), serde_json::json!(pid));
+    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID")
+        && !pid.is_empty()
+    {
+        ctx.insert("process_id".into(), serde_json::json!(pid));
 
-            // Terminal ID from parent's stdout capture
-            let id_file = crate::paths::hcom_dir()
-                .join(".tmp")
-                .join("terminal_ids")
-                .join(&pid);
-            if id_file.exists() {
-                if let Ok(content) = std::fs::read_to_string(&id_file) {
-                    let terminal_id = content.trim().to_string();
-                    if !terminal_id.is_empty() {
-                        if std::env::var("HCOM_LAUNCHED_PRESET").as_deref() == Ok("zellij") {
-                            if let Some(pane_id) = zellij_pane_id_from_terminal_id(&terminal_id) {
-                                ctx.insert("pane_id".into(), serde_json::json!(pane_id));
-                            }
-                        }
-                        ctx.insert("terminal_id".into(), serde_json::json!(terminal_id));
+        // Terminal ID from parent's stdout capture
+        let id_file = crate::paths::hcom_dir()
+            .join(".tmp")
+            .join("terminal_ids")
+            .join(&pid);
+        if id_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&id_file) {
+                let terminal_id = content.trim().to_string();
+                if !terminal_id.is_empty() {
+                    if std::env::var("HCOM_LAUNCHED_PRESET").as_deref() == Ok("zellij")
+                        && let Some(pane_id) = zellij_pane_id_from_terminal_id(&terminal_id)
+                    {
+                        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
                     }
+                    ctx.insert("terminal_id".into(), serde_json::json!(terminal_id));
                 }
-                let _ = std::fs::remove_file(&id_file);
             }
+            let _ = std::fs::remove_file(&id_file);
         }
     }
 
@@ -298,99 +292,98 @@ pub fn bind_session_to_process(
         let mut resume_updates = serde_json::Map::new();
         resume_updates.insert("last_stop".into(), serde_json::json!(now));
 
-        if let Some(ref ph_name) = placeholder_name {
-            if ph_name != canonical_name {
-                // Always migrate notify_endpoints
-                if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
-                    crate::log::log_error(
-                        "binding",
-                        "bind_canonical.migrate_endpoints",
-                        &format!("{e}"),
-                    );
+        if let Some(ref ph_name) = placeholder_name
+            && ph_name != canonical_name
+        {
+            // Always migrate notify_endpoints
+            if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
+                crate::log::log_error(
+                    "binding",
+                    "bind_canonical.migrate_endpoints",
+                    &format!("{e}"),
+                );
+            }
+
+            let is_true_placeholder = placeholder_data
+                .as_ref()
+                .map(|d| d.session_id.is_none())
+                .unwrap_or(false);
+
+            if is_true_placeholder {
+                // Path 1a: True placeholder merge
+                if let Some(ref ph_data) = placeholder_data {
+                    if let Some(ref tag) = ph_data.tag {
+                        resume_updates.insert("tag".into(), serde_json::json!(tag));
+                    }
+                    if ph_data.background != 0 {
+                        resume_updates
+                            .insert("background".into(), serde_json::json!(ph_data.background));
+                    }
+                    if let Some(ref args) = ph_data.launch_args {
+                        resume_updates.insert("launch_args".into(), serde_json::json!(args));
+                    }
+                    // Reset status_context for ready event
+                    if std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1") {
+                        resume_updates.insert("status_context".into(), serde_json::json!("new"));
+                    }
                 }
 
-                let is_true_placeholder = placeholder_data
-                    .as_ref()
-                    .map(|d| d.session_id.is_none())
-                    .unwrap_or(false);
-
-                if is_true_placeholder {
-                    // Path 1a: True placeholder merge
-                    if let Some(ref ph_data) = placeholder_data {
-                        if let Some(ref tag) = ph_data.tag {
-                            resume_updates.insert("tag".into(), serde_json::json!(tag));
-                        }
-                        if ph_data.background != 0 {
-                            resume_updates
-                                .insert("background".into(), serde_json::json!(ph_data.background));
-                        }
-                        if let Some(ref args) = ph_data.launch_args {
-                            resume_updates.insert("launch_args".into(), serde_json::json!(args));
-                        }
-                        // Reset status_context for ready event
-                        if std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1") {
-                            resume_updates
-                                .insert("status_context".into(), serde_json::json!("new"));
-                        }
-                    }
-
-                    // Delete true placeholder (temporary identity)
-                    match db.delete_instance(ph_name) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
-                                crate::log::log_error(
-                                    "binding",
-                                    "bind_canonical.rollback_endpoints",
-                                    &format!("{e}"),
-                                );
-                            }
-                        }
-                        Err(e) => {
+                // Delete true placeholder (temporary identity)
+                match db.delete_instance(ph_name) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
                             crate::log::log_error(
                                 "binding",
-                                "bind_canonical.delete_placeholder",
+                                "bind_canonical.rollback_endpoints",
                                 &format!("{e}"),
                             );
-                            if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
-                                crate::log::log_error(
-                                    "binding",
-                                    "bind_canonical.rollback_endpoints",
-                                    &format!("{e}"),
-                                );
-                            }
                         }
                     }
-                } else {
-                    // Path 1b: Session switch — mark old instance inactive
-                    crate::instance_lifecycle::set_status(
-                        db,
-                        ph_name,
-                        ST_INACTIVE,
-                        "exit:session_switch",
-                        Default::default(),
-                    );
-                    if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
+                    Err(e) => {
                         crate::log::log_error(
                             "binding",
-                            "bind_canonical.delete_session_bindings",
+                            "bind_canonical.delete_placeholder",
                             &format!("{e}"),
                         );
+                        if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
+                            crate::log::log_error(
+                                "binding",
+                                "bind_canonical.rollback_endpoints",
+                                &format!("{e}"),
+                            );
+                        }
                     }
+                }
+            } else {
+                // Path 1b: Session switch — mark old instance inactive
+                crate::instance_lifecycle::set_status(
+                    db,
+                    ph_name,
+                    ST_INACTIVE,
+                    "exit:session_switch",
+                    Default::default(),
+                );
+                if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
+                    crate::log::log_error(
+                        "binding",
+                        "bind_canonical.delete_session_bindings",
+                        &format!("{e}"),
+                    );
                 }
             }
         }
 
         update_instance_position(db, canonical_name, &resume_updates);
 
-        if let Some(pid) = process_id {
-            if let Err(e) = db.set_process_binding(pid, session_id, canonical_name) {
-                crate::log::log_error(
-                    "binding",
-                    "bind_canonical.set_process_binding",
-                    &format!("{e}"),
-                );
-            }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, canonical_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "bind_canonical.set_process_binding",
+                &format!("{e}"),
+            );
         }
 
         return Some(canonical_name.clone());
@@ -419,14 +412,14 @@ pub fn bind_session_to_process(
                 &format!("{e}"),
             );
         }
-        if let Some(pid) = process_id {
-            if let Err(e) = db.set_process_binding(pid, session_id, ph_name) {
-                crate::log::log_error(
-                    "binding",
-                    "bind_placeholder.set_process_binding",
-                    &format!("{e}"),
-                );
-            }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, ph_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "bind_placeholder.set_process_binding",
+                &format!("{e}"),
+            );
         }
 
         return Some(ph_name.clone());
@@ -563,12 +556,11 @@ pub fn initialize_instance_in_position_file(
 
             if let Some(t) = tag {
                 data.insert("tag".into(), serde_json::json!(t));
-            } else if session_id.is_some() || parent_session_id.is_some() || is_launched {
-                if let Ok(hcom_config) = crate::config::HcomConfig::load(None) {
-                    if !hcom_config.tag.is_empty() {
-                        data.insert("tag".into(), serde_json::json!(hcom_config.tag));
-                    }
-                }
+            } else if (session_id.is_some() || parent_session_id.is_some() || is_launched)
+                && let Ok(hcom_config) = crate::config::HcomConfig::load(None)
+                && !hcom_config.tag.is_empty()
+            {
+                data.insert("tag".into(), serde_json::json!(hcom_config.tag));
             }
 
             if let Some(wt) = wait_timeout {
@@ -676,10 +668,10 @@ pub fn create_orphaned_pty_identity(
     if let Err(e) = db.rebind_session(session_id, &name) {
         eprintln!("[hcom] warn: rebind_session failed for {name}: {e}");
     }
-    if let Some(pid) = process_id {
-        if let Err(e) = db.set_process_binding(pid, session_id, &name) {
-            eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
-        }
+    if let Some(pid) = process_id
+        && let Err(e) = db.set_process_binding(pid, session_id, &name)
+    {
+        eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
 
     Some(name)
@@ -697,20 +689,18 @@ pub fn resolve_instance_from_binding(
     session_id: Option<&str>,
     process_id: Option<&str>,
 ) -> Option<InstanceRow> {
-    if let Some(pid) = process_id {
-        if let Ok(Some(name)) = db.get_process_binding(pid) {
-            if let Ok(Some(instance)) = db.get_instance_full(&name) {
-                return Some(instance);
-            }
-        }
+    if let Some(pid) = process_id
+        && let Ok(Some(name)) = db.get_process_binding(pid)
+        && let Ok(Some(instance)) = db.get_instance_full(&name)
+    {
+        return Some(instance);
     }
 
-    if let Some(sid) = session_id {
-        if let Some(name) = db.get_session_binding(sid).ok().flatten() {
-            if let Ok(Some(instance)) = db.get_instance_full(&name) {
-                return Some(instance);
-            }
-        }
+    if let Some(sid) = session_id
+        && let Some(name) = db.get_session_binding(sid).ok().flatten()
+        && let Ok(Some(instance)) = db.get_instance_full(&name)
+    {
+        return Some(instance);
     }
 
     None

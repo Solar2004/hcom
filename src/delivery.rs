@@ -54,10 +54,10 @@ fn refresh_binding(
             if let Err(e) = db.update_tcp_mode(&new_name, true) {
                 log_warn("native", "delivery.update_tcp_mode_fail", &format!("{}", e));
             }
-            if let Some(shared) = shared_name {
-                if let Ok(mut s) = shared.write() {
-                    *s = full_display_name(db, &new_name);
-                }
+            if let Some(shared) = shared_name
+                && let Ok(mut s) = shared.write()
+            {
+                *s = full_display_name(db, &new_name);
             }
             *current_name = new_name;
         }
@@ -93,10 +93,10 @@ fn refresh_status(
         }
     };
     if new_status != *current_status {
-        if let Some(shared) = shared_status {
-            if let Ok(mut s) = shared.write() {
-                *s = new_status.clone();
-            }
+        if let Some(shared) = shared_status
+            && let Ok(mut s) = shared.write()
+        {
+            *s = new_status.clone();
         }
         *current_status = new_status;
     }
@@ -110,10 +110,10 @@ fn refresh_display_name(
 ) {
     if let Some(shared) = shared_name {
         let new_display = full_display_name(db, current_name);
-        if let Ok(mut s) = shared.write() {
-            if *s != new_display {
-                *s = new_display;
-            }
+        if let Ok(mut s) = shared.write()
+            && *s != new_display
+        {
+            *s = new_display;
         }
     }
 }
@@ -586,10 +586,10 @@ pub fn run_delivery_loop(
     }
 
     // Set shared display name for PTY title (tag-name or just name)
-    if let Some(ref shared) = shared_name {
-        if let Ok(mut s) = shared.write() {
-            *s = full_display_name(db, &current_name);
-        }
+    if let Some(ref shared) = shared_name
+        && let Ok(mut s) = shared.write()
+    {
+        *s = full_display_name(db, &current_name);
     }
 
     // OpenCode: plugin handles delivery after session exists. The delivery thread
@@ -752,25 +752,23 @@ pub fn run_delivery_loop(
                     }
 
                     // Clear stale PTY-owned approval state even when no messages are pending.
-                    if let Ok(Some((status, context))) = db.get_status(&current_name) {
-                        if status == ST_BLOCKED && context == "pty:approval" {
-                            let approval_showing = {
-                                let screen = state.screen.read().unwrap();
-                                screen.approval
-                            };
-                            if !approval_showing {
-                                if let Err(e) = db.set_status(
-                                    &current_name,
-                                    ST_LISTENING,
-                                    "pty:approval_cleared",
-                                ) {
-                                    log_warn(
-                                        "native",
-                                        "delivery.set_status_fail",
-                                        &format!("Failed to clear PTY approval status: {}", e),
-                                    );
-                                }
-                            }
+                    if let Ok(Some((status, context))) = db.get_status(&current_name)
+                        && status == ST_BLOCKED
+                        && context == "pty:approval"
+                    {
+                        let approval_showing = {
+                            let screen = state.screen.read().unwrap();
+                            screen.approval
+                        };
+                        if !approval_showing
+                            && let Err(e) =
+                                db.set_status(&current_name, ST_LISTENING, "pty:approval_cleared")
+                        {
+                            log_warn(
+                                "native",
+                                "delivery.set_status_fail",
+                                &format!("Failed to clear PTY approval status: {}", e),
+                            );
                         }
                     }
 
@@ -889,7 +887,7 @@ pub fn run_delivery_loop(
                         }
 
                         // Log gate failure
-                        if attempt == 0 || attempt % 5 == 0 {
+                        if attempt == 0 || attempt.is_multiple_of(5) {
                             let screen = state.screen.read().unwrap();
                             log_info(
                                 "native",
@@ -993,36 +991,36 @@ pub fn run_delivery_loop(
                                 }
                             }
                             // Fall through to TUI status update
-                            if let Some(since) = block_since {
-                                if since.elapsed().as_secs_f64() >= 2.0 {
-                                    match db.get_status(&current_name) {
-                                        Ok(Some((status, _))) if status == ST_LISTENING => {
-                                            let context = "tui:not-idle".to_string();
-                                            if context != last_block_context {
-                                                if let Err(e) = db.set_gate_status(
-                                                    &current_name,
-                                                    &context,
-                                                    "waiting for idle status",
-                                                ) {
-                                                    log_warn(
-                                                        "native",
-                                                        "delivery.gate_status_fail",
-                                                        &format!("{}", e),
-                                                    );
-                                                }
-                                                last_block_context = context;
+                            if let Some(since) = block_since
+                                && since.elapsed().as_secs_f64() >= 2.0
+                            {
+                                match db.get_status(&current_name) {
+                                    Ok(Some((status, _))) if status == ST_LISTENING => {
+                                        let context = "tui:not-idle".to_string();
+                                        if context != last_block_context {
+                                            if let Err(e) = db.set_gate_status(
+                                                &current_name,
+                                                &context,
+                                                "waiting for idle status",
+                                            ) {
+                                                log_warn(
+                                                    "native",
+                                                    "delivery.gate_status_fail",
+                                                    &format!("{}", e),
+                                                );
                                             }
+                                            last_block_context = context;
                                         }
-                                        Ok(Some(_)) | Ok(None) => {
-                                            // Status not "listening" or not found - skip
-                                        }
-                                        Err(e) => {
-                                            log_error(
-                                                "native",
-                                                "delivery.tui_status_update",
-                                                &format!("DB error checking status: {}", e),
-                                            );
-                                        }
+                                    }
+                                    Ok(Some(_)) | Ok(None) => {
+                                        // Status not "listening" or not found - skip
+                                    }
+                                    Err(e) => {
+                                        log_error(
+                                            "native",
+                                            "delivery.tui_status_update",
+                                            &format!("DB error checking status: {}", e),
+                                        );
                                     }
                                 }
                             }
@@ -1105,45 +1103,46 @@ pub fn run_delivery_loop(
                             ),
                         );
                     }
-                    if let Some(ref input_text) = screen.input_text {
-                        if !injected_text.is_empty() && input_text.contains(&injected_text) {
-                            drop(screen);
-                            log_info(
-                                "native",
-                                "delivery.text_rendered",
-                                "Injected text appeared in input box, sending Enter",
-                            );
-                            // Text appeared - send Enter
-                            delivery_state = State::WaitTextClear;
-                            phase_started_at = Instant::now();
-                            enter_attempt = 0;
+                    if let Some(ref input_text) = screen.input_text
+                        && !injected_text.is_empty()
+                        && input_text.contains(&injected_text)
+                    {
+                        drop(screen);
+                        log_info(
+                            "native",
+                            "delivery.text_rendered",
+                            "Injected text appeared in input box, sending Enter",
+                        );
+                        // Text appeared - send Enter
+                        delivery_state = State::WaitTextClear;
+                        phase_started_at = Instant::now();
+                        enter_attempt = 0;
 
-                            // Re-check submit hazards only. The full gate ran before
-                            // injection; by now a permission prompt or user typing may
-                            // have appeared. Text in the prompt is harmless — pressing
-                            // Enter is what would clobber state.
-                            if !state.is_user_active() {
-                                let screen = state.screen.read().unwrap();
-                                if !screen.approval {
-                                    drop(screen);
-                                    log_info("native", "delivery.send_enter", "Sending Enter key");
-                                    inject_enter(state.inject_port);
-                                } else {
-                                    log_info(
-                                        "native",
-                                        "delivery.enter_blocked",
-                                        "Enter blocked by approval prompt",
-                                    );
-                                }
+                        // Re-check submit hazards only. The full gate ran before
+                        // injection; by now a permission prompt or user typing may
+                        // have appeared. Text in the prompt is harmless — pressing
+                        // Enter is what would clobber state.
+                        if !state.is_user_active() {
+                            let screen = state.screen.read().unwrap();
+                            if !screen.approval {
+                                drop(screen);
+                                log_info("native", "delivery.send_enter", "Sending Enter key");
+                                inject_enter(state.inject_port);
                             } else {
                                 log_info(
                                     "native",
                                     "delivery.enter_blocked",
-                                    "Enter blocked by user activity",
+                                    "Enter blocked by approval prompt",
                                 );
                             }
-                            continue;
+                        } else {
+                            log_info(
+                                "native",
+                                "delivery.enter_blocked",
+                                "Enter blocked by user activity",
+                            );
                         }
+                        continue;
                     }
                     drop(screen);
 
@@ -1424,10 +1423,10 @@ pub fn run_delivery_loop(
     }
 
     // Always clean up our own process binding (keyed by our process_id, not name)
-    if !process_id.is_empty() {
-        if let Err(e) = db.delete_process_binding(&process_id) {
-            log_warn("native", "delivery.cleanup_binding_fail", &format!("{}", e));
-        }
+    if !process_id.is_empty()
+        && let Err(e) = db.delete_process_binding(&process_id)
+    {
+        log_warn("native", "delivery.cleanup_binding_fail", &format!("{}", e));
     }
 }
 

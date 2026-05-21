@@ -138,17 +138,17 @@ pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -
             }
             "status" => {
                 // Truncate detail unless --cmd or --file filter active
-                if !filters.contains_key("cmd") && !filters.contains_key("file") {
-                    if let Some(detail) = obj.get("detail").and_then(|v| v.as_str()) {
-                        if detail.len() > 60 {
-                            let end = (0..=60)
-                                .rev()
-                                .find(|&i| detail.is_char_boundary(i))
-                                .unwrap_or(0);
-                            let truncated = format!("{}...", &detail[..end]);
-                            obj.insert("detail".into(), json!(truncated));
-                        }
-                    }
+                if !filters.contains_key("cmd")
+                    && !filters.contains_key("file")
+                    && let Some(detail) = obj.get("detail").and_then(|v| v.as_str())
+                    && detail.len() > 60
+                {
+                    let end = (0..=60)
+                        .rev()
+                        .find(|&i| detail.is_char_boundary(i))
+                        .unwrap_or(0);
+                    let truncated = format!("{}...", &detail[..end]);
+                    obj.insert("detail".into(), json!(truncated));
                 }
                 obj.remove("position");
             }
@@ -347,11 +347,10 @@ fn events_sub_filter(
                 &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
                 [],
                 |row| row.get::<_, i64>(0),
-            ) {
-                if count > 0 {
-                    println!("  historical matches: {count} events");
-                    println!("  You will be notified on the next matching event(s)");
-                }
+            ) && count > 0
+            {
+                println!("  historical matches: {count} events");
+                println!("  You will be notified on the next matching event(s)");
             }
 
             maybe_show_tip(db, caller, "sub:created");
@@ -401,8 +400,8 @@ fn events_sub_sql(
             // Show latest match as example
             if let Ok(mut stmt) = db.conn().prepare(
                 &format!("SELECT timestamp, type, instance FROM events_v WHERE ({sql}) ORDER BY id DESC LIMIT 1")
-            ) {
-                if let Ok(row) = stmt.query_row([], |row| {
+            )
+                && let Ok(row) = stmt.query_row([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -412,7 +411,6 @@ fn events_sub_sql(
                     let ts = if row.0.len() > 19 { &row.0[..19] } else { &row.0 };
                     println!("  latest match: [{}] {} @ {}", row.1, row.2, ts);
                 }
-            }
             println!("  You will be notified on the next matching event(s)");
         } else {
             println!("  historical matches: 0 (filter will apply to future events only)");
@@ -804,20 +802,18 @@ fn events_wait(
     let lookback_query = format!(
         "SELECT * FROM events_v WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
     );
-    if let Ok(mut stmt) = db.conn().prepare(&lookback_query) {
-        if let Ok(mut rows) = stmt.query(rusqlite::params![lookback_ts]) {
-            if let Ok(Some(row)) = rows.next() {
-                if let Ok(event) = parse_event_row(row) {
-                    let output = if full_output {
-                        event.clone()
-                    } else {
-                        streamline_event(&event, filters)
-                    };
-                    println!("{}", serde_json::to_string(&output).unwrap_or_default());
-                    return 0;
-                }
-            }
-        }
+    if let Ok(mut stmt) = db.conn().prepare(&lookback_query)
+        && let Ok(mut rows) = stmt.query(rusqlite::params![lookback_ts])
+        && let Ok(Some(row)) = rows.next()
+        && let Ok(event) = parse_event_row(row)
+    {
+        let output = if full_output {
+            event.clone()
+        } else {
+            streamline_event(&event, filters)
+        };
+        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+        return 0;
     }
 
     // Setup TCP notify server for instant wake — only useful when we can
@@ -826,16 +822,15 @@ fn events_wait(
     // fall through to a short poll.
     let mut notify_server: Option<TcpListener> = None;
     let mut notify_port: Option<u16> = None;
-    if let Some(name) = instance_name {
-        if let Ok(server) = TcpListener::bind("127.0.0.1:0") {
-            if let Ok(addr) = server.local_addr() {
-                let port = addr.port();
-                server.set_nonblocking(true).ok();
-                if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
-                    notify_server = Some(server);
-                    notify_port = Some(port);
-                }
-            }
+    if let Some(name) = instance_name
+        && let Ok(server) = TcpListener::bind("127.0.0.1:0")
+        && let Ok(addr) = server.local_addr()
+    {
+        let port = addr.port();
+        server.set_nonblocking(true).ok();
+        if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
+            notify_server = Some(server);
+            notify_port = Some(port);
         }
     }
 
@@ -1153,51 +1148,50 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 
         // Search archives
         let archive_dir = crate::paths::hcom_dir().join("archive");
-        if archive_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&archive_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let db_path = path.join("hcom.db");
-                    if !db_path.exists() {
-                        continue;
-                    }
-                    let archive_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("archive");
+        if archive_dir.exists()
+            && let Ok(entries) = std::fs::read_dir(&archive_dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let db_path = path.join("hcom.db");
+                if !db_path.exists() {
+                    continue;
+                }
+                let archive_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("archive");
 
-                    if let Ok(archive_db) = HcomDb::open_raw(&db_path) {
-                        // Build archive query with same filters
-                        let archive_filter = filter_query.clone();
-                        let query = format!(
-                            "SELECT * FROM events_v WHERE 1=1{archive_filter} ORDER BY id DESC LIMIT {last_n}"
-                        );
-                        if let Ok(mut stmt) = archive_db.conn().prepare(&query) {
-                            if let Ok(rows) = stmt.query_map([], |row| {
-                                let id: i64 = row.get("id")?;
-                                let ts: String = row.get("timestamp")?;
-                                let etype: String = row.get("type")?;
-                                let instance: String = row.get("instance")?;
-                                let data_str: String = row.get("data")?;
-                                Ok((id, ts, etype, instance, data_str))
-                            }) {
-                                for row in rows.flatten() {
-                                    let (id, ts, etype, instance, data_str) = row;
-                                    let data: Value =
-                                        serde_json::from_str(&data_str).unwrap_or(json!({}));
-                                    all_events.push(json!({
-                                        "id": id,
-                                        "ts": ts,
-                                        "type": etype,
-                                        "instance": instance,
-                                        "data": data,
-                                        "source": archive_name,
-                                    }));
-                                }
-                            }
+                if let Ok(archive_db) = HcomDb::open_raw(&db_path) {
+                    // Build archive query with same filters
+                    let archive_filter = filter_query.clone();
+                    let query = format!(
+                        "SELECT * FROM events_v WHERE 1=1{archive_filter} ORDER BY id DESC LIMIT {last_n}"
+                    );
+                    if let Ok(mut stmt) = archive_db.conn().prepare(&query)
+                        && let Ok(rows) = stmt.query_map([], |row| {
+                            let id: i64 = row.get("id")?;
+                            let ts: String = row.get("timestamp")?;
+                            let etype: String = row.get("type")?;
+                            let instance: String = row.get("instance")?;
+                            let data_str: String = row.get("data")?;
+                            Ok((id, ts, etype, instance, data_str))
+                        })
+                    {
+                        for row in rows.flatten() {
+                            let (id, ts, etype, instance, data_str) = row;
+                            let data: Value = serde_json::from_str(&data_str).unwrap_or(json!({}));
+                            all_events.push(json!({
+                                "id": id,
+                                "ts": ts,
+                                "type": etype,
+                                "instance": instance,
+                                "data": data,
+                                "source": archive_name,
+                            }));
                         }
                     }
                 }

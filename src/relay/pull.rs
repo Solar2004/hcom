@@ -616,13 +616,13 @@ fn import_remote_events(
         // - `mentions` / `delivered_to` strip *our own* suffix -> local delivery still matches
         if let Some(obj) = data.as_object_mut() {
             // Namespace 'from' field
-            if let Some(from) = obj.get("from").and_then(|v| v.as_str()).map(String::from) {
-                if !from.contains(':') {
-                    obj.insert(
-                        "from".to_string(),
-                        Value::String(super::add_device_suffix(&from, short_id)),
-                    );
-                }
+            if let Some(from) = obj.get("from").and_then(|v| v.as_str()).map(String::from)
+                && !from.contains(':')
+            {
+                obj.insert(
+                    "from".to_string(),
+                    Value::String(super::add_device_suffix(&from, short_id)),
+                );
             }
 
             // Strip own device suffix from mentions and delivered_to

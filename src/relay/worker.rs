@@ -183,10 +183,10 @@ pub fn run() -> i32 {
     relay.run(connection);
 
     // Clear notify port so CLI callers stop trying to connect
-    if notify_port.is_some() {
-        if let Ok(db) = HcomDb::open() {
-            super::safe_kv_set(&db, "relay_daemon_port", None);
-        }
+    if notify_port.is_some()
+        && let Ok(db) = HcomDb::open()
+    {
+        super::safe_kv_set(&db, "relay_daemon_port", None);
     }
 
     log::log_info("relay", "relay_worker.stop", "exited cleanly");
@@ -314,19 +314,20 @@ fn local_instance_count(db: &HcomDb) -> i64 {
 /// Returns true if spawned successfully, false if already running or spawn failed.
 fn do_spawn() -> bool {
     let lock_path = spawn_lock_path();
-    if let Some(parent) = lock_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            log::log_warn(
-                "relay",
-                "relay_worker.spawn_lock_mkdir_err",
-                &format!("{e}"),
-            );
-            return false;
-        }
+    if let Some(parent) = lock_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        log::log_warn(
+            "relay",
+            "relay_worker.spawn_lock_mkdir_err",
+            &format!("{e}"),
+        );
+        return false;
     }
 
     let lock_file = match std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path)
@@ -501,17 +502,14 @@ fn poll_until_ready(timeout_ms: u64) -> bool {
     let db = HcomDb::open().ok();
 
     while start.elapsed() < deadline {
-        if let Some(ref db) = db {
-            if let Some(port_str) = super::safe_kv_get(db, "relay_daemon_port") {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    use std::net::{SocketAddr, TcpStream};
-                    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                    if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50))
-                        .is_ok()
-                    {
-                        return true;
-                    }
-                }
+        if let Some(ref db) = db
+            && let Some(port_str) = super::safe_kv_get(db, "relay_daemon_port")
+            && let Ok(port) = port_str.trim().parse::<u16>()
+        {
+            use std::net::{SocketAddr, TcpStream};
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50)).is_ok() {
+                return true;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(30));

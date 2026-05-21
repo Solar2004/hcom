@@ -6,12 +6,12 @@ static HCOM_PREFIX: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(
         return vec!["hcom".into()];
     }
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Ok(resolved) = exe.canonicalize() {
-            let has_uv = resolved.components().any(|c| c.as_os_str() == "uv");
-            if has_uv {
-                return vec!["uvx".into(), "hcom".into()];
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Ok(resolved) = exe.canonicalize()
+    {
+        let has_uv = resolved.components().any(|c| c.as_os_str() == "uv");
+        if has_uv {
+            return vec!["uvx".into(), "hcom".into()];
         }
     }
 

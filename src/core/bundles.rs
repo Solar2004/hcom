@@ -226,19 +226,19 @@ pub fn validate_bundle(bundle: &mut Value) -> Result<(), String> {
     }
 
     // Validate extends
-    if let Some(extends) = obj.get("extends") {
-        if !extends.is_string() {
-            return Err("extends must be a string".into());
-        }
-        // Note: parent bundle existence check requires DB access.
-        // Call validate_extends_reference() separately when DB is available.
+    if let Some(extends) = obj.get("extends")
+        && !extends.is_string()
+    {
+        return Err("extends must be a string".into());
     }
+    // Note: parent bundle existence check requires DB access.
+    // Call validate_extends_reference() separately when DB is available.
 
     // Validate bundle_id
-    if let Some(bid) = obj.get("bundle_id") {
-        if !bid.is_string() {
-            return Err("bundle_id must be a string".into());
-        }
+    if let Some(bid) = obj.get("bundle_id")
+        && !bid.is_string()
+    {
+        return Err("bundle_id must be a string".into());
     }
 
     Ok(())

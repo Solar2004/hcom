@@ -204,19 +204,17 @@ fn correlate_paths_to_hcom(
         "SELECT name, transcript_path, session_id
          FROM instances
          WHERE transcript_path IS NOT NULL",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        }) {
-            for (name, tp, session_id) in rows.flatten() {
-                let key = transcript_search_key(&tp, session_id.as_deref());
-                if target_keys.contains(&key) {
-                    result.insert(key, name);
-                }
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    }) {
+        for (name, tp, session_id) in rows.flatten() {
+            let key = transcript_search_key(&tp, session_id.as_deref());
+            if target_keys.contains(&key) {
+                result.insert(key, name);
             }
         }
     }
@@ -230,19 +228,17 @@ fn correlate_paths_to_hcom(
          AND json_extract(data, '$.action') = 'stopped' \
          AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL \
          ORDER BY id DESC",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        }) {
-            for (name, tp, session_id) in rows.flatten() {
-                let key = transcript_search_key(&tp, session_id.as_deref());
-                if target_keys.contains(&key) && !result.contains_key(&key) {
-                    result.insert(key, name);
-                }
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    }) {
+        for (name, tp, session_id) in rows.flatten() {
+            let key = transcript_search_key(&tp, session_id.as_deref());
+            if target_keys.contains(&key) && !result.contains_key(&key) {
+                result.insert(key, name);
             }
         }
     }
@@ -371,10 +367,10 @@ fn cmd_transcript_search(
                 break;
             }
             let agent = detect_agent_type(file_path);
-            if let Some(af) = agent_filter {
-                if !agent.contains(af) {
-                    continue;
-                }
+            if let Some(af) = agent_filter
+                && !agent.contains(af)
+            {
+                continue;
             }
             let hcom_name = path_to_hcom
                 .get(&transcript_search_key(file_path, None))
@@ -393,23 +389,24 @@ fn cmd_transcript_search(
                     file_path,
                 ])
                 .output();
-            if let Ok(out) = out {
-                if out.status.success() {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let lines: Vec<&str> = stdout.lines().collect();
-                    let match_count = lines.len();
-                    if match_count > 0 {
-                        let first_line = lines[0];
-                        let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
-                            let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
-                            let text = &first_line[colon_pos + 1..];
-                            let text = truncate_str(text, 100);
-                            (num, text.to_string())
-                        } else {
-                            (0, first_line.to_string())
-                        };
+            if let Ok(out) = out
+                && out.status.success()
+            {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<&str> = stdout.lines().collect();
+                let match_count = lines.len();
+                if match_count > 0 {
+                    let first_line = lines[0];
+                    let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
+                        let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
+                        let text = &first_line[colon_pos + 1..];
+                        let text = truncate_str(text, 100);
+                        (num, text.to_string())
+                    } else {
+                        (0, first_line.to_string())
+                    };
 
-                        results.push(json!({
+                    results.push(json!({
                             "hcom_name": if hcom_name.is_empty() { serde_json::Value::Null } else { json!(hcom_name) },
                             "agent": agent,
                             "path": file_path,
@@ -417,7 +414,6 @@ fn cmd_transcript_search(
                             "text": snippet,
                             "matches": match_count,
                         }));
-                    }
                 }
             }
         }
@@ -503,8 +499,8 @@ fn cmd_transcript_search(
         // Active instances
         if let Ok(mut stmt) = db.conn().prepare(
             "SELECT name, transcript_path, tool FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
-        ) {
-            if let Ok(rows) = stmt.query_map([], |row| {
+        )
+            && let Ok(rows) = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -512,22 +508,20 @@ fn cmd_transcript_search(
                 ))
             }) {
                 for (name, path, tool) in rows.flatten() {
-                    if let Some(agent) = agent_filter {
-                        if !tool.contains(agent.as_str()) { continue; }
-                    }
+                    if let Some(agent) = agent_filter
+                        && !tool.contains(agent.as_str()) { continue; }
                     if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                     seen.insert(name.clone());
                     paths.push((name, path, tool));
                 }
             }
-        }
 
         // Stopped instances from life event snapshots (C2/C3 fix)
-        if !live_mode {
-            if let Ok(mut stmt) = db.conn().prepare(
+        if !live_mode
+            && let Ok(mut stmt) = db.conn().prepare(
                 "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
-            ) {
-                if let Ok(rows) = stmt.query_map([], |row| {
+            )
+                && let Ok(rows) = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -536,16 +530,13 @@ fn cmd_transcript_search(
                 }) {
                     for (name, path, tool) in rows.flatten() {
                         if seen.contains(&name) { continue; }
-                        if let Some(agent) = agent_filter {
-                            if !tool.contains(agent.as_str()) { continue; }
-                        }
+                        if let Some(agent) = agent_filter
+                            && !tool.contains(agent.as_str()) { continue; }
                         if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                         seen.insert(name.clone());
                         paths.push((name, path, tool));
                     }
                 }
-            }
-        }
     }
 
     // Search using ripgrep (with line-level matches + snippets) — hcom-tracked/live paths
@@ -574,32 +565,32 @@ fn cmd_transcript_search(
                     .output()
             });
 
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let lines: Vec<&str> = stdout.lines().collect();
-                let match_count = lines.len();
-                if match_count > 0 {
-                    // Extract first match line number and snippet
-                    let first_line = lines[0];
-                    let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
-                        let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
-                        let text = &first_line[colon_pos + 1..];
-                        let text = truncate_str(text, 100);
-                        (num, text.to_string())
-                    } else {
-                        (0, first_line.to_string())
-                    };
+        if let Ok(out) = output
+            && out.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            let match_count = lines.len();
+            if match_count > 0 {
+                // Extract first match line number and snippet
+                let first_line = lines[0];
+                let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
+                    let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
+                    let text = &first_line[colon_pos + 1..];
+                    let text = truncate_str(text, 100);
+                    (num, text.to_string())
+                } else {
+                    (0, first_line.to_string())
+                };
 
-                    results.push(json!({
-                        "hcom_name": name,
-                        "agent": agent,
-                        "path": path,
-                        "line": line_num,
-                        "text": snippet,
-                        "matches": match_count,
-                    }));
-                }
+                results.push(json!({
+                    "hcom_name": name,
+                    "agent": agent,
+                    "path": path,
+                    "line": line_num,
+                    "text": snippet,
+                    "matches": match_count,
+                }));
             }
         }
 
@@ -684,8 +675,8 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
     // Active instances
     if let Ok(mut stmt) = db.conn().prepare(
         "SELECT name, transcript_path, tool, session_id FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -711,13 +702,12 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
                 }
             }
         }
-    }
 
     // Stopped instances from life event snapshots
     if let Ok(mut stmt) = db.conn().prepare(
         "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -744,7 +734,6 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
                 }
             }
         }
-    }
 
     // Sort by timestamp (most recent first)
     all_entries.sort_by(|a, b| {
@@ -898,10 +887,10 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         }
     }
 
-    if let Some(ref range_pos) = args.range_positional {
-        if range_str.is_none() {
-            range_str = Some(range_pos.clone());
-        }
+    if let Some(ref range_pos) = args.range_positional
+        && range_str.is_none()
+    {
+        range_str = Some(range_pos.clone());
     }
 
     // Resolve target to transcript path
@@ -1265,11 +1254,11 @@ fn parse_range(s: &str) -> (Option<usize>, Option<usize>) {
         let start: Option<usize> = s[..dash_pos].parse().ok().filter(|&v: &usize| v >= 1);
         let end: Option<usize> = s[dash_pos + 1..].parse().ok().filter(|&v: &usize| v >= 1);
         // Validate start <= end
-        if let (Some(s), Some(e)) = (start, end) {
-            if s > e {
-                eprintln!("Error: invalid range '{s}-{e}' (start must be <= end)");
-                return (None, None);
-            }
+        if let (Some(s), Some(e)) = (start, end)
+            && s > e
+        {
+            eprintln!("Error: invalid range '{s}-{e}' (start must be <= end)");
+            return (None, None);
         }
         (start, end)
     } else {

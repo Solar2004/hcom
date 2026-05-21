@@ -98,45 +98,44 @@ pub(crate) fn extract_edit_info(
     tool_input: &Value,
 ) -> Option<Value> {
     // Try toolUseResult first
-    if let Some(result) = tool_use_result.as_ref().and_then(|v| v.as_object()) {
-        if result.contains_key("structuredPatch") || result.contains_key("oldString") {
-            let file = result
-                .get("filePath")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let diff = if let Some(patch) = result.get("structuredPatch").and_then(|v| v.as_array())
-            {
-                format_structured_patch(patch)
-            } else if let (Some(old), Some(new)) = (
-                result.get("oldString").and_then(|v| v.as_str()),
-                result.get("newString").and_then(|v| v.as_str()),
-            ) {
-                let old_preview = truncate_str(old, 100);
-                let new_preview = truncate_str(new, 100);
-                let old_suffix = if old.len() > 100 { "..." } else { "" };
-                let new_suffix = if new.len() > 100 { "..." } else { "" };
-                format!("-{old_preview}{old_suffix}\n+{new_preview}{new_suffix}")
-            } else {
-                String::new()
-            };
-            return Some(json!({"file": file, "diff": diff}));
-        }
-    }
-
-    // Fallback: extract from tool_use input
-    if let Some(obj) = tool_input.as_object() {
-        if obj.contains_key("old_string") || obj.contains_key("new_string") {
-            let file = obj.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let old = obj.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new = obj.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(result) = tool_use_result.as_ref().and_then(|v| v.as_object())
+        && (result.contains_key("structuredPatch") || result.contains_key("oldString"))
+    {
+        let file = result
+            .get("filePath")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let diff = if let Some(patch) = result.get("structuredPatch").and_then(|v| v.as_array()) {
+            format_structured_patch(patch)
+        } else if let (Some(old), Some(new)) = (
+            result.get("oldString").and_then(|v| v.as_str()),
+            result.get("newString").and_then(|v| v.as_str()),
+        ) {
             let old_preview = truncate_str(old, 100);
             let new_preview = truncate_str(new, 100);
             let old_suffix = if old.len() > 100 { "..." } else { "" };
             let new_suffix = if new.len() > 100 { "..." } else { "" };
-            return Some(
-                json!({"file": file, "diff": format!("-{old_preview}{old_suffix}\n+{new_preview}{new_suffix}")}),
-            );
-        }
+            format!("-{old_preview}{old_suffix}\n+{new_preview}{new_suffix}")
+        } else {
+            String::new()
+        };
+        return Some(json!({"file": file, "diff": diff}));
+    }
+
+    // Fallback: extract from tool_use input
+    if let Some(obj) = tool_input.as_object()
+        && (obj.contains_key("old_string") || obj.contains_key("new_string"))
+    {
+        let file = obj.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+        let old = obj.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+        let new = obj.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+        let old_preview = truncate_str(old, 100);
+        let new_preview = truncate_str(new, 100);
+        let old_suffix = if old.len() > 100 { "..." } else { "" };
+        let new_suffix = if new.len() > 100 { "..." } else { "" };
+        return Some(
+            json!({"file": file, "diff": format!("-{old_preview}{old_suffix}\n+{new_preview}{new_suffix}")}),
+        );
     }
 
     None
