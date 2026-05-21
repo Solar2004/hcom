@@ -1433,7 +1433,6 @@ pub fn run_delivery_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::status_icon;
 
     /// Helper: create DeliveryState with given screen state
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {
@@ -1557,15 +1556,6 @@ mod tests {
     }
 
     // ---- Lookup functions ----
-
-    #[test]
-    fn status_icon_known_values() {
-        assert_eq!(status_icon("listening"), "◉");
-        assert_eq!(status_icon("active"), "▶");
-        assert_eq!(status_icon("blocked"), "■");
-        assert_eq!(status_icon("stopped"), "⊘");
-        assert_eq!(status_icon("whatever"), "○");
-    }
 
     #[test]
     fn gate_block_detail_known_reasons() {

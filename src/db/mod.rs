@@ -778,68 +778,16 @@ pub(super) mod tests {
     use rusqlite::{Connection, params};
     use std::path::PathBuf;
 
-    /// Create a test database with instances table
-    pub(super) fn setup_test_db() -> (Connection, PathBuf) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        let temp_dir = std::env::temp_dir();
-        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = temp_dir.join(format!("test_hcom_{}_{}.db", std::process::id(), test_id));
-
-        let conn = Connection::open(&db_path).unwrap();
-
-        // Create minimal schema
-        conn.execute_batch(
-            "CREATE TABLE instances (
-                name TEXT PRIMARY KEY,
-                status TEXT,
-                status_context TEXT,
-                status_detail TEXT,
-                last_event_id INTEGER,
-                transcript_path TEXT,
-                session_id TEXT,
-                tool TEXT,
-                directory TEXT,
-                parent_name TEXT,
-                tag TEXT,
-                wait_timeout INTEGER,
-                subagent_timeout INTEGER,
-                hints TEXT,
-                pid INTEGER,
-                created_at TEXT,
-                background INTEGER,
-                agent_id TEXT,
-                launch_args TEXT,
-                terminal_preset_requested TEXT,
-                terminal_preset_effective TEXT,
-                launch_context TEXT,
-                origin_device_id TEXT,
-                background_log_file TEXT,
-                status_time INTEGER
-            );
-
-            CREATE TABLE process_bindings (
-                process_id TEXT PRIMARY KEY,
-                session_id TEXT,
-                instance_name TEXT,
-                updated_at REAL NOT NULL
-            );",
-        )
-        .unwrap();
-
-        (conn, db_path)
-    }
-
     /// Clean up test database
     pub(super) fn cleanup_test_db(path: PathBuf) {
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-wal", path.display())));
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", path.display())));
     }
 
     #[test]
     fn test_all_methods_return_ok_none_when_not_found() {
-        let (_conn, db_path) = setup_test_db();
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let (db, db_path) = setup_full_test_db();
 
         // All these should return Ok(None) for non-existent data
         assert!(db.get_instance_status("nonexistent").unwrap().is_none());
@@ -864,8 +812,7 @@ pub(super) mod tests {
             test_id
         ));
 
-        let db = HcomDb::open_raw(&db_path).unwrap();
-        db.init_db().unwrap();
+        let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path)
     }
 

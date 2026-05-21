@@ -1575,19 +1575,11 @@ mod tests {
             std::process::id(),
             test_id
         ));
-        let conn = Connection::open(&db_path).unwrap();
 
         if with_notify_endpoints {
-            conn.execute_batch(
-                "CREATE TABLE notify_endpoints (
-                    instance TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    port INTEGER NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (instance, kind)
-                );",
-            )
-            .unwrap();
+            crate::db::HcomDb::open_at(&db_path).unwrap();
+        } else {
+            let _ = Connection::open(&db_path).unwrap();
         }
 
         db_path

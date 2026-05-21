@@ -837,20 +837,25 @@ impl HcomDb {
 #[cfg(test)]
 mod tests {
     use super::super::HcomDb;
-    use super::super::tests::{cleanup_test_db, setup_full_test_db, setup_test_db};
+    use super::super::tests::{cleanup_test_db, setup_full_test_db};
     use rusqlite::params;
+
+    fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
+        // Use open_raw here: open_at would repair the table we deliberately dropped.
+        HcomDb::open_raw(db_path).unwrap()
+    }
 
     #[test]
     fn test_get_instance_status_propagates_prepare_error() {
         // Verify that SQL errors are propagated as Err (not silently converted to None)
-        let (conn, db_path) = setup_test_db();
+        let (db, db_path) = setup_full_test_db();
 
         // Drop the instances table to cause SQL error
-        conn.execute("DROP TABLE instances", []).unwrap();
-        drop(conn);
+        db.conn().execute("DROP TABLE instances", []).unwrap();
+        drop(db);
 
         // Now HcomDb will fail when trying to query
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let db = reopen_broken_schema(&db_path);
 
         let result = db.get_instance_status("test");
 
@@ -868,8 +873,7 @@ mod tests {
     fn test_get_instance_status_returns_ok_none_when_not_found() {
         // Verify that "not found" is distinguished from "error" via Ok(None)
 
-        let (_conn, db_path) = setup_test_db();
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let (db, db_path) = setup_full_test_db();
 
         // Query non-existent instance
         let result = db.get_instance_status("nonexistent");
@@ -883,11 +887,11 @@ mod tests {
 
     #[test]
     fn test_get_status_propagates_prepare_error() {
-        let (conn, db_path) = setup_test_db();
-        conn.execute("DROP TABLE instances", []).unwrap();
-        drop(conn);
+        let (db, db_path) = setup_full_test_db();
+        db.conn().execute("DROP TABLE instances", []).unwrap();
+        drop(db);
 
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let db = reopen_broken_schema(&db_path);
         let result = db.get_status("test");
 
         let err = result.expect_err("SQL error should propagate as Err");
@@ -900,11 +904,11 @@ mod tests {
 
     #[test]
     fn test_get_transcript_path_propagates_prepare_error() {
-        let (conn, db_path) = setup_test_db();
-        conn.execute("DROP TABLE instances", []).unwrap();
-        drop(conn);
+        let (db, db_path) = setup_full_test_db();
+        db.conn().execute("DROP TABLE instances", []).unwrap();
+        drop(db);
 
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let db = reopen_broken_schema(&db_path);
         let result = db.get_transcript_path("test");
 
         let err = result.expect_err("SQL error should propagate as Err");
@@ -917,11 +921,11 @@ mod tests {
 
     #[test]
     fn test_get_instance_snapshot_propagates_prepare_error() {
-        let (conn, db_path) = setup_test_db();
-        conn.execute("DROP TABLE instances", []).unwrap();
-        drop(conn);
+        let (db, db_path) = setup_full_test_db();
+        db.conn().execute("DROP TABLE instances", []).unwrap();
+        drop(db);
 
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let db = reopen_broken_schema(&db_path);
         let result = db.get_instance_snapshot("test");
 
         let err = result.expect_err("SQL error should propagate as Err");

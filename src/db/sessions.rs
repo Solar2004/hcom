@@ -354,15 +354,22 @@ impl HcomDb {
 #[cfg(test)]
 mod tests {
     use super::super::HcomDb;
-    use super::super::tests::{cleanup_test_db, setup_full_test_db, setup_test_db};
+    use super::super::tests::{cleanup_test_db, setup_full_test_db};
+
+    fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
+        // Use open_raw here: open_at would repair the table we deliberately dropped.
+        HcomDb::open_raw(db_path).unwrap()
+    }
 
     #[test]
     fn test_get_process_binding_propagates_prepare_error() {
-        let (conn, db_path) = setup_test_db();
-        conn.execute("DROP TABLE process_bindings", []).unwrap();
-        drop(conn);
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute("DROP TABLE process_bindings", [])
+            .unwrap();
+        drop(db);
 
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let db = reopen_broken_schema(&db_path);
         let result = db.get_process_binding("test_pid");
 
         let err = result.expect_err("SQL error should propagate as Err");

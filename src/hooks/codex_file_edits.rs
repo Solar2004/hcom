@@ -283,7 +283,6 @@ pub fn run_transcript_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -302,7 +301,7 @@ mod tests {
             std::process::id(),
             test_id
         ));
-        let _ = Connection::open(&db_path).unwrap();
+        crate::db::HcomDb::open_at(&db_path).unwrap();
         db_path
     }
 
@@ -343,7 +342,7 @@ mod tests {
     #[test]
     fn logged_call_ids_bounds_memory() {
         let db_path = setup_test_db();
-        let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
+        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
         let mut w = watcher();
 
         for i in 0..10001 {

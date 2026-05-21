@@ -112,7 +112,6 @@ mod tests {
         allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name, is_too_similar,
         name_pool, score_name,
     };
-    use rusqlite::Connection;
     use std::collections::HashSet;
     use std::path::PathBuf;
 
@@ -128,82 +127,7 @@ mod tests {
             test_id
         ));
 
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             PRAGMA journal_mode=WAL;
-
-             CREATE TABLE events (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 timestamp TEXT NOT NULL,
-                 type TEXT NOT NULL,
-                 instance TEXT,
-                 data TEXT NOT NULL
-             );
-
-             CREATE TABLE instances (
-                 name TEXT PRIMARY KEY,
-                 session_id TEXT UNIQUE,
-                 parent_session_id TEXT,
-                 parent_name TEXT,
-                 tag TEXT,
-                 last_event_id INTEGER DEFAULT 0,
-                 status TEXT DEFAULT 'active',
-                 status_time INTEGER DEFAULT 0,
-                 status_context TEXT DEFAULT '',
-                 status_detail TEXT DEFAULT '',
-                 last_stop INTEGER DEFAULT 0,
-                 directory TEXT,
-                 created_at REAL NOT NULL DEFAULT 0,
-                 transcript_path TEXT DEFAULT '',
-                 tcp_mode INTEGER DEFAULT 0,
-                 wait_timeout INTEGER DEFAULT 86400,
-                 background INTEGER DEFAULT 0,
-                 background_log_file TEXT DEFAULT '',
-                 name_announced INTEGER DEFAULT 0,
-                 agent_id TEXT UNIQUE,
-                 running_tasks TEXT DEFAULT '',
-                 origin_device_id TEXT DEFAULT '',
-                 hints TEXT DEFAULT '',
-                 subagent_timeout INTEGER,
-                 tool TEXT DEFAULT 'claude',
-                 launch_args TEXT DEFAULT '',
-                 terminal_preset_requested TEXT DEFAULT '',
-                 terminal_preset_effective TEXT DEFAULT '',
-                 idle_since TEXT DEFAULT '',
-                 pid INTEGER DEFAULT NULL,
-                 launch_context TEXT DEFAULT '',
-                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
-             );
-
-             CREATE TABLE process_bindings (
-                 process_id TEXT PRIMARY KEY,
-                 session_id TEXT,
-                 instance_name TEXT,
-                 updated_at REAL NOT NULL
-             );
-
-             CREATE TABLE session_bindings (
-                 session_id TEXT PRIMARY KEY,
-                 instance_name TEXT NOT NULL,
-                 created_at REAL NOT NULL,
-                 FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE CASCADE
-             );
-
-             CREATE TABLE notify_endpoints (
-                 instance TEXT NOT NULL,
-                 kind TEXT NOT NULL,
-                 port INTEGER NOT NULL,
-                 updated_at REAL NOT NULL,
-                 PRIMARY KEY (instance, kind)
-             );
-
-             CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path)
     }
 

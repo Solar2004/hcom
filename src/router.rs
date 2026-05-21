@@ -904,14 +904,13 @@ mod tests {
     fn read_dev_root_from_kv_returns_stored_value() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
+        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2)",
+                rusqlite::params![DEV_ROOT_KV_KEY, "/tmp/dev-root"],
+            )
             .unwrap();
-        conn.execute(
-            "INSERT INTO kv (key, value) VALUES (?1, ?2)",
-            rusqlite::params![DEV_ROOT_KV_KEY, "/tmp/dev-root"],
-        )
-        .unwrap();
 
         assert_eq!(
             read_dev_root_from_kv(&db_path),
@@ -923,9 +922,7 @@ mod tests {
     fn read_dev_root_from_kv_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
-            .unwrap();
+        crate::db::HcomDb::open_at(&db_path).unwrap();
 
         assert_eq!(read_dev_root_from_kv(&db_path), None);
     }

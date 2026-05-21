@@ -78,30 +78,11 @@ impl HcomDb {
 
 #[cfg(test)]
 mod tests {
-    use super::super::HcomDb;
-    use super::super::tests::{cleanup_test_db, setup_test_db};
-    use rusqlite::Connection;
-    use std::path::PathBuf;
-
-    fn setup_test_db_with_endpoints() -> (Connection, PathBuf) {
-        let (conn, db_path) = setup_test_db();
-        conn.execute_batch(
-            "CREATE TABLE notify_endpoints (
-                instance TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                updated_at REAL NOT NULL,
-                PRIMARY KEY (instance, kind)
-            );",
-        )
-        .unwrap();
-        (conn, db_path)
-    }
+    use super::super::tests::{cleanup_test_db, setup_full_test_db};
 
     #[test]
     fn test_register_inject_port_inserts() {
-        let (_conn, db_path) = setup_test_db_with_endpoints();
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let (db, db_path) = setup_full_test_db();
 
         db.register_inject_port("test", 5555).unwrap();
 
@@ -120,8 +101,7 @@ mod tests {
 
     #[test]
     fn test_register_inject_port_upserts() {
-        let (_conn, db_path) = setup_test_db_with_endpoints();
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let (db, db_path) = setup_full_test_db();
 
         db.register_inject_port("test", 5555).unwrap();
         db.register_inject_port("test", 6666).unwrap();

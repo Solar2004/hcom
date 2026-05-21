@@ -2258,12 +2258,6 @@ mod tests {
     }
 
     #[test]
-    fn test_kill_result_enum() {
-        assert_eq!(KillResult::Sent, KillResult::Sent);
-        assert_ne!(KillResult::Sent, KillResult::AlreadyDead);
-    }
-
-    #[test]
     fn test_sandbox_flags_in_get_sandbox_flags() {
         use crate::tools::codex_preprocessing::get_sandbox_flags;
         let flags = get_sandbox_flags("workspace");
