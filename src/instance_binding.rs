@@ -719,7 +719,10 @@ pub fn resolve_instance_from_binding(
 /// Auto-subscribe instance to default event subscriptions from config.
 /// Called during instance creation.
 fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
-    if !matches!(tool, "claude" | "gemini" | "codex" | "opencode" | "kilocode") {
+    if !matches!(
+        tool,
+        "claude" | "gemini" | "codex" | "opencode" | "kilocode"
+    ) {
         return;
     }
 
@@ -812,7 +815,7 @@ mod tests {
             test_id
         ));
 
-        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (db, db_path)
     }

@@ -15,8 +15,7 @@ fn get_antigravity_extensions_dir() -> PathBuf {
 }
 
 fn get_extension_dir() -> PathBuf {
-    get_antigravity_extensions_dir()
-        .join(format!("{}-{}", EXTENSION_ID, EXTENSION_VERSION))
+    get_antigravity_extensions_dir().join(format!("{}-{}", EXTENSION_ID, EXTENSION_VERSION))
 }
 
 fn get_extensions_json_path() -> PathBuf {
@@ -117,9 +116,10 @@ fn update_extensions_json() -> std::io::Result<()> {
     });
 
     // Replace existing entry or append
-    if let Some(pos) = entries.iter().position(|e| {
-        e["identifier"]["id"].as_str() == Some(EXTENSION_ID)
-    }) {
+    if let Some(pos) = entries
+        .iter()
+        .position(|e| e["identifier"]["id"].as_str() == Some(EXTENSION_ID))
+    {
         entries[pos] = entry;
     } else {
         entries.push(entry);
@@ -148,7 +148,11 @@ pub fn remove_extension() -> std::io::Result<()> {
         std::fs::write(&path, json)?;
     }
 
-    log_info("antigravity", "extension.removed", "hcom-bridge extension removed");
+    log_info(
+        "antigravity",
+        "extension.removed",
+        "hcom-bridge extension removed",
+    );
     Ok(())
 }
 

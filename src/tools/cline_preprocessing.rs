@@ -3,7 +3,10 @@ use std::collections::HashMap;
 const CLINE_PERMISSION_JSON: &str = r#"{"hcom *":"allow"}"#;
 
 pub fn preprocess_cline_env(env: &mut HashMap<String, String>, instance_name: &str) {
-    env.insert("CLINE_PERMISSION".to_string(), CLINE_PERMISSION_JSON.to_string());
+    env.insert(
+        "CLINE_PERMISSION".to_string(),
+        CLINE_PERMISSION_JSON.to_string(),
+    );
     env.insert("HCOM_NAME".to_string(), instance_name.to_string());
 }
 

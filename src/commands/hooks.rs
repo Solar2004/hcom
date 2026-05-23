@@ -16,7 +16,16 @@ pub struct HooksArgs {
 }
 
 /// Valid tool names for hooks management.
-const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "kilocode", "cline", "clinecode", "antigravity"];
+const HOOK_TOOLS: &[&str] = &[
+    "claude",
+    "gemini",
+    "codex",
+    "opencode",
+    "kilocode",
+    "cline",
+    "clinecode",
+    "antigravity",
+];
 
 /// Get hook installation status for each tool.
 fn get_tool_status() -> Vec<(&'static str, bool, String)> {
@@ -97,7 +106,9 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, kilocode, cline, clinecode, antigravity, all");
+        eprintln!(
+            "Valid options: claude, gemini, codex, opencode, kilocode, cline, clinecode, antigravity, all"
+        );
         return 1;
     };
 
@@ -226,7 +237,9 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         vec![argv[0].as_str()]
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
-        eprintln!("Valid options: claude, gemini, codex, opencode, kilocode, cline, clinecode, antigravity, all");
+        eprintln!(
+            "Valid options: claude, gemini, codex, opencode, kilocode, cline, clinecode, antigravity, all"
+        );
         return 1;
     };
 

@@ -705,7 +705,11 @@ pub fn render_config_instance_get(value: &Value, key: Option<&str>, json_mode: b
                 "Agent: {display}\n  tag: {}\n  timeout: {timeout}s\n  hints: {}\n  subagent_timeout: {subagent_timeout}\n  project: {}",
                 if tag.is_empty() { "(none)" } else { tag },
                 if hints.is_empty() { "(none)" } else { hints },
-                if project.is_empty() { "(none)" } else { project },
+                if project.is_empty() {
+                    "(none)"
+                } else {
+                    project
+                },
             )
         }
         Some(_) => value

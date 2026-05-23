@@ -187,7 +187,10 @@ impl App {
                     self.ui.flash = if project.is_empty() {
                         Some(Flash::new("Project cleared".into(), Theme::flash_info()))
                     } else {
-                        Some(Flash::new(format!("Project set to {}", project), Theme::flash_ok()))
+                        Some(Flash::new(
+                            format!("Project set to {}", project),
+                            Theme::flash_ok(),
+                        ))
                     };
                     self.reload_data();
                 }

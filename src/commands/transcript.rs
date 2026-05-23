@@ -518,8 +518,13 @@ fn cmd_transcript_search(
                 }) {
                     for (name, path, tool) in rows.flatten() {
                         if let Some(agent) = agent_filter
-                            && !tool.contains(agent.as_str()) { continue; }
-                        if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
+                            && !tool.contains(agent.as_str())
+                        {
+                            continue;
+                        }
+                        if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) {
+                            continue;
+                        }
                         seen.insert(name.clone());
                         paths.push((name, path, tool));
                     }
@@ -531,7 +536,9 @@ fn cmd_transcript_search(
         if !live_mode {
             let mut sql = "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL".to_string();
             if let Some(ref p) = project_filter {
-                sql.push_str(&format!(" AND instance IN (SELECT name FROM instances WHERE project = '{p}')"));
+                sql.push_str(&format!(
+                    " AND instance IN (SELECT name FROM instances WHERE project = '{p}')"
+                ));
             }
             if let Ok(mut stmt) = db.conn().prepare(&sql) {
                 if let Ok(rows) = stmt.query_map([], |row| {
@@ -542,10 +549,17 @@ fn cmd_transcript_search(
                     ))
                 }) {
                     for (name, path, tool) in rows.flatten() {
-                        if seen.contains(&name) { continue; }
+                        if seen.contains(&name) {
+                            continue;
+                        }
                         if let Some(agent) = agent_filter
-                            && !tool.contains(agent.as_str()) { continue; }
-                        if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
+                            && !tool.contains(agent.as_str())
+                        {
+                            continue;
+                        }
+                        if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) {
+                            continue;
+                        }
                         seen.insert(name.clone());
                         paths.push((name, path, tool));
                     }
@@ -553,131 +567,135 @@ fn cmd_transcript_search(
             }
         }
 
-    // Search using ripgrep (with line-level matches + snippets) — hcom-tracked/live paths
-    let mut results = Vec::new();
-    for (name, path, agent) in &paths {
-        if !Path::new(path).exists() {
-            continue;
-        }
+        // Search using ripgrep (with line-level matches + snippets) — hcom-tracked/live paths
+        let mut results = Vec::new();
+        for (name, path, agent) in &paths {
+            if !Path::new(path).exists() {
+                continue;
+            }
 
-        // Use rg for line-level matches with context
-        let remaining = limit - results.len();
-        let output = std::process::Command::new("rg")
-            .args([
-                "-n",
-                "--max-count",
-                &remaining.to_string(),
-                "--max-columns",
-                "500",
-                pattern,
-                path,
-            ])
-            .output()
-            .or_else(|_| {
-                std::process::Command::new("grep")
-                    .args(["-n", "-m", &remaining.to_string(), pattern, path])
-                    .output()
-            });
+            // Use rg for line-level matches with context
+            let remaining = limit - results.len();
+            let output = std::process::Command::new("rg")
+                .args([
+                    "-n",
+                    "--max-count",
+                    &remaining.to_string(),
+                    "--max-columns",
+                    "500",
+                    pattern,
+                    path,
+                ])
+                .output()
+                .or_else(|_| {
+                    std::process::Command::new("grep")
+                        .args(["-n", "-m", &remaining.to_string(), pattern, path])
+                        .output()
+                });
 
-        if let Ok(out) = output
-            && out.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let lines: Vec<&str> = stdout.lines().collect();
-            let match_count = lines.len();
-            if match_count > 0 {
-                // Extract first match line number and snippet
-                let first_line = lines[0];
-                let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
-                    let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
-                    let text = &first_line[colon_pos + 1..];
-                    let text = truncate_str(text, 100);
-                    (num, text.to_string())
-                } else {
-                    (0, first_line.to_string())
-                };
+            if let Ok(out) = output
+                && out.status.success()
+            {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<&str> = stdout.lines().collect();
+                let match_count = lines.len();
+                if match_count > 0 {
+                    // Extract first match line number and snippet
+                    let first_line = lines[0];
+                    let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
+                        let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
+                        let text = &first_line[colon_pos + 1..];
+                        let text = truncate_str(text, 100);
+                        (num, text.to_string())
+                    } else {
+                        (0, first_line.to_string())
+                    };
 
-                results.push(json!({
-                    "hcom_name": name,
-                    "agent": agent,
-                    "path": path,
-                    "line": line_num,
-                    "text": snippet,
-                    "matches": match_count,
-                }));
+                    results.push(json!({
+                        "hcom_name": name,
+                        "agent": agent,
+                        "path": path,
+                        "line": line_num,
+                        "text": snippet,
+                        "matches": match_count,
+                    }));
+                }
+            }
+
+            if results.len() >= limit {
+                break;
             }
         }
 
-        if results.len() >= limit {
-            break;
-        }
-    }
+        let scope_label = if live_mode {
+            " (live agents)"
+        } else if all_mode {
+            ""
+        } else {
+            " (hcom-tracked)"
+        };
 
-    let scope_label = if live_mode {
-        " (live agents)"
-    } else if all_mode {
-        ""
-    } else {
-        " (hcom-tracked)"
-    };
-
-    if json_mode {
-        println!(
-            "{}",
-            json!({"count": results.len(), "results": results, "scope": if live_mode {"live"} else if all_mode {"all"} else {"hcom"}})
-        );
-    } else {
-        if results.is_empty() {
-            println!("No matches for \"{pattern}\"");
-            return 0;
-        }
-        let limit_hit = results.len() >= limit;
-        if limit_hit {
+        if json_mode {
             println!(
-                "Showing {} matches (limit {}){scope_label}:\n",
-                results.len(),
-                limit
+                "{}",
+                json!({"count": results.len(), "results": results, "scope": if live_mode {"live"} else if all_mode {"all"} else {"hcom"}})
             );
         } else {
-            println!("Found {} matches{scope_label}:\n", results.len());
-        }
-        for result in &results {
-            let hcom_name = result
-                .get("hcom_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let agent = result.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-            let path = result.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let line = result.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-            let snippet = result.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-            let path_display = if path.len() > 60 {
-                let mut start = path.len() - 57;
-                while start < path.len() && !path.is_char_boundary(start) {
-                    start += 1;
-                }
-                format!("...{}", &path[start..])
+            if results.is_empty() {
+                println!("No matches for \"{pattern}\"");
+                return 0;
+            }
+            let limit_hit = results.len() >= limit;
+            if limit_hit {
+                println!(
+                    "Showing {} matches (limit {}){scope_label}:\n",
+                    results.len(),
+                    limit
+                );
             } else {
-                path.to_string()
-            };
+                println!("Found {} matches{scope_label}:\n", results.len());
+            }
+            for result in &results {
+                let hcom_name = result
+                    .get("hcom_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let agent = result.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+                let path = result.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let line = result.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
+                let snippet = result.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
-            println!("[{agent}:{hcom_name}] {path_display}:{line}");
-            let snippet_clean = snippet.replace('\n', " ");
-            let snippet_short = if snippet_clean.len() > 100 {
-                format!("{}...", truncate_str(&snippet_clean, 100))
-            } else {
-                snippet_clean
-            };
-            println!("    {snippet_short}\n");
+                let path_display = if path.len() > 60 {
+                    let mut start = path.len() - 57;
+                    while start < path.len() && !path.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    format!("...{}", &path[start..])
+                } else {
+                    path.to_string()
+                };
+
+                println!("[{agent}:{hcom_name}] {path_display}:{line}");
+                let snippet_clean = snippet.replace('\n', " ");
+                let snippet_short = if snippet_clean.len() > 100 {
+                    format!("{}...", truncate_str(&snippet_clean, 100))
+                } else {
+                    snippet_clean
+                };
+                println!("    {snippet_short}\n");
+            }
         }
-    }
     }
 
     0
 }
 
 /// Timeline: `hcom transcript timeline [--last N] [--full] [--json]`
-fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs, project: Option<&str>) -> i32 {
+fn cmd_transcript_timeline(
+    db: &HcomDb,
+    args: &TranscriptTimelineArgs,
+    project: Option<&str>,
+) -> i32 {
     let json_mode = args.json;
     let full_mode = args.full;
     let detailed = args.detailed;
@@ -729,7 +747,9 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs, project: 
     {
         let mut sql = "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL".to_string();
         if let Some(ref p) = project_filter {
-            sql.push_str(&format!(" AND instance IN (SELECT name FROM instances WHERE project = '{p}')"));
+            sql.push_str(&format!(
+                " AND instance IN (SELECT name FROM instances WHERE project = '{p}')"
+            ));
         }
         if let Ok(mut stmt) = db.conn().prepare(&sql) {
             if let Ok(rows) = stmt.query_map([], |row| {
@@ -741,7 +761,9 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs, project: 
                 ))
             }) {
                 for (name, path, tool, sid) in rows.flatten() {
-                    if seen.contains(&name) { continue; }
+                    if seen.contains(&name) {
+                        continue;
+                    }
                     seen.insert(name.clone());
                     if let Ok(exchanges) =
                         get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)

@@ -178,9 +178,7 @@ pub fn verify_cline_plugin_installed() -> bool {
     if plugin_files_match(&primary) {
         return true;
     }
-    scan_plugin_dirs()
-        .iter()
-        .any(|dir| plugin_files_match(dir))
+    scan_plugin_dirs().iter().any(|dir| plugin_files_match(dir))
 }
 
 pub fn install_cline_plugin() -> std::io::Result<bool> {
@@ -240,8 +238,6 @@ pub fn ensure_plugin_installed() -> bool {
     }
     install_cline_plugin().unwrap_or(false)
 }
-
-
 
 fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
     let session_id = match parse_flag(argv, "--session-id") {
@@ -548,9 +544,15 @@ pub fn dispatch_cline_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     let db = match HcomDb::open() {
         Ok(db) => db,
         Err(e) => {
-            log_error("hooks", "hook.error",
-                &format!("hook={} op=db_open err={}", hook_name, e));
-            return (0, serde_json::json!({"error": format!("DB open failed: {}", e)}).to_string());
+            log_error(
+                "hooks",
+                "hook.error",
+                &format!("hook={} op=db_open err={}", hook_name, e),
+            );
+            return (
+                0,
+                serde_json::json!({"error": format!("DB open failed: {}", e)}).to_string(),
+            );
         }
     };
     if !common::hook_gate_check(&ctx, &db) {
@@ -566,20 +568,32 @@ pub fn dispatch_cline_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     let (exit_code, output) = common::dispatch_with_panic_guard(
         "cline",
         &hook_name_owned,
-        (0, serde_json::json!({"error": "internal panic"}).to_string()),
+        (
+            0,
+            serde_json::json!({"error": "internal panic"}).to_string(),
+        ),
         || match hook_name_owned.as_str() {
             "cline-start" => handle_start(&ctx, &db, &handler_argv),
             "cline-status" => handle_status(&db, &handler_argv),
             "cline-read" => handle_read(&db, &handler_argv),
             "cline-stop" => handle_stop(&db, &handler_argv),
-            _ => (0, serde_json::json!({"error": format!("Unknown Cline hook: {}", hook_name_owned)}).to_string()),
+            _ => (
+                0,
+                serde_json::json!({"error": format!("Unknown Cline hook: {}", hook_name_owned)})
+                    .to_string(),
+            ),
         },
     );
     let handler_ms = handler_start.elapsed().as_secs_f64() * 1000.0;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    log_info("hooks", "cline.dispatch.timing",
-        &format!("hook={} handler_ms={:.2} total_ms={:.2} exit_code={}",
-            hook_name, handler_ms, total_ms, exit_code));
+    log_info(
+        "hooks",
+        "cline.dispatch.timing",
+        &format!(
+            "hook={} handler_ms={:.2} total_ms={:.2} exit_code={}",
+            hook_name, handler_ms, total_ms, exit_code
+        ),
+    );
     (exit_code, output)
 }
 
@@ -604,7 +618,10 @@ mod tests {
     #[test]
     fn test_parse_value_arg() {
         let argv = vec!["--model=sonnet".to_string()];
-        assert_eq!(parse_value_arg(&argv, &["--model"]), Some("sonnet".to_string()));
+        assert_eq!(
+            parse_value_arg(&argv, &["--model"]),
+            Some("sonnet".to_string())
+        );
     }
 
     #[test]

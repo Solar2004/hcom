@@ -45,12 +45,7 @@ const KILO_HOOKS: &[&str] = &[
     "kilocode-stop",
 ];
 
-const CLINE_HOOKS: &[&str] = &[
-    "cline-start",
-    "cline-status",
-    "cline-read",
-    "cline-stop",
-];
+const CLINE_HOOKS: &[&str] = &["cline-start", "cline-status", "cline-read", "cline-stop"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -105,9 +100,16 @@ impl Tool {
     }
 
     pub fn from_hook_name(name: &str) -> Option<Self> {
-        [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo, Tool::Cline]
-            .into_iter()
-            .find(|tool| tool.owns_hook(name))
+        [
+            Tool::Claude,
+            Tool::Gemini,
+            Tool::Codex,
+            Tool::OpenCode,
+            Tool::Kilo,
+            Tool::Cline,
+        ]
+        .into_iter()
+        .find(|tool| tool.owns_hook(name))
     }
 
     pub fn is_hook_name(name: &str) -> bool {
@@ -152,7 +154,14 @@ mod tests {
     #[test]
     fn hook_names_are_disjoint() {
         let mut owners = HashMap::new();
-        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo, Tool::Cline] {
+        for tool in [
+            Tool::Claude,
+            Tool::Gemini,
+            Tool::Codex,
+            Tool::OpenCode,
+            Tool::Kilo,
+            Tool::Cline,
+        ] {
             for hook in tool.hooks() {
                 assert_eq!(
                     owners.insert(*hook, tool),

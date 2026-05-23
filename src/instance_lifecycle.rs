@@ -693,7 +693,10 @@ pub fn mark_dead_instances(db: &HcomDb) -> i32 {
             continue;
         }
 
-        let is_remote = inst.origin_device_id.as_deref().is_some_and(|v| !v.is_empty());
+        let is_remote = inst
+            .origin_device_id
+            .as_deref()
+            .is_some_and(|v| !v.is_empty());
         if is_remote {
             continue;
         }
@@ -797,7 +800,7 @@ mod tests {
             test_id
         ));
 
-        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        let db = HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (db, db_path)
     }

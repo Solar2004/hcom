@@ -428,10 +428,10 @@ fn render_inline(frame: &mut Frame, app: &mut App, area: Rect) {
     // Layout: topline + status + sep + agents + [launch] + input + footer
     // Use Fill(1) for agents so launch/input always get their full height
     let mut constraints = vec![
-        Constraint::Length(1),     // top line
-        Constraint::Length(1),     // status bar
-        Constraint::Length(1),     // separator
-        Constraint::Fill(1),       // agents (takes remaining space)
+        Constraint::Length(1), // top line
+        Constraint::Length(1), // status bar
+        Constraint::Length(1), // separator
+        Constraint::Fill(1),   // agents (takes remaining space)
     ];
     if launch_height > 0 {
         constraints.push(Constraint::Length(launch_height));

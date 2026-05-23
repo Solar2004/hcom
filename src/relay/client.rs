@@ -363,10 +363,7 @@ impl MqttRelay {
                         let err_msg = format!("{:?}", conn_err);
 
                         // Log first error, then every 10th
-                        if connected
-                            || consecutive_errors <= 1
-                            || consecutive_errors.is_multiple_of(10)
-                        {
+                        if connected || consecutive_errors <= 1 || consecutive_errors % 10 == 0 {
                             log::log_warn(
                                 "relay",
                                 "relay.disconnected",
@@ -431,10 +428,7 @@ impl MqttRelay {
                         consecutive_errors += 1;
                         let err_msg = format!("{:?}", conn_err);
 
-                        if connected
-                            || consecutive_errors <= 1
-                            || consecutive_errors.is_multiple_of(10)
-                        {
+                        if connected || consecutive_errors <= 1 || consecutive_errors % 10 == 0 {
                             log::log_warn(
                                 "relay",
                                 "relay.disconnected",

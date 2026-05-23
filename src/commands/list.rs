@@ -224,12 +224,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         } else {
             sorted_instances
                 .into_iter()
-                .filter(|inst| {
-                    inst.project
-                        .as_deref()
-                        .map(|p| p == proj)
-                        .unwrap_or(true)
-                })
+                .filter(|inst| inst.project.as_deref().map(|p| p == proj).unwrap_or(true))
                 .collect()
         }
     } else {
@@ -684,10 +679,9 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
         }
         sql.push_str(" ORDER BY id DESC LIMIT 10000");
     } else {
-        sql = format!(
-            "SELECT instance, timestamp, data FROM events
+        sql = "SELECT instance, timestamp, data FROM events
              WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'"
-        );
+            .to_string();
         if let Some(p) = project {
             sql.push_str(" AND instance IN (SELECT name FROM instances WHERE project = ?)");
             param_values.push(Box::new(p.to_string()));

@@ -436,7 +436,8 @@ impl App {
                     } else {
                         String::new()
                     };
-                    self.ui.overlay = Some(Overlay::with(OverlayKind::Project, names, common_project));
+                    self.ui.overlay =
+                        Some(Overlay::with(OverlayKind::Project, names, common_project));
                 }
             }
 
@@ -768,8 +769,10 @@ impl App {
                             name: name.clone(),
                             project: project.clone(),
                         }) {
-                            self.ui.flash =
-                                Some(Flash::new(format!("Project set failed: {}", e), Theme::flash_err()));
+                            self.ui.flash = Some(Flash::new(
+                                format!("Project set failed: {}", e),
+                                Theme::flash_err(),
+                            ));
                             break;
                         }
                     }

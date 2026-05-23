@@ -1213,7 +1213,7 @@ mod tests {
     #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
-assert!(help.contains(
+        assert!(help.contains(
     "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kilocode/cline/clinecode)"
 ));
     }

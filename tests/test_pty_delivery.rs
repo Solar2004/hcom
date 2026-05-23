@@ -873,6 +873,7 @@ fn run_pty_test(tool: &str) {
 
 // ── OpenCode test flow ─────────────────────────────────────────────────
 
+#[expect(dead_code)]
 fn run_pty_test_opencode() {
     let _serial = serial_lock();
 

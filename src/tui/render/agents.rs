@@ -110,7 +110,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
         .data
         .agents
         .iter()
-        .filter(|a| filter_project.map_or(true, |proj| a.project == proj))
+        .filter(|a| filter_project.is_none_or(|proj| a.project == proj))
         .collect();
 
     // Compute max display name width for alignment (min 4 to avoid cramping)
@@ -170,8 +170,16 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled("@ ", Style::default().fg(palette::CYAN)),
-            Span::styled(proj.to_string(), Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" ({}/{})", total_filtered, app.data.agents.len()), Theme::dim()),
+            Span::styled(
+                proj.to_string(),
+                Style::default()
+                    .fg(palette::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({}/{})", total_filtered, app.data.agents.len()),
+                Theme::dim(),
+            ),
         ]));
     }
 
@@ -183,8 +191,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
         )));
     }
 
-    for i in scroll..end {
-        let agent = filtered[i];
+    for (i, agent) in filtered.iter().enumerate().skip(scroll).take(end - scroll) {
         let is_cursor = app.ui.cursor == i;
         let is_selected = app.ui.selected.contains(&agent.name);
 
@@ -760,7 +767,7 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
         .data
         .agents
         .iter()
-        .filter(|a| filter_project.map_or(true, |proj| a.project == proj))
+        .filter(|a| filter_project.is_none_or(|proj| a.project == proj))
         .collect();
     for (i, agent) in filtered.iter().enumerate() {
         let is_cursor = app.ui.cursor == i;
@@ -1065,17 +1072,23 @@ fn build_agent_detail(agent: &Agent, app: &App, lines: &mut Vec<Line<'static>>, 
     lines.push(Line::from(left));
 
     // Line 2: project · tag · directory · [headless]/[terminal] · pid · session · unread
-    let mut info: Vec<Span<'static>> = vec![
-        Span::raw("  "),
-    ];
+    let mut info: Vec<Span<'static>> = vec![Span::raw("  ")];
     if !agent.project.is_empty() {
         info.push(Span::styled("@", Style::default().fg(palette::CYAN)));
-        info.push(Span::styled(agent.project.clone(), Style::default().fg(palette::CYAN).add_modifier(Modifier::BOLD)));
+        info.push(Span::styled(
+            agent.project.clone(),
+            Style::default()
+                .fg(palette::CYAN)
+                .add_modifier(Modifier::BOLD),
+        ));
         info.push(Span::styled(" ", Theme::dim()));
     }
     if !agent.tag.is_empty() {
         info.push(Span::styled("#", Style::default().fg(palette::TEAL)));
-        info.push(Span::styled(agent.tag.clone(), Style::default().fg(palette::TEAL)));
+        info.push(Span::styled(
+            agent.tag.clone(),
+            Style::default().fg(palette::TEAL),
+        ));
         info.push(Span::styled(" ", Theme::dim()));
     }
     info.push(Span::styled(shorten_dir(&agent.directory), Theme::dim()));

@@ -43,7 +43,9 @@ const COMMANDS: &[&str] = &[
 ];
 
 /// Tools that support launch commands (hcom [N] <tool>)
-const LAUNCH_TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "kilocode", "kilo", "cline", "f", "r"];
+const LAUNCH_TOOLS: &[&str] = &[
+    "claude", "codex", "gemini", "opencode", "kilocode", "kilo", "cline", "f", "r",
+];
 
 fn is_command(name: &str) -> bool {
     COMMANDS.contains(&name)
@@ -1298,7 +1300,14 @@ mod tests {
 
     #[test]
     fn hooks_do_not_collide_with_commands_or_launch_tools() {
-        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode, Tool::Kilo, Tool::Cline] {
+        for tool in [
+            Tool::Claude,
+            Tool::Gemini,
+            Tool::Codex,
+            Tool::OpenCode,
+            Tool::Kilo,
+            Tool::Cline,
+        ] {
             for hook in tool.hooks() {
                 assert!(!COMMANDS.contains(hook), "{hook} collides with command");
                 assert!(

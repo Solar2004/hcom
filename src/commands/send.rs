@@ -274,7 +274,12 @@ pub fn send_message(
 
     // Compute scope and routing. Thread-only sends keep their original message
     // semantics; membership only affects the delivery target set.
-    let scope_result = compute_scope(message, &rows, explicit_targets.map(|t| t as &[String]), sender_project)?;
+    let scope_result = compute_scope(
+        message,
+        &rows,
+        explicit_targets.map(|t| t as &[String]),
+        sender_project,
+    )?;
     let thread_delivery_members =
         if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
             if scope_result.scope == MessageScope::Broadcast {
@@ -1118,7 +1123,7 @@ fn send_reminder_message(db: &HcomDb, recipient: &str, prompt: &str) {
         "delivered_to": [recipient],
     });
 
-    if let Err(e) = db.log_event("message", &format!("sys_hcom-system"), &data) {
+    if let Err(e) = db.log_event("message", "sys_hcom-system", &data) {
         crate::log::log_error("send", "reminder_log_failed", &format!("{e}"));
     }
 

@@ -1208,7 +1208,11 @@ pub fn read_launch_defaults() -> LaunchDefaults {
         .unwrap_or("")
         .to_string();
 
-    LaunchDefaults { terminal, tag, project }
+    LaunchDefaults {
+        terminal,
+        tag,
+        project,
+    }
 }
 
 // ── Dynamic terminal preset detection ────────────────────────────

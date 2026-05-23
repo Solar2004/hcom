@@ -21,7 +21,9 @@ use crate::instances;
 use crate::paths;
 use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
 use crate::terminal;
-use crate::tools::{codex_preprocessing, cline_preprocessing, kilo_preprocessing, opencode_preprocessing};
+use crate::tools::{
+    cline_preprocessing, codex_preprocessing, kilo_preprocessing, opencode_preprocessing,
+};
 
 /// Canonical tool types for launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,9 +112,11 @@ impl LaunchBackend {
         match tool {
             LaunchTool::Claude if !pty => LaunchBackend::NativePrint,
             LaunchTool::Claude | LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
-            LaunchTool::Gemini | LaunchTool::Codex | LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Cline => {
-                LaunchBackend::HeadlessPty
-            }
+            LaunchTool::Gemini
+            | LaunchTool::Codex
+            | LaunchTool::OpenCode
+            | LaunchTool::Kilo
+            | LaunchTool::Cline => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -1161,9 +1165,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                 Ok(true)
                             }
                             _ => Ok(false),
-            }
-        }
-    }
+                        }
+                    }
+                }
 
                 LaunchTool::ClaudePty => {
                     instances::update_instance_position(
@@ -1333,10 +1337,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 }
 
                 LaunchTool::Kilo => {
-                    kilo_preprocessing::preprocess_kilo_env(
-                        &mut instance_env,
-                        &instance_name,
-                    );
+                    kilo_preprocessing::preprocess_kilo_env(&mut instance_env, &instance_name);
 
                     instances::update_instance_position(
                         db,
@@ -1367,10 +1368,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 }
 
                 LaunchTool::Cline => {
-                    cline_preprocessing::preprocess_cline_env(
-                        &mut instance_env,
-                        &instance_name,
-                    );
+                    cline_preprocessing::preprocess_cline_env(&mut instance_env, &instance_name);
 
                     instances::update_instance_position(
                         db,
@@ -1613,7 +1611,12 @@ mod tests {
     #[test]
     fn test_launch_backend_resolve_other_tools_headless() {
         // gemini/codex/opencode/kilo + --headless → HeadlessPty (unchanged from today).
-        for tool in [LaunchTool::Gemini, LaunchTool::Codex, LaunchTool::OpenCode, LaunchTool::Kilo] {
+        for tool in [
+            LaunchTool::Gemini,
+            LaunchTool::Codex,
+            LaunchTool::OpenCode,
+            LaunchTool::Kilo,
+        ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, true, true),
                 LaunchBackend::HeadlessPty,

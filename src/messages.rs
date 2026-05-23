@@ -301,10 +301,7 @@ pub fn compute_scope(
             enabled_instances
                 .iter()
                 .filter(|inst| {
-                    inst.project
-                        .as_deref()
-                        .map(|p| p == proj)
-                        .unwrap_or(true) // include instances with no project
+                    inst.project.as_deref().map(|p| p == proj).unwrap_or(true) // include instances with no project
                 })
                 .collect()
         }

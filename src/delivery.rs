@@ -611,7 +611,10 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(Tool::from_str(&config.tool), Ok(Tool::OpenCode) | Ok(Tool::Kilo) | Ok(Tool::Cline)) {
+    if matches!(
+        Tool::from_str(&config.tool),
+        Ok(Tool::OpenCode) | Ok(Tool::Kilo) | Ok(Tool::Cline)
+    ) {
         log_info(
             "native",
             "delivery.opencode_mode",
@@ -901,7 +904,7 @@ pub fn run_delivery_loop(
                         }
 
                         // Log gate failure
-                        if attempt == 0 || attempt.is_multiple_of(5) {
+                        if attempt == 0 || attempt % 5 == 0 {
                             let screen = state.screen.read().unwrap();
                             log_info(
                                 "native",

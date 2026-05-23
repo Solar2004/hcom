@@ -756,7 +756,9 @@ impl LaunchState {
     pub fn delete_word(&mut self) {
         match self.editing {
             Some(LaunchField::Tag) => delete_word_back(&mut self.tag, &mut self.edit_cursor),
-            Some(LaunchField::Project) => delete_word_back(&mut self.project, &mut self.edit_cursor),
+            Some(LaunchField::Project) => {
+                delete_word_back(&mut self.project, &mut self.edit_cursor)
+            }
             _ => {}
         }
     }

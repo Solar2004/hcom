@@ -389,10 +389,9 @@ fn resolve_identity_with_expectation(
                         if !has_session
                             && let Some(thread_id) = codex_thread_id
                             && !thread_id.is_empty()
-                            && let Some(resolved) =
-                                crate::instance_binding::bind_session_to_process(
-                                    db, thread_id, process_id,
-                                )
+                            && let Some(resolved) = crate::instance_binding::bind_session_to_process(
+                                db, thread_id, process_id,
+                            )
                         {
                             final_name = resolved;
                         }

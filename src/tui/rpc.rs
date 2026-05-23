@@ -162,7 +162,15 @@ mod tests {
 
     #[test]
     fn launch_argv_numeric_count_first() {
-        let argv = build_launch_argv(Tool::Claude, 2, "review", "myproject", true, "kitty", "hello");
+        let argv = build_launch_argv(
+            Tool::Claude,
+            2,
+            "review",
+            "myproject",
+            true,
+            "kitty",
+            "hello",
+        );
         assert_eq!(argv[0], "2");
         assert_eq!(argv[1], "claude");
         assert!(argv.contains(&"--no-run-here".into()));

@@ -433,7 +433,12 @@ pub fn get_bootstrap(
 
     // Tool-specific delivery
     if tool == "claude"
-        || ((tool == "codex" || tool == "gemini" || tool == "opencode" || tool == "kilo" || tool == "cline") && ctx.is_launched)
+        || ((tool == "codex"
+            || tool == "gemini"
+            || tool == "opencode"
+            || tool == "kilo"
+            || tool == "cline")
+            && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
     } else {
@@ -461,10 +466,7 @@ pub fn get_bootstrap(
 
     // Agent prompt from ~/.hcom/agents/<name>.md
     if let Some(agent_prompt) = crate::agent_prompts::load_agent_prompt(instance_name) {
-        result.push_str(&format!(
-            "\n\n## AGENT PROMPT\n\n{}\n",
-            agent_prompt
-        ));
+        result.push_str(&format!("\n\n## AGENT PROMPT\n\n{}\n", agent_prompt));
     }
 
     // Rewrite hcom references if using alternate command

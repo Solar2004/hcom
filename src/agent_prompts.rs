@@ -14,7 +14,9 @@ pub fn get_agent_prompt_path(instance_name: &str) -> PathBuf {
 pub fn load_agent_prompt(instance_name: &str) -> Option<String> {
     let path = get_agent_prompt_path(instance_name);
     if path.exists() {
-        std::fs::read_to_string(&path).ok().filter(|s| !s.trim().is_empty())
+        std::fs::read_to_string(&path)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
     } else {
         None
     }
@@ -26,7 +28,6 @@ pub fn ensure_agents_dir() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::TempDir;
 
     #[test]
