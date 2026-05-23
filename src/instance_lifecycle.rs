@@ -772,6 +772,14 @@ pub fn mark_dead_instances(db: &HcomDb) -> i32 {
     marked
 }
 
+pub fn notify_instance_endpoints(db: &HcomDb, name: &str, kinds: &[crate::notify::WakeKind]) {
+    crate::notify::wake(db, name, kinds);
+}
+
+pub fn notify_all_instances(db: &HcomDb) {
+    crate::notify::wake_all(db);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -789,6 +797,8 @@ mod tests {
             test_id
         ));
 
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
         (db, db_path)
     }
 

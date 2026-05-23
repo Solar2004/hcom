@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::db::DEV_ROOT_KV_KEY;
 use crate::db::HcomDb;
 use crate::identity;
+use crate::instance_lifecycle;
 use crate::instances;
 use crate::shared::CommandContext;
 

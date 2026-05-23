@@ -49,6 +49,7 @@ pub struct InstanceRow {
     pub name_announced: i64,
     pub running_tasks: Option<String>,
     pub idle_since: Option<String>,
+    pub project: Option<String>,
 }
 
 impl InstanceRow {
@@ -125,6 +126,9 @@ impl InstanceRow {
             idle_since: row
                 .get::<_, Option<String>>("idle_since")?
                 .filter(|s| !s.is_empty()),
+            project: row
+                .get::<_, Option<String>>("project")?
+                .filter(|s| !s.is_empty()),
         })
     }
 }
@@ -138,7 +142,7 @@ pub(super) const INSTANCE_COLUMNS: &str =
      background_log_file, name_announced, agent_id, running_tasks,
      origin_device_id, hints, subagent_timeout, tool, launch_args,
      terminal_preset_requested, terminal_preset_effective,
-     idle_since, pid, launch_context";
+     idle_since, pid, launch_context, project";
 
 impl HcomDb {
     /// Get instance status by name

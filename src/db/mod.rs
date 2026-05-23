@@ -35,16 +35,22 @@ pub use instances::InstanceRow;
 pub use instances::InstanceStatus;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 17;
+const SCHEMA_VERSION: i32 = 18;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
-const MIGRATIONS: &[(i32, &str)] = &[(
-    17,
-    "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
-     ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
-     UPDATE instances
-     SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
-     WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
-)];
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        17,
+        "ALTER TABLE instances ADD COLUMN terminal_preset_requested TEXT DEFAULT '';
+         ALTER TABLE instances ADD COLUMN terminal_preset_effective TEXT DEFAULT '';
+         UPDATE instances
+         SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset')
+         WHERE launch_context != '' AND json_valid(launch_context) AND json_extract(launch_context, '$.terminal_preset') IS NOT NULL;",
+    ),
+    (
+        18,
+        "ALTER TABLE instances ADD COLUMN project TEXT DEFAULT '';",
+    ),
+];
 
 /// Schema compatibility check result
 enum SchemaCompat {
@@ -247,6 +253,7 @@ impl HcomDb {
                 idle_since TEXT DEFAULT '',
                 pid INTEGER DEFAULT NULL,
                 launch_context TEXT DEFAULT '',
+                project TEXT DEFAULT '',
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
 
@@ -1157,9 +1164,8 @@ pub(super) mod tests {
             test_id
         ));
 
-        // Simulate the bug: create a v16-style DB but stamp it as v17
-        // (this is what init_db() did — CREATE IF NOT EXISTS is a no-op on
-        // existing tables, then it unconditionally set user_version = 17)
+        // Simulate the bug: create a v17-style DB but stamp it as v17
+        // missing project column (what should have been added by v18 migration)
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -1191,6 +1197,8 @@ pub(super) mod tests {
                      subagent_timeout INTEGER,
                      tool TEXT DEFAULT 'claude',
                      launch_args TEXT DEFAULT '',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT '',
                      idle_since TEXT DEFAULT '',
                      pid INTEGER DEFAULT NULL,
                      launch_context TEXT DEFAULT ''
@@ -1221,8 +1229,8 @@ pub(super) mod tests {
                 .filter_map(|r| r.ok())
                 .collect();
             assert!(
-                !cols.contains(&"terminal_preset_requested".to_string()),
-                "column should be missing before repair"
+                !cols.contains(&"project".to_string()),
+                "project column should be missing before repair"
             );
         }
 
@@ -1252,6 +1260,10 @@ pub(super) mod tests {
         assert!(
             cols.contains(&"terminal_preset_effective".to_string()),
             "terminal_preset_effective column should exist after repair"
+        );
+        assert!(
+            cols.contains(&"project".to_string()),
+            "project column should exist after repair"
         );
 
         // Test data should have survived (not archived)

@@ -525,6 +525,7 @@ fn cmd_transcript_search(
                     }
                 }
             }
+        }
 
         // Stopped instances from life event snapshots (C2/C3 fix)
         if !live_mode {
@@ -549,7 +550,8 @@ fn cmd_transcript_search(
                         paths.push((name, path, tool));
                     }
                 }
-    }
+            }
+        }
 
     // Search using ripgrep (with line-level matches + snippets) — hcom-tracked/live paths
     let mut results = Vec::new();
@@ -669,6 +671,7 @@ fn cmd_transcript_search(
             println!("    {snippet_short}\n");
         }
     }
+    }
 
     0
 }
@@ -720,6 +723,7 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs, project: 
                 }
             }
         }
+    }
 
     // Stopped instances from life event snapshots
     {
@@ -756,6 +760,7 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs, project: 
                 }
             }
         }
+    }
 
     // Sort by timestamp (most recent first)
     all_entries.sort_by(|a, b| {

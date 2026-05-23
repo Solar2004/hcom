@@ -9,6 +9,7 @@ use crate::agent_prompts;
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
+use crate::instance_lifecycle;
 use crate::instances;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,

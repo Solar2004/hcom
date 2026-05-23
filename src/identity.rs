@@ -332,7 +332,13 @@ fn resolve_identity_with_expectation(
                     .get_instance(&inst_name)
                     .map_err(|e| HcomError::DatabaseError(e.to_string()))?;
 
-                }
+                return Ok(SenderIdentity {
+                    kind: SenderKind::Instance,
+                    name: inst_name,
+                    session_id: Some(sid.to_string()),
+                    instance_data: data,
+                    project: None,
+                });
             }
             None => {
                 crate::log::log_warn(
@@ -955,6 +961,7 @@ mod tests {
             name_announced: 0,
             running_tasks: None,
             idle_since: None,
+            project: None,
         }
     }
 

@@ -812,6 +812,8 @@ mod tests {
             test_id
         ));
 
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
         (db, db_path)
     }
 
@@ -1221,6 +1223,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(ok);
         let ok_again = initialize_instance_in_position_file(
@@ -1233,6 +1236,7 @@ mod tests {
             None,
             Some("codex"),
             false,
+            None,
             None,
             None,
             None,
