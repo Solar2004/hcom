@@ -315,32 +315,32 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
     instances::update_instance_position(db, instance_name, &dir_updates);
 
     // Bind session_id if instance doesn't have one (fresh instance after /clear)
-    if instance.session_id.is_none() {
-        if let Some(ref sid) = payload.session_id {
-            log::log_info(
+    if instance.session_id.is_none()
+        && let Some(ref sid) = payload.session_id
+    {
+        log::log_info(
+            "hooks",
+            "gemini.beforeagent.bind_session",
+            &format!("instance={} session_id={}", instance_name, sid),
+        );
+        let mut sid_updates = serde_json::Map::new();
+        sid_updates.insert("session_id".into(), Value::String(sid.clone()));
+        instances::update_instance_position(db, instance_name, &sid_updates);
+        if let Err(e) = db.rebind_session(sid, instance_name) {
+            log::log_warn(
                 "hooks",
-                "gemini.beforeagent.bind_session",
-                &format!("instance={} session_id={}", instance_name, sid),
+                "gemini.rebind_failed",
+                &format!("rebind_session failed for {instance_name}: {e}"),
             );
-            let mut sid_updates = serde_json::Map::new();
-            sid_updates.insert("session_id".into(), Value::String(sid.clone()));
-            instances::update_instance_position(db, instance_name, &sid_updates);
-            if let Err(e) = db.rebind_session(sid, instance_name) {
-                log::log_warn(
-                    "hooks",
-                    "gemini.rebind_failed",
-                    &format!("rebind_session failed for {instance_name}: {e}"),
-                );
-            }
-            if let Some(ref pid) = ctx.process_id {
-                if let Err(e) = db.set_process_binding(pid, sid, instance_name) {
-                    log::log_warn(
-                        "hooks",
-                        "gemini.process_binding_failed",
-                        &format!("set_process_binding failed for {instance_name}: {e}"),
-                    );
-                }
-            }
+        }
+        if let Some(ref pid) = ctx.process_id
+            && let Err(e) = db.set_process_binding(pid, sid, instance_name)
+        {
+            log::log_warn(
+                "hooks",
+                "gemini.process_binding_failed",
+                &format!("set_process_binding failed for {instance_name}: {e}"),
+            );
         }
     }
 
@@ -415,10 +415,10 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
     let mut instance: Option<InstanceRow> = None;
 
     // Vanilla binding: try tool_response first (immediate)
-    if ctx.process_id.is_none() {
-        if let Some(bound_name) = bind_vanilla_instance(db, payload) {
-            instance = db.get_instance_full(&bound_name).ok().flatten();
-        }
+    if ctx.process_id.is_none()
+        && let Some(bound_name) = bind_vanilla_instance(db, payload)
+    {
+        instance = db.get_instance_full(&bound_name).ok().flatten();
     }
 
     // Process/session binding fallback
@@ -659,14 +659,14 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
     };
     if let Some(json) = output_json {
         let mut stdout = std::io::stdout().lock();
-        if serde_json::to_writer(&mut stdout, &json).is_ok() && stdout.flush().is_ok() {
-            if let HookResult::Allow {
+        if serde_json::to_writer(&mut stdout, &json).is_ok()
+            && stdout.flush().is_ok()
+            && let HookResult::Allow {
                 delivery_ack: Some(ack),
                 ..
             } = &result
-            {
-                common::commit_delivery_ack(&db, ack);
-            }
+        {
+            common::commit_delivery_ack(&db, ack);
         }
     }
 
@@ -798,10 +798,10 @@ fn build_all_permission_patterns() -> Vec<String> {
 ///
 /// Priority: GEMINI_CLI_HOME env var (+ .gemini suffix) → tool_config_root()/.gemini
 fn gemini_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir).join(".gemini");
-        }
+    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir).join(".gemini");
     }
     crate::runtime_env::tool_config_root().join(".gemini")
 }
@@ -846,12 +846,11 @@ fn setup_gemini_policy() -> bool {
     let policy_content = build_gemini_policy();
 
     // Check if already configured correctly
-    if policy_file.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&policy_file) {
-            if existing == policy_content {
-                return true;
-            }
-        }
+    if policy_file.exists()
+        && let Ok(existing) = std::fs::read_to_string(&policy_file)
+        && existing == policy_content
+    {
+        return true;
     }
 
     let _ = std::fs::create_dir_all(&policies_dir);
@@ -919,12 +918,12 @@ fn set_hooks_enabled(settings: &mut serde_json::Map<String, Value>) {
     }
 
     // Clean up legacy hooks.enabled
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
-        if hooks.get("enabled").and_then(|v| v.as_bool()).is_some() {
-            hooks.remove("enabled");
-            if hooks.is_empty() {
-                settings.remove("hooks");
-            }
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|v| v.as_object_mut())
+        && hooks.get("enabled").and_then(|v| v.as_bool()).is_some()
+    {
+        hooks.remove("enabled");
+        if hooks.is_empty() {
+            settings.remove("hooks");
         }
     }
 }
@@ -942,68 +941,67 @@ fn is_hooks_enabled(settings: &serde_json::Map<String, Value>) -> bool {
 ///
 /// Only removes hcom-specific hooks, preserving user hooks.
 fn remove_hcom_hooks_from_settings(settings: &mut serde_json::Map<String, Value>) {
-    if let Some(hooks_val) = settings.get_mut("hooks") {
-        if let Some(hooks) = hooks_val.as_object_mut() {
-            let hook_types: Vec<String> = hooks.keys().cloned().collect();
-            for hook_type in hook_types {
-                if let Some(matchers) = hooks.get_mut(&hook_type).and_then(|v| v.as_array_mut()) {
-                    let mut updated = Vec::new();
-                    for matcher in matchers.iter() {
-                        if let Some(matcher_obj) = matcher.as_object() {
-                            if let Some(hook_list) =
-                                matcher_obj.get("hooks").and_then(|v| v.as_array())
-                            {
-                                let non_hcom: Vec<Value> = hook_list
-                                    .iter()
-                                    .filter(|h| !is_hcom_hook(h))
-                                    .cloned()
-                                    .collect();
-                                if !non_hcom.is_empty() {
-                                    let mut new_matcher = matcher_obj.clone();
-                                    new_matcher.insert("hooks".into(), Value::Array(non_hcom));
-                                    updated.push(Value::Object(new_matcher));
-                                } else if !matcher_obj.contains_key("hooks") {
-                                    updated.push(matcher.clone());
-                                }
-                                // else: had only hcom hooks — drop
-                            } else {
+    if let Some(hooks_val) = settings.get_mut("hooks")
+        && let Some(hooks) = hooks_val.as_object_mut()
+    {
+        let hook_types: Vec<String> = hooks.keys().cloned().collect();
+        for hook_type in hook_types {
+            if let Some(matchers) = hooks.get_mut(&hook_type).and_then(|v| v.as_array_mut()) {
+                let mut updated = Vec::new();
+                for matcher in matchers.iter() {
+                    if let Some(matcher_obj) = matcher.as_object() {
+                        if let Some(hook_list) = matcher_obj.get("hooks").and_then(|v| v.as_array())
+                        {
+                            let non_hcom: Vec<Value> = hook_list
+                                .iter()
+                                .filter(|h| !is_hcom_hook(h))
+                                .cloned()
+                                .collect();
+                            if !non_hcom.is_empty() {
+                                let mut new_matcher = matcher_obj.clone();
+                                new_matcher.insert("hooks".into(), Value::Array(non_hcom));
+                                updated.push(Value::Object(new_matcher));
+                            } else if !matcher_obj.contains_key("hooks") {
                                 updated.push(matcher.clone());
                             }
+                            // else: had only hcom hooks — drop
                         } else {
                             updated.push(matcher.clone());
                         }
-                    }
-                    if updated.is_empty() {
-                        hooks.remove(&hook_type);
                     } else {
-                        hooks.insert(hook_type, Value::Array(updated));
+                        updated.push(matcher.clone());
                     }
                 }
+                if updated.is_empty() {
+                    hooks.remove(&hook_type);
+                } else {
+                    hooks.insert(hook_type, Value::Array(updated));
+                }
             }
+        }
 
-            // Clean up legacy hooks.enabled
-            if hooks.get("enabled").and_then(|v| v.as_bool()).is_some() {
-                hooks.remove("enabled");
-            }
+        // Clean up legacy hooks.enabled
+        if hooks.get("enabled").and_then(|v| v.as_bool()).is_some() {
+            hooks.remove("enabled");
+        }
 
-            if hooks.is_empty() {
-                settings.remove("hooks");
-            }
+        if hooks.is_empty() {
+            settings.remove("hooks");
         }
     }
 
     // Remove hcom permission patterns from tools.allowed
-    if let Some(tools) = settings.get_mut("tools").and_then(|v| v.as_object_mut()) {
-        if let Some(allowed) = tools.get_mut("allowed").and_then(|v| v.as_array_mut()) {
-            let all_patterns = build_all_permission_patterns();
-            allowed.retain(|v| {
-                v.as_str()
-                    .map(|s| !all_patterns.iter().any(|p| p == s))
-                    .unwrap_or(true)
-            });
-            if allowed.is_empty() {
-                tools.remove("allowed");
-            }
+    if let Some(tools) = settings.get_mut("tools").and_then(|v| v.as_object_mut())
+        && let Some(allowed) = tools.get_mut("allowed").and_then(|v| v.as_array_mut())
+    {
+        let all_patterns = build_all_permission_patterns();
+        allowed.retain(|v| {
+            v.as_str()
+                .map(|s| !all_patterns.iter().any(|p| p == s))
+                .unwrap_or(true)
+        });
+        if allowed.is_empty() {
+            tools.remove("allowed");
         }
     }
 }
@@ -1014,10 +1012,10 @@ fn remove_hcom_hooks_from_settings(settings: &mut serde_json::Map<String, Value>
 /// Skips mutation if Gemini version < 0.26.0.
 pub fn ensure_hooks_enabled() -> bool {
     let version = get_gemini_version();
-    if let Some(v) = version {
-        if v < GEMINI_MIN_VERSION {
-            return false;
-        }
+    if let Some(v) = version
+        && v < GEMINI_MIN_VERSION
+    {
+        return false;
     }
 
     let settings_path = get_gemini_settings_path();
@@ -1120,13 +1118,13 @@ pub enum SetupError {
 /// - Uses atomic write for safety
 pub fn try_setup_gemini_hooks(include_permissions: bool) -> Result<(), SetupError> {
     // Guard: block only if version detected AND too old
-    if let Some(v) = get_gemini_version() {
-        if v < GEMINI_MIN_VERSION {
-            return Err(SetupError::VersionUnsupported {
-                detected: v,
-                required: GEMINI_MIN_VERSION,
-            });
-        }
+    if let Some(v) = get_gemini_version()
+        && v < GEMINI_MIN_VERSION
+    {
+        return Err(SetupError::VersionUnsupported {
+            detected: v,
+            required: GEMINI_MIN_VERSION,
+        });
     }
 
     let settings_path = get_gemini_settings_path();
@@ -2122,11 +2120,11 @@ mod tests {
             for matcher in matchers {
                 if let Some(hook_list) = matcher.get("hooks").and_then(|v| v.as_array()) {
                     for hook in hook_list {
-                        if let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) {
-                            if cmd == expected_full {
-                                found = true;
-                                break;
-                            }
+                        if let Some(cmd) = hook.get("command").and_then(|v| v.as_str())
+                            && cmd == expected_full
+                        {
+                            found = true;
+                            break;
                         }
                     }
                 }

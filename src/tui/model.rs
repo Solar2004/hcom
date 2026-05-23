@@ -453,14 +453,14 @@ impl CommandPalette {
             .map(|(i, _)| i)
             .collect();
         // Clamp cursor into bounds
-        if let Some(c) = self.cursor {
-            if c >= self.filtered.len() {
-                self.cursor = if self.filtered.is_empty() {
-                    None
-                } else {
-                    Some(self.filtered.len() - 1)
-                };
-            }
+        if let Some(c) = self.cursor
+            && c >= self.filtered.len()
+        {
+            self.cursor = if self.filtered.is_empty() {
+                None
+            } else {
+                Some(self.filtered.len() - 1)
+            };
         }
     }
 
@@ -637,10 +637,8 @@ impl LaunchState {
     pub fn adjust_left(&mut self) {
         match self.options_cursor {
             Some(LaunchField::Tool) => self.tool = self.tool.prev(),
-            Some(LaunchField::Count) => {
-                if self.count > 1 {
-                    self.count -= 1;
-                }
+            Some(LaunchField::Count) if self.count > 1 => {
+                self.count -= 1;
             }
             Some(LaunchField::Terminal) => {
                 if self.terminal == 0 {
@@ -656,10 +654,8 @@ impl LaunchState {
     pub fn adjust_right(&mut self) {
         match self.options_cursor {
             Some(LaunchField::Tool) => self.tool = self.tool.next(),
-            Some(LaunchField::Count) => {
-                if self.count < 99 {
-                    self.count += 1;
-                }
+            Some(LaunchField::Count) if self.count < 99 => {
+                self.count += 1;
             }
             Some(LaunchField::Terminal) => {
                 self.terminal = (self.terminal + 1) % self.terminal_presets.len();
@@ -700,10 +696,10 @@ impl LaunchState {
     }
 
     pub fn cancel_editing(&mut self) {
-        if let (Some(field), Some(snapshot)) = (self.editing, self.edit_snapshot.take()) {
-            if let Some(s) = self.field_value_mut(field) {
-                *s = snapshot;
-            }
+        if let (Some(field), Some(snapshot)) = (self.editing, self.edit_snapshot.take())
+            && let Some(s) = self.field_value_mut(field)
+        {
+            *s = snapshot;
         }
         self.editing = None;
         self.edit_cursor = 0;

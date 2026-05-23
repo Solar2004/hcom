@@ -1,6 +1,6 @@
 //! Shared hook functions — deliver, poll, bind, bootstrap, finalize.
 
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::bootstrap;
 use crate::db::{HcomDb, InstanceRow, Message};
+use crate::identity;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
@@ -244,7 +245,7 @@ pub(crate) fn prepare_delivery_batch(
         .first()
         .and_then(|m| m.get("from").and_then(|v| v.as_str()))
         .unwrap_or("unknown");
-    let sender_display = instances::get_display_name(db, sender);
+    let sender_display = identity::get_display_name(db, sender);
     let msg_ts = deliver
         .last()
         .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
@@ -313,7 +314,7 @@ fn prepare_raw_messages(
         .first()
         .and_then(|m| m.get("from").and_then(|v| v.as_str()))
         .unwrap_or("unknown");
-    let sender_display = instances::get_display_name(db, sender);
+    let sender_display = identity::get_display_name(db, sender);
     let last_id = deliver
         .last()
         .and_then(|m| m.get("event_id").and_then(|v| v.as_i64()))
@@ -356,7 +357,7 @@ pub fn deliver_pending_messages(db: &HcomDb, instance_name: &str) -> (Vec<Value>
 /// Main PTY path bypasses this (HCOM_PTY_MODE=1, PTY wrapper handles injection).
 ///
 /// Uses select() on a TCP socket for efficient wake-on-message delivery.
-/// Senders call notify_instance() which connects to wake the select().
+/// Senders call `crate::notify::wake` (kind=`hook`) to wake the select().
 ///
 /// Returns (exit_code, hook_output_json, timed_out).
 /// - exit_code: 0 for timeout/no-participant, 2 for message delivery
@@ -479,8 +480,8 @@ fn poll_loop(
         let remaining = timeout - elapsed;
 
         // TCP select for notifications (or fallback poll). Relay imports
-        // (pull.rs) call notify_all_instances after every batch, so the TCP
-        // wake fires as soon as remote events land — no separate relay
+        // (pull.rs) call `crate::notify::wake_all` after every batch, so the
+        // TCP wake fires as soon as remote events land — no separate relay
         // polling needed.
         let wait_time = if notify_server.is_some() {
             Duration::from_secs(remaining.as_secs().min(30))
@@ -640,10 +641,10 @@ pub fn find_last_bind_marker(transcript_path: &str) -> Option<String> {
             // Find closing bracket
             if let Some(end_offset) = buf[idx..].iter().position(|&b| b == b']') {
                 let marker_bytes = &buf[idx..idx + end_offset + 1];
-                if let Ok(marker_str) = std::str::from_utf8(marker_bytes) {
-                    if let Some(caps) = BIND_MARKER_RE.captures(marker_str) {
-                        return Some(caps[1].to_string());
-                    }
+                if let Ok(marker_str) = std::str::from_utf8(marker_bytes)
+                    && let Some(caps) = BIND_MARKER_RE.captures(marker_str)
+                {
+                    return Some(caps[1].to_string());
                 }
             }
         }
@@ -735,19 +736,20 @@ pub fn init_hook_context(
 
     // Path 1: Process binding (hcom-launched instances)
     let process_start = Instant::now();
-    if let Some(ref process_id) = ctx.process_id {
-        if let Ok(Some(name)) = db.get_process_binding(process_id) {
-            instance_name = Some(name);
-        }
+    if let Some(ref process_id) = ctx.process_id
+        && let Ok(Some(name)) = db.get_process_binding(process_id)
+    {
+        instance_name = Some(name);
     }
     let process_ms = process_start.elapsed().as_secs_f64() * 1000.0;
 
     // Path 2: Session binding
     let binding_start = Instant::now();
-    if instance_name.is_none() && !session_id.is_empty() {
-        if let Ok(Some(name)) = db.get_session_binding(session_id) {
-            instance_name = Some(name);
-        }
+    if instance_name.is_none()
+        && !session_id.is_empty()
+        && let Ok(Some(name)) = db.get_session_binding(session_id)
+    {
+        instance_name = Some(name);
     }
     let binding_ms = binding_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -788,15 +790,15 @@ pub fn init_hook_context(
         );
     }
 
-    if ctx.is_background {
-        if let Some(ref bg_name) = ctx.background_name {
-            updates.insert("background".into(), serde_json::json!(true));
-            let log_file = ctx.hcom_dir.join(".tmp").join("logs").join(bg_name);
-            updates.insert(
-                "background_log_file".into(),
-                Value::String(log_file.to_string_lossy().to_string()),
-            );
-        }
+    if ctx.is_background
+        && let Some(ref bg_name) = ctx.background_name
+    {
+        updates.insert("background".into(), serde_json::json!(true));
+        let log_file = ctx.hcom_dir.join(".tmp").join("logs").join(bg_name);
+        updates.insert(
+            "background_log_file".into(),
+            Value::String(log_file.to_string_lossy().to_string()),
+        );
     }
 
     // Check if session matches (resume detection)
@@ -907,9 +909,9 @@ pub fn get_pending_instances(db: &HcomDb) -> Vec<String> {
 
 /// Wake an instance's hook poll loop via TCP connection.
 ///
-/// Best-effort: opens DB, finds hook notify endpoint, sends brief TCP connect.
-/// This is the hook-side counterpart to instances::notify_instance which
-/// handles PTY-side notification.
+/// Best-effort: opens DB, finds hook wake endpoint, sends brief TCP connect.
+/// Wraps `crate::notify::wake` with kind=`hook` for the hook poll path —
+/// PTY/listen wakes go through `crate::notify::wake` directly.
 ///
 pub fn notify_hook_instance(instance_name: &str) {
     if let Ok(db) = HcomDb::open() {
@@ -919,7 +921,7 @@ pub fn notify_hook_instance(instance_name: &str) {
 
 /// Wake hook poll loop with an existing DB handle.
 pub fn notify_hook_instance_with_db(db: &HcomDb, instance_name: &str) {
-    lifecycle::notify_instance_endpoints(db, instance_name, &["hook"]);
+    crate::notify::wake(db, instance_name, &[crate::notify::WakeKind::Hook]);
 }
 
 /// Stop instance: log snapshot, clean bindings, delete row.
@@ -927,7 +929,16 @@ pub fn notify_hook_instance_with_db(db: &HcomDb, instance_name: &str) {
 /// Handles: snapshot capture, session/process/notify/subscription cleanup,
 /// life event logging, and instance deletion.
 pub fn stop_instance(db: &HcomDb, instance_name: &str, initiated_by: &str, reason: &str) {
-    stop_instance_inner(db, instance_name, initiated_by, reason, 0);
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0);
+}
+
+pub(crate) fn stop_placeholder_instance(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+) {
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0);
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -939,6 +950,7 @@ fn stop_instance_inner(
     instance_name: &str,
     initiated_by: &str,
     reason: &str,
+    placeholder: bool,
     depth: u32,
 ) {
     if depth >= MAX_STOP_DEPTH {
@@ -1006,17 +1018,14 @@ fn stop_instance_inner(
                 let kitty_listen_on = ti.kitty_listen_on;
                 let zellij_session_name = ti.zellij_session_name;
                 // Fallback: process_bindings table
-                if proc_id.is_empty() {
-                    if let Ok(mut stmt) = db
+                if proc_id.is_empty()
+                    && let Ok(mut stmt) = db
                         .conn()
                         .prepare("SELECT process_id FROM process_bindings WHERE instance_name = ?")
-                    {
-                        if let Ok(val) =
-                            stmt.query_row(params![instance_name], |row| row.get::<_, String>(0))
-                        {
-                            proc_id = val;
-                        }
-                    }
+                    && let Ok(val) =
+                        stmt.query_row(params![instance_name], |row| row.get::<_, String>(0))
+                {
+                    proc_id = val;
                 }
                 // Grab notify/inject ports before DB cleanup deletes them
                 let mut notify_port: u16 = 0;
@@ -1024,16 +1033,15 @@ fn stop_instance_inner(
                 if let Ok(mut stmt) = db
                     .conn()
                     .prepare("SELECT kind, port FROM notify_endpoints WHERE instance = ?")
-                {
-                    if let Ok(rows) = stmt.query_map(params![instance_name], |row| {
+                    && let Ok(rows) = stmt.query_map(params![instance_name], |row| {
                         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    }) {
-                        for row in rows.flatten() {
-                            match row.0.as_str() {
-                                "pty" => notify_port = row.1 as u16,
-                                "inject" => inject_port = row.1 as u16,
-                                _ => {}
-                            }
+                    })
+                {
+                    for row in rows.flatten() {
+                        match row.0.as_str() {
+                            "pty" => notify_port = row.1 as u16,
+                            "inject" => inject_port = row.1 as u16,
+                            _ => {}
                         }
                     }
                 }
@@ -1067,15 +1075,9 @@ fn stop_instance_inner(
         }
     }
 
-    // Capture notify ports BEFORE cleanup deletes them
-    let notify_ports: Vec<i64> = db
-        .conn()
-        .prepare("SELECT port FROM notify_endpoints WHERE instance = ?")
-        .and_then(|mut stmt| {
-            stmt.query_map(params![instance_name], |row| row.get::<_, i64>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    // Capture wake ports BEFORE cleanup deletes them; we'll fire wakes after
+    // delete so any remaining listeners see the row is gone.
+    let wake_ports = crate::notify::snapshot_wake_ports(db, instance_name);
 
     // Prepare snapshot before delete (preserves data for transcript access)
     // Use Option values directly so None serializes as JSON null
@@ -1121,7 +1123,14 @@ fn stop_instance_inner(
             })
             .unwrap_or_default();
         for sub_name in subagents {
-            stop_instance_inner(db, &sub_name, initiated_by, "parent_stopped", depth + 1);
+            stop_instance_inner(
+                db,
+                &sub_name,
+                initiated_by,
+                "parent_stopped",
+                false,
+                depth + 1,
+            );
         }
     }
 
@@ -1136,13 +1145,16 @@ fn stop_instance_inner(
     let _ = db.cleanup_subscriptions(instance_name);
 
     // Log life event with snapshot BEFORE delete
-    if let Err(e) = db.log_life_event(
-        instance_name,
-        "stopped",
-        initiated_by,
-        reason,
-        Some(snapshot),
-    ) {
+    let mut event_data = serde_json::json!({
+        "action": "stopped",
+        "by": initiated_by,
+        "reason": reason,
+        "snapshot": snapshot,
+    });
+    if placeholder {
+        event_data["placeholder"] = serde_json::json!(true);
+    }
+    if let Err(e) = db.log_event("life", instance_name, &event_data) {
         log::log_warn(
             "hooks",
             "finalize.life_event_failed",
@@ -1160,14 +1172,7 @@ fn stop_instance_inner(
     }
 
     // Notify remaining listeners AFTER delete (so they see the row is gone)
-    for port in notify_ports {
-        if port > 0 && port <= 65535 {
-            let addr = format!("127.0.0.1:{}", port);
-            if let Ok(addr) = addr.parse() {
-                let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
-            }
-        }
-    }
+    crate::notify::wake_ports(&wake_ports, crate::notify::WAKE_TARGETED_MS);
 
     // Trigger relay push (best-effort)
     let prefix = crate::runtime_env::get_hcom_prefix();
@@ -1443,7 +1448,7 @@ mod tests {
         assert_eq!(cursor, expected_last_id);
 
         let instance = db.get_instance_full("nova").unwrap().unwrap();
-        let delivered_name = crate::instances::get_display_name(&db, "luna");
+        let delivered_name = crate::identity::get_display_name(&db, "luna");
 
         assert_eq!(instance.status, ST_ACTIVE);
         assert_eq!(instance.status_context, format!("deliver:{delivered_name}"));

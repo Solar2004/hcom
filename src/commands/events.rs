@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::core::filters::{
-    EventFilterArgs, FILE_WRITE_CONTEXTS, build_sql_from_flags, resolve_filter_names,
-};
+use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
 use crate::core::launch_status::wait_for_launch;
 use crate::db::HcomDb;
+use crate::db::subscriptions::{
+    SubCreateOutcome, build_and_insert_sql_subscription, create_filter_subscription,
+};
 use crate::shared::CommandContext;
 
 /// Parsed arguments for `hcom events`.
@@ -140,17 +141,17 @@ pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -
             }
             "status" => {
                 // Truncate detail unless --cmd or --file filter active
-                if !filters.contains_key("cmd") && !filters.contains_key("file") {
-                    if let Some(detail) = obj.get("detail").and_then(|v| v.as_str()) {
-                        if detail.len() > 60 {
-                            let end = (0..=60)
-                                .rev()
-                                .find(|&i| detail.is_char_boundary(i))
-                                .unwrap_or(0);
-                            let truncated = format!("{}...", &detail[..end]);
-                            obj.insert("detail".into(), json!(truncated));
-                        }
-                    }
+                if !filters.contains_key("cmd")
+                    && !filters.contains_key("file")
+                    && let Some(detail) = obj.get("detail").and_then(|v| v.as_str())
+                    && detail.len() > 60
+                {
+                    let end = (0..=60)
+                        .rev()
+                        .find(|&i| detail.is_char_boundary(i))
+                        .unwrap_or(0);
+                    let truncated = format!("{}...", &detail[..end]);
+                    obj.insert("detail".into(), json!(truncated));
                 }
                 obj.remove("position");
             }
@@ -330,215 +331,36 @@ fn events_sub_filter(
     once: bool,
     on_hit: Option<&str>,
 ) -> i32 {
-    create_filter_subscription(db, filters, sql_parts, caller, once, false, on_hit)
-}
-
-/// Determine sender_kind for a sub caller at creation time.
-/// Stored on the sub so on-hit provenance stays stable across caller lifecycle.
-fn resolve_caller_kind(db: &HcomDb, caller: &str) -> &'static str {
-    let exists: bool = db
-        .conn()
-        .query_row(
-            "SELECT 1 FROM instances WHERE name = ?",
-            rusqlite::params![caller],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if exists { "instance" } else { "external" }
-}
-
-fn collision_self_relevance_sql(caller: &str) -> String {
-    let caller_escaped = caller.replace('\'', "''");
-    format!(
-        "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events_v e2 WHERE e2.type = 'status' AND e2.status_context IN {ctx} AND e2.status_detail = events_v.status_detail AND e2.instance = '{caller_escaped}' AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 30))",
-        ctx = FILE_WRITE_CONTEXTS
-    )
-}
-
-/// Outcome of a subscription insert attempt.
-pub(crate) enum SubCreateOutcome {
-    Created { id: String, final_sql: String },
-    AlreadyExists { id: String },
-}
-
-/// Build and insert a filter-based subscription row into `kv`.
-/// No printing — callers format output as appropriate.
-pub(crate) fn build_and_insert_filter_subscription(
-    db: &HcomDb,
-    filters: &HashMap<String, Vec<String>>,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    on_hit: Option<&str>,
-) -> Result<SubCreateOutcome, String> {
-    // Build SQL from filters
-    let mut sql = match build_sql_from_flags(filters) {
-        Ok(s) if !s.is_empty() => s,
-        Ok(_) => return Err("No valid filters provided".to_string()),
-        Err(e) => return Err(format!("Filter error: {e}")),
-    };
-
-    // Validate and combine user-provided SQL parts
-    if !sql_parts.is_empty() {
-        let manual_sql = sql_parts.join(" ").replace("\\!", "!");
-        if let Err(e) = db.conn().execute(
-            &format!("SELECT 1 FROM events_v WHERE ({manual_sql}) LIMIT 0"),
-            [],
-        ) {
-            return Err(format!("Invalid SQL: {e}"));
+    let outcome = match create_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
         }
-        sql = format!("({sql}) AND ({manual_sql})");
-    }
-
-    // Collision self-relevance filtering
-    if filters.contains_key("collision") {
-        let self_relevance = collision_self_relevance_sql(caller);
-        sql = format!("({sql}) AND {self_relevance}");
-    }
-
-    // Generate subscription ID from SHA256 hash
-    let id_source = format!(
-        "{}:{}:{}:{}:{}",
-        caller,
-        serde_json::to_string(filters).unwrap_or_default(),
-        sql,
-        once,
-        on_hit.unwrap_or(""),
-    );
-    let hash = sha256_hash(&id_source);
-    let sub_id = format!("sub-{}", &hash[..8]);
-    let sub_key = format!("events_sub:{sub_id}");
-
-    // Check duplicate
-    if db.kv_get(&sub_key).ok().flatten().is_some() {
-        return Ok(SubCreateOutcome::AlreadyExists { id: sub_id });
-    }
-
-    let now = crate::shared::time::now_epoch_f64();
-    let last_id = db.get_last_event_id();
-
-    let mut sub_data = json!({
-        "id": sub_id,
-        "caller": caller,
-        "filters": filters,
-        "sql": sql,
-        "created": now,
-        "last_id": last_id,
-        "once": once,
-    });
-    if let Some(text) = on_hit {
-        sub_data["on_hit_text"] = json!(text);
-        // Capture caller_kind at creation so on-hit provenance stays stable
-        // even if the caller instance stops before the sub fires.
-        sub_data["caller_kind"] = json!(resolve_caller_kind(db, caller));
-    }
-
-    let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-
-    Ok(SubCreateOutcome::Created {
-        id: sub_id,
-        final_sql: sql,
-    })
-}
-
-/// Core subscription creation logic. When `silent` is true, suppresses all stdout output.
-/// Used by both the CLI `events sub` command and `auto_subscribe_defaults`.
-pub(crate) fn create_filter_subscription(
-    db: &HcomDb,
-    filters: &HashMap<String, Vec<String>>,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    silent: bool,
-    on_hit: Option<&str>,
-) -> i32 {
-    let outcome =
-        match build_and_insert_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
-            Ok(o) => o,
-            Err(e) => {
-                if !silent {
-                    eprintln!("Error: {e}");
-                }
-                return 1;
-            }
-        };
+    };
 
     match outcome {
         SubCreateOutcome::AlreadyExists { id } => {
-            if !silent {
-                println!("Subscription {id} already exists");
-            }
+            println!("Subscription {id} already exists");
         }
         SubCreateOutcome::Created { id, final_sql } => {
-            if !silent {
-                println!("Subscription {id} created");
+            println!("Subscription {id} created");
 
-                if let Ok(count) = db.conn().query_row(
-                    &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
-                    [],
-                    |row| row.get::<_, i64>(0),
-                ) {
-                    if count > 0 {
-                        println!("  historical matches: {count} events");
-                        println!("  You will be notified on the next matching event(s)");
-                    }
-                }
-
-                maybe_show_tip(db, caller, "sub:created");
+            if let Ok(count) = db.conn().query_row(
+                &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
+                [],
+                |row| row.get::<_, i64>(0),
+            ) && count > 0
+            {
+                println!("  historical matches: {count} events");
+                println!("  You will be notified on the next matching event(s)");
             }
+
+            maybe_show_tip(db, caller, "sub:created");
         }
     }
 
     0
-}
-
-/// Build and insert a raw-SQL subscription row into `kv`. No printing.
-pub(crate) fn build_and_insert_sql_subscription(
-    db: &HcomDb,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    on_hit: Option<&str>,
-) -> Result<SubCreateOutcome, String> {
-    let sql = sql_parts.join(" ").replace("\\!", "!");
-
-    if let Err(e) = db
-        .conn()
-        .execute(&format!("SELECT 1 FROM events_v WHERE ({sql}) LIMIT 0"), [])
-    {
-        return Err(format!("Invalid SQL: {e}"));
-    }
-
-    let hash = sha256_hash(&format!("{caller}{sql}{once}{}", on_hit.unwrap_or("")));
-    let sub_id = format!("sub-{}", &hash[..8]);
-    let sub_key = format!("events_sub:{sub_id}");
-
-    if db.kv_get(&sub_key).ok().flatten().is_some() {
-        return Ok(SubCreateOutcome::AlreadyExists { id: sub_id });
-    }
-
-    let now = crate::shared::time::now_epoch_f64();
-    let last_id = db.get_last_event_id();
-
-    let mut sub_data = json!({
-        "id": sub_id,
-        "sql": sql,
-        "caller": caller,
-        "once": once,
-        "last_id": last_id,
-        "created": now,
-    });
-    if let Some(text) = on_hit {
-        sub_data["on_hit_text"] = json!(text);
-        sub_data["caller_kind"] = json!(resolve_caller_kind(db, caller));
-    }
-
-    let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-
-    Ok(SubCreateOutcome::Created {
-        id: sub_id,
-        final_sql: sql,
-    })
 }
 
 /// Create a raw SQL subscription.
@@ -581,8 +403,8 @@ fn events_sub_sql(
             // Show latest match as example
             if let Ok(mut stmt) = db.conn().prepare(
                 &format!("SELECT timestamp, type, instance FROM events_v WHERE ({sql}) ORDER BY id DESC LIMIT 1")
-            ) {
-                if let Ok(row) = stmt.query_row([], |row| {
+            )
+                && let Ok(row) = stmt.query_row([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -592,7 +414,6 @@ fn events_sub_sql(
                     let ts = if row.0.len() > 19 { &row.0[..19] } else { &row.0 };
                     println!("  latest match: [{}] {} @ {}", row.1, row.2, ts);
                 }
-            }
             println!("  You will be notified on the next matching event(s)");
         } else {
             println!("  historical matches: 0 (filter will apply to future events only)");
@@ -626,7 +447,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
 
     let once = args.once;
     let target_instance = args.for_agent.as_deref().map(|name| {
-        crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
+        crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
     });
     let sql_parts: Vec<String> = args.rest.clone();
 
@@ -984,37 +805,35 @@ fn events_wait(
     let lookback_query = format!(
         "SELECT * FROM events_v WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
     );
-    if let Ok(mut stmt) = db.conn().prepare(&lookback_query) {
-        if let Ok(mut rows) = stmt.query(rusqlite::params![lookback_ts]) {
-            if let Ok(Some(row)) = rows.next() {
-                if let Ok(event) = parse_event_row(row) {
-                    let output = if full_output {
-                        event.clone()
-                    } else {
-                        streamline_event(&event, filters)
-                    };
-                    println!("{}", serde_json::to_string(&output).unwrap_or_default());
-                    return 0;
-                }
-            }
-        }
+    if let Ok(mut stmt) = db.conn().prepare(&lookback_query)
+        && let Ok(mut rows) = stmt.query(rusqlite::params![lookback_ts])
+        && let Ok(Some(row)) = rows.next()
+        && let Ok(event) = parse_event_row(row)
+    {
+        let output = if full_output {
+            event.clone()
+        } else {
+            streamline_event(&event, filters)
+        };
+        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+        return 0;
     }
 
     // Setup TCP notify server for instant wake — only useful when we can
-    // register a port for `notify_all_instances` to poke. Anonymous waits
-    // (no instance_name) skip the listener and fall through to a short poll.
+    // register an `events_wait` wake endpoint for `crate::notify::wake_all`
+    // to poke. Anonymous waits (no instance_name) skip the listener and
+    // fall through to a short poll.
     let mut notify_server: Option<TcpListener> = None;
     let mut notify_port: Option<u16> = None;
-    if let Some(name) = instance_name {
-        if let Ok(server) = TcpListener::bind("127.0.0.1:0") {
-            if let Ok(addr) = server.local_addr() {
-                let port = addr.port();
-                server.set_nonblocking(true).ok();
-                if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
-                    notify_server = Some(server);
-                    notify_port = Some(port);
-                }
-            }
+    if let Some(name) = instance_name
+        && let Ok(server) = TcpListener::bind("127.0.0.1:0")
+        && let Ok(addr) = server.local_addr()
+    {
+        let port = addr.port();
+        server.set_nonblocking(true).ok();
+        if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
+            notify_server = Some(server);
+            notify_port = Some(port);
         }
     }
 
@@ -1123,15 +942,6 @@ fn parse_event_row(row: &rusqlite::Row) -> Result<Value, rusqlite::Error> {
     }))
 }
 
-/// SHA-256 hex hash
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Build <hcom> XML message preview for unread notification.
 fn build_message_preview(db: &HcomDb, instance_name: &str) -> String {
     let messages = db.get_unread_messages(instance_name);
@@ -1140,10 +950,10 @@ fn build_message_preview(db: &HcomDb, instance_name: &str) -> String {
     }
 
     // Build simple "sender → you" format
-    let display_name = crate::instances::get_display_name(db, instance_name);
+    let display_name = crate::identity::get_display_name(db, instance_name);
     let senders: Vec<String> = messages
         .iter()
-        .map(|m| crate::instances::get_display_name(db, &m.from))
+        .map(|m| crate::identity::get_display_name(db, &m.from))
         .collect();
 
     // Deduplicate senders preserving order
@@ -1349,51 +1159,50 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 
         // Search archives
         let archive_dir = crate::paths::hcom_dir().join("archive");
-        if archive_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&archive_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let db_path = path.join("hcom.db");
-                    if !db_path.exists() {
-                        continue;
-                    }
-                    let archive_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("archive");
+        if archive_dir.exists()
+            && let Ok(entries) = std::fs::read_dir(&archive_dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let db_path = path.join("hcom.db");
+                if !db_path.exists() {
+                    continue;
+                }
+                let archive_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("archive");
 
-                    if let Ok(archive_db) = HcomDb::open_raw(&db_path) {
-                        // Build archive query with same filters
-                        let archive_filter = filter_query.clone();
-                        let query = format!(
-                            "SELECT * FROM events_v WHERE 1=1{archive_filter} ORDER BY id DESC LIMIT {last_n}"
-                        );
-                        if let Ok(mut stmt) = archive_db.conn().prepare(&query) {
-                            if let Ok(rows) = stmt.query_map([], |row| {
-                                let id: i64 = row.get("id")?;
-                                let ts: String = row.get("timestamp")?;
-                                let etype: String = row.get("type")?;
-                                let instance: String = row.get("instance")?;
-                                let data_str: String = row.get("data")?;
-                                Ok((id, ts, etype, instance, data_str))
-                            }) {
-                                for row in rows.flatten() {
-                                    let (id, ts, etype, instance, data_str) = row;
-                                    let data: Value =
-                                        serde_json::from_str(&data_str).unwrap_or(json!({}));
-                                    all_events.push(json!({
-                                        "id": id,
-                                        "ts": ts,
-                                        "type": etype,
-                                        "instance": instance,
-                                        "data": data,
-                                        "source": archive_name,
-                                    }));
-                                }
-                            }
+                if let Ok(archive_db) = HcomDb::open_raw(&db_path) {
+                    // Build archive query with same filters
+                    let archive_filter = filter_query.clone();
+                    let query = format!(
+                        "SELECT * FROM events_v WHERE 1=1{archive_filter} ORDER BY id DESC LIMIT {last_n}"
+                    );
+                    if let Ok(mut stmt) = archive_db.conn().prepare(&query)
+                        && let Ok(rows) = stmt.query_map([], |row| {
+                            let id: i64 = row.get("id")?;
+                            let ts: String = row.get("timestamp")?;
+                            let etype: String = row.get("type")?;
+                            let instance: String = row.get("instance")?;
+                            let data_str: String = row.get("data")?;
+                            Ok((id, ts, etype, instance, data_str))
+                        })
+                    {
+                        for row in rows.flatten() {
+                            let (id, ts, etype, instance, data_str) = row;
+                            let data: Value = serde_json::from_str(&data_str).unwrap_or(json!({}));
+                            all_events.push(json!({
+                                "id": id,
+                                "ts": ts,
+                                "type": etype,
+                                "instance": instance,
+                                "data": data,
+                                "source": archive_name,
+                            }));
                         }
                     }
                 }
@@ -1554,27 +1363,6 @@ mod tests {
         let data = result.get("data").unwrap();
 
         assert!(data.get("mentions").is_some());
-    }
-
-    #[test]
-    fn test_sha256_hash() {
-        let h1 = sha256_hash("test input");
-        let h2 = sha256_hash("test input");
-        let h3 = sha256_hash("different input");
-        assert_eq!(h1, h2); // deterministic
-        assert_ne!(h1, h3); // different inputs
-        assert_eq!(h1.len(), 64); // full SHA-256 hex
-        // Verify known SHA-256 hash
-        assert_eq!(&h1[..8], "9dfe6f15");
-    }
-
-    #[test]
-    fn test_collision_self_relevance_matches_filter_constants() {
-        let sql = collision_self_relevance_sql("luna");
-        assert!(sql.contains(FILE_WRITE_CONTEXTS));
-        assert!(sql.contains("< 30"));
-        assert!(!sql.contains("tool:edit_file"));
-        assert!(!sql.contains("< 20"));
     }
 
     #[test]

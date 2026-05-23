@@ -1,0 +1,132 @@
+//! Notify endpoint registry helpers.
+//!
+//! Owns the `notify_endpoints` table — `(instance, kind, port)` rows that map
+//! an instance to TCP ports the rest of the system can poke. Two protocol
+//! families share this table:
+//!
+//! - **Wake endpoints** (kinds: `pty`, `hook`, `listen`, `listen_filter`,
+//!   `events_wait`, `plugin`) — connect-and-close wakes a poll loop in the
+//!   target process. See `crate::notify::WakeKind`.
+//! - **Inject endpoint** (kind: `inject`) — bidirectional RPC for PTY input
+//!   and screen queries. Lives in the same table for historical reasons; the
+//!   protocol is unrelated to wake.
+
+use anyhow::Result;
+use rusqlite::params;
+
+use super::HcomDb;
+use crate::shared::time::now_epoch_f64;
+
+impl HcomDb {
+    /// Register notify endpoint for PTY wake-ups
+    ///
+    /// Inserts or updates notify_endpoints table with (instance, kind='pty', port)
+    pub fn register_notify_port(&self, name: &str, port: u16) -> Result<()> {
+        self.upsert_notify_endpoint(name, "pty", port)
+    }
+
+    /// Register inject port for screen queries
+    pub fn register_inject_port(&self, name: &str, port: u16) -> Result<()> {
+        self.upsert_notify_endpoint(name, "inject", port)
+    }
+
+    /// Delete notify endpoints for an instance
+    pub fn delete_notify_endpoints(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM notify_endpoints WHERE instance = ?",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Insert or update a notify endpoint with specific kind.
+    /// Used by listen command to register listen/listen_filter endpoints.
+    pub fn upsert_notify_endpoint(&self, name: &str, kind: &str, port: u16) -> Result<()> {
+        let now = now_epoch_f64();
+
+        self.conn.execute(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(instance, kind) DO UPDATE SET
+                 port = excluded.port,
+                 updated_at = excluded.updated_at",
+            params![name, kind, port as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a specific notify endpoint by instance and kind.
+    pub fn delete_notify_endpoint(&self, name: &str, kind: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM notify_endpoints WHERE instance = ? AND kind = ?",
+            params![name, kind],
+        )?;
+        Ok(())
+    }
+
+    /// Check if any notify endpoint exists for an instance.
+    pub fn has_notify_endpoint(&self, name: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM notify_endpoints WHERE instance = ? LIMIT 1",
+                params![name],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{cleanup_test_db, setup_full_test_db};
+
+    #[test]
+    fn test_register_inject_port_inserts() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.register_inject_port("test", 5555).unwrap();
+
+        let port: i64 = db
+            .conn
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'test' AND kind = 'inject'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(port, 5555);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_register_inject_port_upserts() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.register_inject_port("test", 5555).unwrap();
+        db.register_inject_port("test", 6666).unwrap();
+
+        let port: i64 = db
+            .conn
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'test' AND kind = 'inject'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(port, 6666);
+
+        // Should be exactly one row
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'test'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        cleanup_test_db(db_path);
+    }
+}

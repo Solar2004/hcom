@@ -130,7 +130,7 @@ or TypeScript needed on the user's machine.
 
 ## Terminal
 
-Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, **tmux**, and **cmux** also support closing panes from `hcom kill`.
+Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux** also support closing panes from `hcom kill`.
 
 To configure a custom terminal open/close setup, tell an agent to run:
 
@@ -303,7 +303,7 @@ hcom events --wait <filters>         # Block until match for scripting
 hcom update                         # update hcom version
 ```
 
-`hcom --help` for all commands.
+`hcom run docs --cli` for all commands.
 
 </details>
 
@@ -391,7 +391,7 @@ Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovere
 ### Building from Source
 
 ```bash
-# Prerequisites: Rust 1.86+
+# Prerequisites: Rust 1.88+
 
 git clone https://github.com/Solar2004/hcom.git
 cd hcom

@@ -45,6 +45,7 @@ fn check_gemini_hooks() -> bool {
 
 fn check_codex_hooks() -> bool {
     crate::hooks::codex::verify_codex_hooks_installed(false)
+        && crate::hooks::codex::codex_current_feature_enabled()
 }
 
 fn check_opencode_hooks() -> bool {
@@ -156,20 +157,19 @@ fn get_agent_counts(db: &HcomDb) -> AgentCounts {
     if let Ok(mut stmt) = db
         .conn()
         .prepare("SELECT status, COUNT(*) FROM instances GROUP BY status")
-    {
-        if let Ok(rows) = stmt.query_map([], |row| {
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }) {
-            for row in rows.flatten() {
-                match row.0.as_str() {
-                    s if s.starts_with("active") => c.active += row.1,
-                    "listening" => c.listening += row.1,
-                    s if s.starts_with("blocked") => c.blocked += row.1,
-                    "error" => c.error += row.1,
-                    "launching" => c.launching += row.1,
-                    "inactive" => c.inactive += row.1,
-                    _ => c.inactive += row.1,
-                }
+        })
+    {
+        for row in rows.flatten() {
+            match row.0.as_str() {
+                s if s.starts_with("active") => c.active += row.1,
+                "listening" => c.listening += row.1,
+                s if s.starts_with("blocked") => c.blocked += row.1,
+                "error" => c.error += row.1,
+                "launching" => c.launching += row.1,
+                "inactive" => c.inactive += row.1,
+                _ => c.inactive += row.1,
             }
         }
     }

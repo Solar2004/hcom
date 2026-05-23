@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use crate::db::HcomDb;
-use crate::instances::get_full_name;
+use crate::identity::get_full_name;
 use crate::paths;
 use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
 
@@ -54,8 +54,6 @@ Routing rules:
 
 You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
-- Message: send @name(s) [--project X] [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "message text" 
-  Or instead of --: --file <path> | --base64 <string> | pipe/heredoc
   Example: send @luna @nova --intent ack --reply-to 82 -- "ok"
 - See who's active: list [-v] [--json] [--names] [--project X] [--format '{{name}} {{status}}']
 - Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search "text" [--all]
@@ -515,8 +513,7 @@ mod tests {
     fn setup_test_db() -> (TempDir, HcomDb) {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
-        let db = HcomDb::open_raw(&db_path).unwrap();
-        db.init_db().unwrap();
+        let db = HcomDb::open_at(&db_path).unwrap();
         (tmp, db)
     }
 

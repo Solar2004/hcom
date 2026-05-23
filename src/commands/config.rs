@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::db::DEV_ROOT_KV_KEY;
 use crate::db::HcomDb;
-use crate::instance_lifecycle;
+use crate::identity;
 use crate::instances;
 use crate::shared::CommandContext;
 
@@ -324,17 +324,17 @@ pub fn config_get(key: &str) -> (String, &'static str) {
     let content = load_config_content();
     if let Ok(table) = content.parse::<toml::Table>() {
         // Try nested path first
-        if let Some(dotted_path) = toml_path_for_key(&field_name) {
-            if let Some(val) = get_nested_toml(&table, dotted_path) {
-                let val_str = match &val {
-                    toml::Value::String(s) => s.clone(),
-                    toml::Value::Integer(n) => n.to_string(),
-                    toml::Value::Boolean(b) => b.to_string(),
-                    toml::Value::Float(f) => f.to_string(),
-                    other => other.to_string(),
-                };
-                return (val_str, "toml");
-            }
+        if let Some(dotted_path) = toml_path_for_key(&field_name)
+            && let Some(val) = get_nested_toml(&table, dotted_path)
+        {
+            let val_str = match &val {
+                toml::Value::String(s) => s.clone(),
+                toml::Value::Integer(n) => n.to_string(),
+                toml::Value::Boolean(b) => b.to_string(),
+                toml::Value::Float(f) => f.to_string(),
+                other => other.to_string(),
+            };
+            return (val_str, "toml");
         }
         // Fallback: try flat key (for legacy configs) — skip non-scalar values
         // (e.g. table.get("terminal") returns the whole [terminal] section when
@@ -459,8 +459,7 @@ fn config_instance(
             return 1;
         }
     } else {
-        instances::resolve_display_name(db, instance_arg)
-            .unwrap_or_else(|| instance_arg.to_string())
+        identity::resolve_display_name(db, instance_arg).unwrap_or_else(|| instance_arg.to_string())
     };
 
     // Verify instance exists
@@ -496,7 +495,7 @@ fn config_instance(
 
     // No key: show instance settings
     if args.is_empty() {
-        let full_name = crate::instances::get_full_name(&instance);
+        let full_name = crate::identity::get_full_name(&instance);
         let config = build_instance_config_json(&instance, &full_name);
         println!("{}", render_config_instance_get(&config, None, json_mode));
         return 0;
@@ -573,7 +572,7 @@ fn config_instance(
                 render_config_instance_set_feedback(inst_name, "tag", tag)
             );
             // Notify for display update
-            instance_lifecycle::notify_all_instances(db);
+            crate::notify::wake_all(db);
         }
         "timeout" => {
             if value.is_empty() || value.eq_ignore_ascii_case("default") {
@@ -788,7 +787,7 @@ pub fn config_instance_get(
     instance_arg: &str,
     key: Option<&str>,
 ) -> Result<Value, String> {
-    let name = instances::resolve_display_name(db, instance_arg)
+    let name = identity::resolve_display_name(db, instance_arg)
         .unwrap_or_else(|| instance_arg.to_string());
     let instance = db
         .get_instance_full(&name)
@@ -797,7 +796,7 @@ pub fn config_instance_get(
 
     Ok(match key {
         None => {
-            let full_name = crate::instances::get_full_name(&instance);
+            let full_name = crate::identity::get_full_name(&instance);
             build_instance_config_json(&instance, &full_name)
         }
         Some("tag") => serde_json::json!({"value": instance.tag.as_deref().unwrap_or("")}),
@@ -818,7 +817,7 @@ pub fn config_instance_set(
     key: &str,
     value: &str,
 ) -> Result<Value, String> {
-    let name = instances::resolve_display_name(db, instance_arg)
+    let name = identity::resolve_display_name(db, instance_arg)
         .unwrap_or_else(|| instance_arg.to_string());
     let instance = db
         .get_instance_full(&name)
@@ -900,7 +899,7 @@ pub fn config_instance_set(
         other => return Err(format!("Unknown instance config key '{}'", other)),
     }
 
-    instance_lifecycle::notify_all_instances(db);
+    crate::notify::wake_all(db);
     Ok(serde_json::json!({"instance": inst_name, "field": key, "value": value}))
 }
 
@@ -939,8 +938,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
     // Instance config mode
     if let Some(ref inst) = instance_name {
-        let resolved =
-            instances::resolve_display_name(db, inst).unwrap_or_else(|| inst.to_string());
+        let resolved = identity::resolve_display_name(db, inst).unwrap_or_else(|| inst.to_string());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
             let action = if argv.len() >= 2 {
                 crate::relay::control::rpc_action::CONFIG_SET
@@ -1580,32 +1578,32 @@ pub fn terminal_help_text(show_current: bool) -> String {
     // Check binary availability
     let is_available = |preset_name: &str| -> bool {
         let preset = TERMINAL_PRESETS.iter().find(|(n, _)| *n == preset_name);
-        #[allow(unused_variables)]
-        if let Some((name, p)) = preset {
-            if let Some(bin) = p.binary {
-                if crate::terminal::which_bin(bin).is_some() {
+        let Some((_name, p)) = preset else {
+            return false;
+        };
+        if p.binary
+            .is_some_and(|bin| crate::terminal::which_bin(bin).is_some())
+        {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let app = p.app_name.unwrap_or(_name);
+            // Handle preset names that already end in .app
+            let bundle = if app.ends_with(".app") {
+                app.to_string()
+            } else {
+                format!("{app}.app")
+            };
+            for dir in [
+                "/Applications",
+                "/Applications/Utilities",
+                "/System/Applications",
+                "/System/Applications/Utilities",
+            ] {
+                let path = format!("{dir}/{bundle}");
+                if std::path::Path::new(&path).exists() {
                     return true;
-                }
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let app = p.app_name.unwrap_or(name);
-                // Handle preset names that already end in .app
-                let bundle = if app.ends_with(".app") {
-                    app.to_string()
-                } else {
-                    format!("{app}.app")
-                };
-                for dir in [
-                    "/Applications",
-                    "/Applications/Utilities",
-                    "/System/Applications",
-                    "/System/Applications/Utilities",
-                ] {
-                    let path = format!("{dir}/{bundle}");
-                    if std::path::Path::new(&path).exists() {
-                        return true;
-                    }
                 }
             }
         }
@@ -1810,13 +1808,13 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
         }
         // Include TOML-defined presets not in built-ins
         let toml_path = crate::paths::config_toml_path();
-        if let Some(toml_presets) = crate::config::load_toml_presets(&toml_path) {
-            if let Some(table) = toml_presets.as_table() {
-                for name in table.keys() {
-                    if !TERMINAL_PRESETS.iter().any(|(n, _)| *n == name.as_str()) {
-                        let marker = if *name == current { " ← current" } else { "" };
-                        println!("  {}{}", name, marker);
-                    }
+        if let Some(toml_presets) = crate::config::load_toml_presets(&toml_path)
+            && let Some(table) = toml_presets.as_table()
+        {
+            for name in table.keys() {
+                if !TERMINAL_PRESETS.iter().any(|(n, _)| *n == name.as_str()) {
+                    let marker = if *name == current { " ← current" } else { "" };
+                    println!("  {}{}", name, marker);
                 }
             }
         }
@@ -1950,10 +1948,10 @@ fn kitty_conf_has(path: &Path, key: &str) -> Option<String> {
             continue;
         }
         let mut parts = line.splitn(2, |c: char| c.is_whitespace());
-        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-            if k == key {
-                return Some(v.trim().to_string());
-            }
+        if let (Some(k), Some(v)) = (parts.next(), parts.next())
+            && k == key
+        {
+            return Some(v.trim().to_string());
         }
     }
     None
@@ -1988,15 +1986,16 @@ fn kitty_setup() -> i32 {
         return 0;
     }
 
-    if let Some(ref rc_val) = has_rc {
-        if rc_val != "yes" && rc_val != "socket" {
-            eprintln!(
-                "Error: allow_remote_control is '{rc_val}' in {}",
-                conf.display()
-            );
-            eprintln!("  Change to 'yes' or 'socket', then restart kitty");
-            return 1;
-        }
+    if let Some(ref rc_val) = has_rc
+        && rc_val != "yes"
+        && rc_val != "socket"
+    {
+        eprintln!(
+            "Error: allow_remote_control is '{rc_val}' in {}",
+            conf.display()
+        );
+        eprintln!("  Change to 'yes' or 'socket', then restart kitty");
+        return 1;
     }
 
     let mut lines_to_add = Vec::new();
@@ -2201,42 +2200,6 @@ mod tests {
 
         assert!(managed.contains("cmux"));
         assert!(!other.contains("cmux"));
-    }
-
-    #[test]
-    fn test_terminal_help_text_lists_close_capable_zellij_as_managed() {
-        crate::config::Config::reset();
-        crate::config::Config::init();
-        let help = terminal_help_text(false);
-        let managed = help
-            .split("Other (opens window only):")
-            .next()
-            .expect("managed section should exist");
-        let other = help
-            .split("Other (opens window only):")
-            .nth(1)
-            .expect("other section should exist");
-
-        assert!(managed.contains("zellij"));
-        assert!(!other.contains("zellij"));
-    }
-
-    #[test]
-    fn test_terminal_help_text_lists_close_capable_waveterm_as_managed() {
-        crate::config::Config::reset();
-        crate::config::Config::init();
-        let help = terminal_help_text(false);
-        let managed = help
-            .split("Other (opens window only):")
-            .next()
-            .expect("managed section should exist");
-        let other = help
-            .split("Other (opens window only):")
-            .nth(1)
-            .expect("other section should exist");
-
-        assert!(managed.contains("waveterm"));
-        assert!(!other.contains("waveterm"));
     }
 
     #[test]

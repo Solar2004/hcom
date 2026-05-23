@@ -96,17 +96,17 @@ impl App {
         self.data = new_data;
 
         // Sync popup enabled state from DB (source of truth after config.toml change)
-        if let Some(popup) = self.ui.relay_popup.as_mut() {
-            if !popup.toggling {
-                popup.enabled = self.data.relay_enabled;
-            }
+        if let Some(popup) = self.ui.relay_popup.as_mut()
+            && !popup.toggling
+        {
+            popup.enabled = self.data.relay_enabled;
         }
 
         // Restore cursor by name
-        if let Some(ref name) = saved_cursor_name {
-            if let Some(pos) = self.data.agents.iter().position(|a| &a.name == name) {
-                self.ui.cursor = pos;
-            }
+        if let Some(ref name) = saved_cursor_name
+            && let Some(pos) = self.data.agents.iter().position(|a| &a.name == name)
+        {
+            self.ui.cursor = pos;
         }
 
         // Clamp cursor

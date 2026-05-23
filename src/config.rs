@@ -360,13 +360,13 @@ impl HcomConfig {
             ("kilo_args", &self.kilo_args),
             ("cline_args", &self.cline_args),
         ] {
-            if !value.is_empty() {
-                if let Err(e) = shell_words::split(value) {
-                    errors.insert(
-                        field.into(),
-                        format!("{field} contains invalid shell quoting: {e}"),
-                    );
-                }
+            if !value.is_empty()
+                && let Err(e) = shell_words::split(value)
+            {
+                errors.insert(
+                    field.into(),
+                    format!("{field} contains invalid shell quoting: {e}"),
+                );
             }
         }
 
@@ -529,16 +529,16 @@ impl HcomConfig {
                 .map(|&(_, e)| e);
 
             // Relay fields are file-only (no env override)
-            if let Some(env_key) = env_key {
-                if !is_relay_field(field) {
-                    let env_val = if let Some(overrides) = env_override {
-                        overrides.get(env_key).cloned()
-                    } else {
-                        std::env::var(env_key).ok()
-                    };
-                    if let Some(val) = env_val {
-                        return Some(TomlFieldValue::Str(val));
-                    }
+            if let Some(env_key) = env_key
+                && !is_relay_field(field)
+            {
+                let env_val = if let Some(overrides) = env_override {
+                    overrides.get(env_key).cloned()
+                } else {
+                    std::env::var(env_key).ok()
+                };
+                if let Some(val) = env_val {
+                    return Some(TomlFieldValue::Str(val));
                 }
             }
 
@@ -651,10 +651,10 @@ impl HcomConfig {
         let env_to_field: HashMap<&str, &str> = FIELD_TO_ENV.iter().map(|&(f, e)| (e, f)).collect();
 
         for (env_key, value) in data {
-            if let Some(&field) = env_to_field.get(env_key.as_str()) {
-                if let Err(e) = config.set_field(field, value) {
-                    errors.insert(field.to_string(), e);
-                }
+            if let Some(&field) = env_to_field.get(env_key.as_str())
+                && let Err(e) = config.set_field(field, value)
+            {
+                errors.insert(field.to_string(), e);
             }
         }
 
@@ -751,22 +751,21 @@ pub fn load_toml_config(path: &std::path::Path) -> HashMap<String, TomlFieldValu
     }
 
     // Terminal dangerous-char validation
-    if let Some(TomlFieldValue::Str(terminal_val)) = result.get("terminal") {
-        if terminal_val
+    if let Some(TomlFieldValue::Str(terminal_val)) = result.get("terminal")
+        && terminal_val
             .chars()
             .any(|c| TERMINAL_DANGEROUS_CHARS.contains(&c))
-        {
-            let bad_chars: Vec<String> = TERMINAL_DANGEROUS_CHARS
-                .iter()
-                .filter(|&&c| terminal_val.contains(c))
-                .map(|c| format!("{c:?}"))
-                .collect();
-            eprintln!(
-                "Warning: Unsafe characters in terminal.active ({}), ignoring custom terminal command",
-                bad_chars.join(", ")
-            );
-            result.remove("terminal");
-        }
+    {
+        let bad_chars: Vec<String> = TERMINAL_DANGEROUS_CHARS
+            .iter()
+            .filter(|&&c| terminal_val.contains(c))
+            .map(|c| format!("{c:?}"))
+            .collect();
+        eprintln!(
+            "Warning: Unsafe characters in terminal.active ({}), ignoring custom terminal command",
+            bad_chars.join(", ")
+        );
+        result.remove("terminal");
     }
 
     result
@@ -816,14 +815,13 @@ pub fn save_toml_config(config: &HcomConfig, presets: Option<&toml::Value>) -> s
                 toml::to_string_pretty(&toml::Value::Table(presets_table.clone()))
                     .unwrap_or_default()
             );
-            if let Ok(wrapper_doc) = wrapper_str.parse::<DocumentMut>() {
-                if let Some(item) = wrapper_doc
+            if let Ok(wrapper_doc) = wrapper_str.parse::<DocumentMut>()
+                && let Some(item) = wrapper_doc
                     .as_item()
                     .as_table()
                     .and_then(|t| t.get("presets"))
-                {
-                    terminal.insert("presets", item.clone());
-                }
+            {
+                terminal.insert("presets", item.clone());
             }
         }
     }
@@ -968,10 +966,10 @@ fn normalize_terminal_case(name: &str) -> String {
 /// Check if a terminal name matches a user-defined preset in config.toml.
 pub fn is_user_defined_preset(name: &str) -> bool {
     let toml_path = paths::config_toml_path();
-    if let Some(presets_val) = load_toml_presets(&toml_path) {
-        if let Some(table) = presets_val.as_table() {
-            return table.keys().any(|k| k.eq_ignore_ascii_case(name));
-        }
+    if let Some(presets_val) = load_toml_presets(&toml_path)
+        && let Some(table) = presets_val.as_table()
+    {
+        return table.keys().any(|k| k.eq_ignore_ascii_case(name));
     }
     false
 }

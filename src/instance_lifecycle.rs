@@ -1,6 +1,5 @@
-//! Instance lifecycle state machine, launch failure handling, and notification helpers.
+//! Instance lifecycle state machine and launch failure handling.
 
-use anyhow::Result;
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -89,34 +88,30 @@ pub fn is_in_wake_grace_with_persistence(db: Option<&crate::db::HcomDb>) -> bool
         Err(_) => return false,
     };
 
-    if state.last_mono.is_none() {
-        if let Some(db) = db {
-            if let Ok(Some(persisted_wall)) = db.kv_get("_wake_last_wall") {
-                if let Ok(last_wall) = persisted_wall.parse::<f64>() {
-                    let wall_elapsed = now_wall - last_wall;
-                    if wall_elapsed > 30.0 && wall_elapsed < 3600.0 {
-                        crate::log::log_info(
-                            "cleanup",
-                            "sleep_wake_detected",
-                            &format!(
-                                "drift={:.0}s (cross-process), grace={:.0}s",
-                                wall_elapsed, WAKE_GRACE_PERIOD
-                            ),
-                        );
-                        state.grace_until_mono =
-                            Some(now_mono + std::time::Duration::from_secs_f64(WAKE_GRACE_PERIOD));
-                    }
-                    if let Ok(Some(grace_until)) = db.kv_get("_wake_grace_until") {
-                        if let Ok(grace_wall) = grace_until.parse::<f64>() {
-                            if now_wall < grace_wall {
-                                let remaining = grace_wall - now_wall;
-                                state.grace_until_mono =
-                                    Some(now_mono + std::time::Duration::from_secs_f64(remaining));
-                            }
-                        }
-                    }
-                }
-            }
+    if state.last_mono.is_none()
+        && let Some(db) = db
+        && let Ok(Some(persisted_wall)) = db.kv_get("_wake_last_wall")
+        && let Ok(last_wall) = persisted_wall.parse::<f64>()
+    {
+        let wall_elapsed = now_wall - last_wall;
+        if wall_elapsed > 30.0 && wall_elapsed < 3600.0 {
+            crate::log::log_info(
+                "cleanup",
+                "sleep_wake_detected",
+                &format!(
+                    "drift={:.0}s (cross-process), grace={:.0}s",
+                    wall_elapsed, WAKE_GRACE_PERIOD
+                ),
+            );
+            state.grace_until_mono =
+                Some(now_mono + std::time::Duration::from_secs_f64(WAKE_GRACE_PERIOD));
+        }
+        if let Ok(Some(grace_until)) = db.kv_get("_wake_grace_until")
+            && let Ok(grace_wall) = grace_until.parse::<f64>()
+            && now_wall < grace_wall
+        {
+            let remaining = grace_wall - now_wall;
+            state.grace_until_mono = Some(now_mono + std::time::Duration::from_secs_f64(remaining));
         }
     }
 
@@ -515,7 +510,7 @@ pub fn set_status(
     crate::instances::update_instance_position(db, instance_name, &updates);
 
     if status_changed {
-        let _ = notify_instance_with_db(db, instance_name);
+        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
 
     if is_new {
@@ -541,12 +536,11 @@ pub fn set_status(
             crate::log::log_error("core", "db.error", &format!("ready event: {e}"));
         }
 
-        if launcher != "unknown" {
-            if let Some(ref bid) = batch_id {
-                if let Err(e) = db.check_batch_completion(&launcher, bid) {
-                    crate::log::log_error("core", "db.error", &format!("batch notification: {e}"));
-                }
-            }
+        if launcher != "unknown"
+            && let Some(ref bid) = batch_id
+            && let Err(e) = db.check_batch_completion(&launcher, bid)
+        {
+            crate::log::log_error("core", "db.error", &format!("batch notification: {e}"));
         }
     }
 
@@ -565,85 +559,6 @@ pub fn set_status(
     let _ = db.log_event("status", instance_name, &data);
 }
 
-/// Wake an instance by connecting to its registered notify endpoints.
-pub fn notify_instance_endpoints(db: &HcomDb, instance_name: &str, kinds: &[&str]) {
-    use std::net::TcpStream;
-
-    let ports: Vec<i64> = if kinds.is_empty() {
-        db.conn()
-            .prepare("SELECT port FROM notify_endpoints WHERE instance = ?")
-            .and_then(|mut stmt| {
-                stmt.query_map(rusqlite::params![instance_name], |row| row.get::<_, i64>(0))
-                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default()
-    } else {
-        let placeholders: String = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT port FROM notify_endpoints WHERE instance = ? AND kind IN ({placeholders})",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(instance_name.to_string())];
-        for kind in kinds {
-            params.push(Box::new(kind.to_string()));
-        }
-        db.conn()
-            .prepare(&sql)
-            .and_then(|mut stmt| {
-                stmt.query_map(
-                    rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
-                    |row| row.get::<_, i64>(0),
-                )
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            })
-            .unwrap_or_default()
-    };
-
-    for port in ports {
-        if port > 0 && port <= 65535 {
-            let addr = format!("127.0.0.1:{port}");
-            if let Ok(addr) = addr.parse() {
-                let _ = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100));
-            }
-        }
-    }
-}
-
-pub fn notify_instance_with_db(db: &HcomDb, instance_name: &str) -> Result<()> {
-    notify_instance_endpoints(db, instance_name, &["pty", "listen", "listen_filter"]);
-    Ok(())
-}
-
-/// Notify all instances via their TCP notify ports to wake delivery loops.
-pub fn notify_all_instances(db: &HcomDb) {
-    use std::net::TcpStream;
-
-    let Ok(mut stmt) = db
-        .conn()
-        .prepare("SELECT DISTINCT port FROM notify_endpoints WHERE port > 0")
-    else {
-        return;
-    };
-
-    let ports: Vec<i64> = stmt
-        .query_map([], |row| row.get(0))
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for port in ports {
-        if port > 0 && port <= 65535 {
-            let addr = format!("127.0.0.1:{port}");
-            let _ = TcpStream::connect_timeout(
-                &addr.parse().unwrap(),
-                std::time::Duration::from_millis(50),
-            );
-        }
-    }
-}
-
 /// Delete placeholder instances that have been launching too long.
 pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     let mut deleted = 0;
@@ -656,7 +571,12 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
             }
             let created_at = data.created_at;
             if created_at > 0.0 && (now - created_at) > CLEANUP_PLACEHOLDER_THRESHOLD as f64 {
-                crate::hooks::common::stop_instance(db, &data.name, "system", "stale_cleanup");
+                crate::hooks::common::stop_placeholder_instance(
+                    db,
+                    &data.name,
+                    "system",
+                    "stale_cleanup",
+                );
                 deleted += 1;
             }
         }
@@ -855,7 +775,6 @@ pub fn mark_dead_instances(db: &HcomDb) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
     use std::path::PathBuf;
 
     fn setup_test_db() -> (HcomDb, PathBuf) {
@@ -870,83 +789,6 @@ mod tests {
             test_id
         ));
 
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             PRAGMA journal_mode=WAL;
-
-             CREATE TABLE events (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 timestamp TEXT NOT NULL,
-                 type TEXT NOT NULL,
-                 instance TEXT,
-                 data TEXT NOT NULL
-             );
-
-             CREATE TABLE instances (
-                 name TEXT PRIMARY KEY,
-                 session_id TEXT UNIQUE,
-                 parent_session_id TEXT,
-                 parent_name TEXT,
-                  tag TEXT,
-                  project TEXT DEFAULT '',
-                  last_event_id INTEGER DEFAULT 0,
-                 status TEXT DEFAULT 'active',
-                 status_time INTEGER DEFAULT 0,
-                 status_context TEXT DEFAULT '',
-                 status_detail TEXT DEFAULT '',
-                 last_stop INTEGER DEFAULT 0,
-                 directory TEXT,
-                 created_at REAL NOT NULL DEFAULT 0,
-                 transcript_path TEXT DEFAULT '',
-                 tcp_mode INTEGER DEFAULT 0,
-                 wait_timeout INTEGER DEFAULT 86400,
-                 background INTEGER DEFAULT 0,
-                 background_log_file TEXT DEFAULT '',
-                 name_announced INTEGER DEFAULT 0,
-                 agent_id TEXT UNIQUE,
-                 running_tasks TEXT DEFAULT '',
-                 origin_device_id TEXT DEFAULT '',
-                 hints TEXT DEFAULT '',
-                 subagent_timeout INTEGER,
-                 tool TEXT DEFAULT 'claude',
-                 launch_args TEXT DEFAULT '',
-                 terminal_preset_requested TEXT DEFAULT '',
-                 terminal_preset_effective TEXT DEFAULT '',
-                 idle_since TEXT DEFAULT '',
-                 pid INTEGER DEFAULT NULL,
-                 launch_context TEXT DEFAULT '',
-                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
-             );
-
-             CREATE TABLE process_bindings (
-                 process_id TEXT PRIMARY KEY,
-                 session_id TEXT,
-                 instance_name TEXT,
-                 updated_at REAL NOT NULL
-             );
-
-             CREATE TABLE session_bindings (
-                 session_id TEXT PRIMARY KEY,
-                 instance_name TEXT NOT NULL,
-                 created_at REAL NOT NULL,
-                 FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE CASCADE
-             );
-
-             CREATE TABLE notify_endpoints (
-                 instance TEXT NOT NULL,
-                 kind TEXT NOT NULL,
-                 port INTEGER NOT NULL,
-                 updated_at REAL NOT NULL,
-                 PRIMARY KEY (instance, kind)
-             );
-
-             CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let db = HcomDb::open_raw(&db_path).unwrap();
         (db, db_path)
     }
 
@@ -1237,6 +1079,18 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         let deleted = cleanup_stale_placeholders(&db);
         assert_eq!(deleted, 1);
         assert!(db.get_instance_full("stale").unwrap().is_none());
+        let placeholder: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COALESCE(json_extract(data, '$.placeholder'), 0)
+                 FROM events
+                 WHERE type = 'life' AND instance = 'stale'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(placeholder, 1);
 
         cleanup(path);
     }

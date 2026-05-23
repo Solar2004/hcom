@@ -508,22 +508,22 @@ fn kill_orphan_debug_daemons() {
 
 fn kill_daemon(hcom_dir: &str) {
     let pid_path = Path::new(hcom_dir).join(".tmp").join("relay.pid");
-    if let Ok(content) = fs::read_to_string(&pid_path) {
-        if let Ok(pid) = content.trim().parse::<i32>() {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+    if let Ok(content) = fs::read_to_string(&pid_path)
+        && let Ok(pid) = content.trim().parse::<i32>()
+    {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        // Wait up to 3s
+        for _ in 0..30 {
+            thread::sleep(Duration::from_millis(100));
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
             }
-            // Wait up to 3s
-            for _ in 0..30 {
-                thread::sleep(Duration::from_millis(100));
-                if unsafe { libc::kill(pid, 0) } != 0 {
-                    return;
-                }
-            }
-            // Still alive — SIGKILL
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
+        }
+        // Still alive — SIGKILL
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
         }
     }
 }
@@ -707,15 +707,15 @@ fn test_relay_roundtrip() {
                 if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
                     let mut data = ev["data"].clone();
                     // data may be string-encoded JSON
-                    if let Some(s) = data.as_str() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                            data = parsed;
-                        }
+                    if let Some(s) = data.as_str()
+                        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        data = parsed;
                     }
-                    if let Some(text) = data["text"].as_str() {
-                        if text.contains(&marker) {
-                            return Some((ev, data));
-                        }
+                    if let Some(text) = data["text"].as_str()
+                        && text.contains(&marker)
+                    {
+                        return Some((ev, data));
                     }
                 }
             }
@@ -843,10 +843,10 @@ fn test_relay_roundtrip() {
             for line in stdout.lines() {
                 if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line.trim()) {
                     let mut data = ev["data"].clone();
-                    if let Some(s) = data.as_str() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                            data = parsed;
-                        }
+                    if let Some(s) = data.as_str()
+                        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        data = parsed;
                     }
                     if data["text"]
                         .as_str()

@@ -405,17 +405,17 @@ fn build_early_launch_context() -> String {
 
     let mut ctx = Map::new();
 
-    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID") {
-        if !pid.is_empty() {
-            ctx.insert("process_id".into(), Value::String(pid));
-        }
+    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID")
+        && !pid.is_empty()
+    {
+        ctx.insert("process_id".into(), Value::String(pid));
     }
 
     // Kitty socket path for close-on-kill (needed when launching from outside kitty)
-    if let Ok(listen) = std::env::var("KITTY_LISTEN_ON") {
-        if !listen.is_empty() {
-            ctx.insert("kitty_listen_on".into(), Value::String(listen));
-        }
+    if let Ok(listen) = std::env::var("KITTY_LISTEN_ON")
+        && !listen.is_empty()
+    {
+        ctx.insert("kitty_listen_on".into(), Value::String(listen));
     }
 
     // Capture pane_id from terminal env vars for same-window launches.
@@ -426,11 +426,11 @@ fn build_early_launch_context() -> String {
         "ZELLIJ_PANE_ID",
     ];
     for &var in pane_id_vars {
-        if let Ok(val) = std::env::var(var) {
-            if !val.is_empty() {
-                ctx.insert("pane_id".into(), Value::String(val));
-                break;
-            }
+        if let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            ctx.insert("pane_id".into(), Value::String(val));
+            break;
         }
     }
 
@@ -562,7 +562,13 @@ impl Proxy {
                         return Err(io::Error::last_os_error());
                     }
                     // Set controlling terminal
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) == -1 {
+                    #[cfg(target_os = "linux")]
+                    let tiocsctty = libc::TIOCSCTTY;
+                    #[cfg(target_os = "android")]
+                    let tiocsctty = libc::TIOCSCTTY as libc::c_int;
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let tiocsctty = libc::TIOCSCTTY as libc::c_ulong;
+                    if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
                     // Redirect stdio to slave
@@ -590,14 +596,14 @@ impl Proxy {
         };
 
         // Write PID and launch context to database for hcom kill
-        if let Some(ref instance_name) = config.instance_name {
-            if let Ok(db) = crate::db::HcomDb::open() {
-                let _ = db.update_instance_pid(instance_name, child.id());
+        if let Some(ref instance_name) = config.instance_name
+            && let Ok(db) = crate::db::HcomDb::open()
+        {
+            let _ = db.update_instance_pid(instance_name, child.id());
 
-                // Capture minimal launch context early so kill can close the terminal pane.
-                // The start hook may later overwrite with richer context (git_branch, tty, env).
-                let _ = db.store_launch_context(instance_name, &build_early_launch_context());
-            }
+            // Capture minimal launch context early so kill can close the terminal pane.
+            // The start hook may later overwrite with richer context (git_branch, tty, env).
+            let _ = db.store_launch_context(instance_name, &build_early_launch_context());
         }
 
         // Close slave in parent
@@ -958,64 +964,61 @@ impl Proxy {
             }
 
             // Handle stdin (only if we're still polling it)
-            if poll_stdin {
-                if let Some(revents) = poll_fds[1].revents() {
-                    if revents.contains(PollFlags::POLLNVAL) {
-                        // Some headless launch paths can inherit a stdin fd that poll()
-                        // reports as invalid instead of readable EOF. Drop it from the
-                        // poll set to avoid an immediate-return busy loop.
-                        poll_stdin = false;
-                    } else if revents.contains(PollFlags::POLLHUP) {
-                        // Terminal disconnected - exit cleanly
-                        if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
-                        // Non-TTY stdin (e.g. /dev/null or a closed pipe) is not a
-                        // terminal-disconnect signal for headless PTY launches.
-                        poll_stdin = false;
-                    } else if revents.contains(PollFlags::POLLIN) {
-                        match nix_read(&stdin_fd, &mut buf) {
-                            Ok(0) => {
-                                // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
-                                // When running headless, stdin may be /dev/null or a pipe,
-                                // which is always at EOF but does not mean the terminal is gone.
-                                if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
-                                    .unwrap_or(false)
-                                {
-                                    break;
-                                }
-                                // Not a TTY — stop polling stdin to avoid busy-waiting on permanent EOF
-                                poll_stdin = false;
+            if poll_stdin && let Some(revents) = poll_fds[1].revents() {
+                if revents.contains(PollFlags::POLLNVAL) {
+                    // Some headless launch paths can inherit a stdin fd that poll()
+                    // reports as invalid instead of readable EOF. Drop it from the
+                    // poll set to avoid an immediate-return busy loop.
+                    poll_stdin = false;
+                } else if revents.contains(PollFlags::POLLHUP) {
+                    // Terminal disconnected - exit cleanly
+                    if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    // Non-TTY stdin (e.g. /dev/null or a closed pipe) is not a
+                    // terminal-disconnect signal for headless PTY launches.
+                    poll_stdin = false;
+                } else if revents.contains(PollFlags::POLLIN) {
+                    match nix_read(&stdin_fd, &mut buf) {
+                        Ok(0) => {
+                            // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
+                            // When running headless, stdin may be /dev/null or a pipe,
+                            // which is always at EOF but does not mean the terminal is gone.
+                            if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
+                                .unwrap_or(false)
+                            {
+                                break;
                             }
-                            Ok(n) => {
-                                self.last_user_input = Instant::now();
-                                self.screen.clear_approval();
-                                // Update delivery state for user activity
-                                if let Ok(mut state) = self.delivery_state.write() {
-                                    state.last_user_input = Instant::now();
-                                    state.approval = false;
-                                }
-                                write_all(&self.pty_master, &buf[..n])?;
-                            }
-                            Err(Errno::EAGAIN) => {}
-                            Err(e) => bail!("read from stdin failed: {}", e),
+                            // Not a TTY — stop polling stdin to avoid busy-waiting on permanent EOF
+                            poll_stdin = false;
                         }
+                        Ok(n) => {
+                            self.last_user_input = Instant::now();
+                            self.screen.clear_approval();
+                            // Update delivery state for user activity
+                            if let Ok(mut state) = self.delivery_state.write() {
+                                state.last_user_input = Instant::now();
+                                state.approval = false;
+                            }
+                            write_all(&self.pty_master, &buf[..n])?;
+                        }
+                        Err(Errno::EAGAIN) => {}
+                        Err(e) => bail!("read from stdin failed: {}", e),
                     }
                 }
             }
 
             // Handle inject server accept
-            if let Some(idx) = inject_listener_idx {
-                if let Some(revents) = poll_fds[idx].revents() {
-                    if revents.contains(PollFlags::POLLIN) {
-                        // If accept() returns WouldBlock (false), skip the listener next
-                        // iteration to break the macOS spurious-POLLIN busy-loop.
-                        if !self.inject_server.accept()? {
-                            listener_backoff = true;
-                        }
-                    }
+            if let Some(idx) = inject_listener_idx
+                && let Some(revents) = poll_fds[idx].revents()
+                && revents.contains(PollFlags::POLLIN)
+            {
+                // If accept() returns WouldBlock (false), skip the listener next
+                // iteration to break the macOS spurious-POLLIN busy-loop.
+                if !self.inject_server.accept()? {
+                    listener_backoff = true;
                 }
             }
 
@@ -1027,26 +1030,25 @@ impl Proxy {
                 .map_or_else(|| poll_fds.len() - client_raw_fds.len(), |idx| idx + 1);
             for i in (0..client_raw_fds.len()).rev() {
                 let poll_idx = clients_base + i;
-                if let Some(revents) = poll_fds[poll_idx].revents() {
-                    if revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP) {
-                        match self.inject_server.read_client(i)? {
-                            inject::InjectResult::Inject(text) => {
-                                write_all(&self.pty_master, text.as_bytes())?;
-                            }
-                            inject::InjectResult::Query(client) => match client.command {
-                                inject::QueryCommand::Screen => {
-                                    let dump = self.screen.get_screen_dump(
-                                        &self.config.tool,
-                                        self.inject_server.port(),
-                                    );
-                                    client.respond(&dump);
-                                }
-                                inject::QueryCommand::Unknown => {
-                                    client.respond("error: unknown command\n");
-                                }
-                            },
-                            inject::InjectResult::Pending => {}
+                if let Some(revents) = poll_fds[poll_idx].revents()
+                    && (revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP))
+                {
+                    match self.inject_server.read_client(i)? {
+                        inject::InjectResult::Inject(text) => {
+                            write_all(&self.pty_master, text.as_bytes())?;
                         }
+                        inject::InjectResult::Query(client) => match client.command {
+                            inject::QueryCommand::Screen => {
+                                let dump = self
+                                    .screen
+                                    .get_screen_dump(&self.config.tool, self.inject_server.port());
+                                client.respond(&dump);
+                            }
+                            inject::QueryCommand::Unknown => {
+                                client.respond("error: unknown command\n");
+                            }
+                        },
+                        inject::InjectResult::Pending => {}
                     }
                 }
             }
@@ -1146,26 +1148,28 @@ impl Proxy {
 
         let launcher = std::env::var("HCOM_LAUNCHED_BY").ok();
         let batch_id = std::env::var("HCOM_LAUNCH_BATCH_ID").ok();
-        if let (Some(launcher), Some(batch_id)) = (launcher, batch_id) {
-            if !launcher.is_empty() && launcher != "unknown" && !batch_id.is_empty() {
-                let _ = db.notify_batch_failure(&launcher, &batch_id, instance_name, &detail);
-            }
+        if let (Some(launcher), Some(batch_id)) = (launcher, batch_id)
+            && !launcher.is_empty()
+            && launcher != "unknown"
+            && !batch_id.is_empty()
+        {
+            let _ = db.notify_batch_failure(&launcher, &batch_id, instance_name, &detail);
         }
 
-        if let Ok(process_id) = std::env::var("HCOM_PROCESS_ID") {
-            if !process_id.is_empty() {
-                let _ = db.delete_process_binding(&process_id);
-            }
+        if let Ok(process_id) = std::env::var("HCOM_PROCESS_ID")
+            && !process_id.is_empty()
+        {
+            let _ = db.delete_process_binding(&process_id);
         }
     }
 
     fn forward_winsize(&mut self) -> Result<()> {
         // Fix #3: Debounce resize signals by 50ms to avoid races during rapid resize
         const RESIZE_DEBOUNCE_MS: u64 = 50;
-        if let Some(last) = self.last_resize {
-            if last.elapsed().as_millis() < RESIZE_DEBOUNCE_MS as u128 {
-                return Ok(()); // Skip if too recent
-            }
+        if let Some(last) = self.last_resize
+            && last.elapsed().as_millis() < RESIZE_DEBOUNCE_MS as u128
+        {
+            return Ok(()); // Skip if too recent
         }
         self.last_resize = Some(Instant::now());
 
@@ -1312,7 +1316,7 @@ impl Proxy {
             let watcher_running = self.running.clone();
             let watcher_name = instance_name.clone();
             std::thread::spawn(move || {
-                crate::transcript::run_transcript_watcher(
+                crate::hooks::codex_file_edits::run_transcript_watcher(
                     watcher_running,
                     watcher_name,
                     Duration::from_secs(5),
@@ -1577,19 +1581,11 @@ mod tests {
             std::process::id(),
             test_id
         ));
-        let conn = Connection::open(&db_path).unwrap();
 
         if with_notify_endpoints {
-            conn.execute_batch(
-                "CREATE TABLE notify_endpoints (
-                    instance TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    port INTEGER NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (instance, kind)
-                );",
-            )
-            .unwrap();
+            crate::db::HcomDb::open_at(&db_path).unwrap();
+        } else {
+            let _ = Connection::open(&db_path).unwrap();
         }
 
         db_path

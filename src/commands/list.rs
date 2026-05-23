@@ -8,11 +8,12 @@ use std::collections::HashMap;
 
 use crate::db::{HcomDb, InstanceRow};
 use crate::identity;
+use crate::identity::{get_full_name, resolve_display_name};
 use crate::instance_lifecycle::{
     RECENTLY_STOPPED_WINDOW, cleanup_stale_instances, cleanup_stale_placeholders, format_age,
     get_instance_status,
 };
-use crate::instances::{get_full_name, is_remote_instance, resolve_display_name};
+use crate::instances::is_remote_instance;
 use crate::shared::{CommandContext, SENDER, ST_LISTENING, shorten_path_max, status_icon};
 
 /// Parsed arguments for `hcom list`.
@@ -141,15 +142,16 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "session_id": sender_identity.as_ref().and_then(|id| id.session_id.as_deref()).unwrap_or(""),
             });
 
-            if !name.is_empty() && name != SENDER {
-                if let Ok(Some(data)) = db.get_instance_full(name) {
-                    payload["status"] = serde_json::json!(data.status);
-                    payload["transcript_path"] = serde_json::json!(data.transcript_path);
-                    payload["directory"] = serde_json::json!(data.directory);
-                    payload["parent_name"] = serde_json::json!(data.parent_name);
-                    payload["agent_id"] = serde_json::json!(data.agent_id);
-                    payload["tool"] = serde_json::json!(data.tool);
-                }
+            if !name.is_empty()
+                && name != SENDER
+                && let Ok(Some(data)) = db.get_instance_full(name)
+            {
+                payload["status"] = serde_json::json!(data.status);
+                payload["transcript_path"] = serde_json::json!(data.transcript_path);
+                payload["directory"] = serde_json::json!(data.directory);
+                payload["parent_name"] = serde_json::json!(data.parent_name);
+                payload["agent_id"] = serde_json::json!(data.agent_id);
+                payload["tool"] = serde_json::json!(data.tool);
             }
 
             if let Some(field) = field_name {
@@ -291,28 +293,25 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
         if let Some(ref template) = format_template {
             // Validate template keys against first payload (error on unknown fields)
-            if let Some(first) = result_list.first() {
-                if let Some(obj) = first.as_object() {
-                    // Find all {key} placeholders in template
-                    let mut i = 0;
-                    let bytes = template.as_bytes();
-                    while i < bytes.len() {
-                        if bytes[i] == b'{' {
-                            if let Some(end) = template[i + 1..].find('}') {
-                                let key = &template[i + 1..i + 1 + end];
-                                if !key.is_empty() && !obj.contains_key(key) {
-                                    eprintln!(
-                                        "Error: unknown field '{{{}}}' in --format template",
-                                        key
-                                    );
-                                    return 1;
-                                }
-                                i += end + 2;
-                                continue;
-                            }
+            if let Some(first) = result_list.first()
+                && let Some(obj) = first.as_object()
+            {
+                // Find all {key} placeholders in template
+                let mut i = 0;
+                let bytes = template.as_bytes();
+                while i < bytes.len() {
+                    if bytes[i] == b'{'
+                        && let Some(end) = template[i + 1..].find('}')
+                    {
+                        let key = &template[i + 1..i + 1 + end];
+                        if !key.is_empty() && !obj.contains_key(key) {
+                            eprintln!("Error: unknown field '{{{}}}' in --format template", key);
+                            return 1;
                         }
-                        i += 1;
+                        i += end + 2;
+                        continue;
                     }
+                    i += 1;
                 }
             }
             for payload in &result_list {
@@ -597,21 +596,21 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
     // Hint about archives if no instances
     if sorted_instances.is_empty() {
         let archive_dir = crate::paths::hcom_dir().join("archive");
-        if archive_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&archive_dir) {
-                let archive_count = entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name()
-                            .to_str()
-                            .map(|s| s.starts_with("session-"))
-                            .unwrap_or(false)
-                    })
-                    .count();
-                if archive_count > 0 {
-                    let plural = if archive_count != 1 { "s" } else { "" };
-                    println!("({archive_count} archived session{plural} - run: hcom archive)");
-                }
+        if archive_dir.exists()
+            && let Ok(entries) = std::fs::read_dir(&archive_dir)
+        {
+            let archive_count = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(|s| s.starts_with("session-"))
+                        .unwrap_or(false)
+                })
+                .count();
+            if archive_count > 0 {
+                let plural = if archive_count != 1 { "s" } else { "" };
+                println!("({archive_count} archived session{plural} - run: hcom archive)");
             }
         }
     }
@@ -672,7 +671,7 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if let Some(name) = filter_name {
-        let resolved = crate::instances::resolve_display_name_or_stopped(db, name)
+        let resolved = crate::identity::resolve_display_name_or_stopped(db, name)
             .unwrap_or_else(|| name.to_string());
         sql = "SELECT instance, timestamp, data FROM events
                WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'
@@ -751,23 +750,23 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
         if let Some(tool) = snapshot["tool"].as_str() {
             println!("  Tool:       {tool}");
         }
-        if let Some(tag) = snapshot["tag"].as_str() {
-            if !tag.is_empty() {
-                println!("  Tag:        {tag}");
-            }
+        if let Some(tag) = snapshot["tag"].as_str()
+            && !tag.is_empty()
+        {
+            println!("  Tag:        {tag}");
         }
         if let Some(dir) = snapshot["directory"].as_str() {
             println!("  Directory:  {dir}");
         }
-        if let Some(sid) = snapshot["session_id"].as_str() {
-            if !sid.is_empty() {
-                println!("  Session:    {sid}");
-            }
+        if let Some(sid) = snapshot["session_id"].as_str()
+            && !sid.is_empty()
+        {
+            println!("  Session:    {sid}");
         }
-        if let Some(tp) = snapshot["transcript_path"].as_str() {
-            if !tp.is_empty() {
-                println!("  Transcript: {tp}");
-            }
+        if let Some(tp) = snapshot["transcript_path"].as_str()
+            && !tp.is_empty()
+        {
+            println!("  Transcript: {tp}");
         }
         println!("\n  Resume: hcom r {}", entry.instance);
 

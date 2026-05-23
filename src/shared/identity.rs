@@ -39,10 +39,10 @@ impl SenderIdentity {
     pub fn group_id(&self) -> Option<&str> {
         let data = self.instance_data.as_ref()?;
         // Subagent — use parent_session_id
-        if let Some(parent_sid) = data.get("parent_session_id").and_then(|v| v.as_str()) {
-            if !parent_sid.is_empty() {
-                return Some(parent_sid);
-            }
+        if let Some(parent_sid) = data.get("parent_session_id").and_then(|v| v.as_str())
+            && !parent_sid.is_empty()
+        {
+            return Some(parent_sid);
         }
         // Parent — use own session_id
         data.get("session_id")

@@ -5,6 +5,7 @@ pub mod claude;
 pub mod claude_args;
 pub mod cline;
 pub mod codex;
+pub mod codex_file_edits;
 pub mod common;
 pub mod family;
 pub mod gemini;
@@ -23,6 +24,7 @@ pub mod test_helpers {
     pub struct EnvGuard {
         saved_hcom: Option<String>,
         saved_home: Option<String>,
+        saved_test_codex_cli_version: Option<String>,
     }
 
     impl Default for EnvGuard {
@@ -36,6 +38,7 @@ pub mod test_helpers {
             Self {
                 saved_hcom: std::env::var("HCOM_DIR").ok(),
                 saved_home: std::env::var("HOME").ok(),
+                saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
             }
         }
     }
@@ -50,6 +53,10 @@ pub mod test_helpers {
                 match &self.saved_home {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
+                }
+                match &self.saved_test_codex_cli_version {
+                    Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
+                    None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
                 }
             }
             crate::config::Config::reset();
@@ -68,6 +75,7 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
         }
         crate::config::Config::reset();
         crate::config::Config::init();
@@ -133,10 +141,10 @@ impl HookPayload {
     /// Extract an optional string from the first matching key.
     fn opt_str_field(raw: &Value, keys: &[&str]) -> Option<String> {
         for key in keys {
-            if let Some(s) = raw.get(*key).and_then(|v| v.as_str()) {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
+            if let Some(s) = raw.get(*key).and_then(|v| v.as_str())
+                && !s.is_empty()
+            {
+                return Some(s.to_string());
             }
         }
         None

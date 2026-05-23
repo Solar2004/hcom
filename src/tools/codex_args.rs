@@ -3,7 +3,7 @@
 //!
 //! Key differences from other tool parsers:
 //! - **Case-sensitive flags**: -C (--cd) vs -c (--config) are DIFFERENT flags
-//! - Subcommands: exec, resume, fork, review, mcp, sandbox, etc.
+//! - Launch subcommands: resume, fork
 //! - Repeatable flags: -c, --config, --enable, --disable, -i, --image, --add-dir
 //! - Sandbox flag grouping: if CLI has ANY sandbox flag, strip ALL from env
 
@@ -13,32 +13,43 @@ use std::sync::OnceLock;
 use super::args_common::{
     self, FlagValue, SourceType, deduplicate_boolean_flags, extract_flag_name_from_token,
     extract_flag_names_from_tokens, remove_positional, set_positional, shell_quote, shell_split,
-    toggle_flag,
 };
 
-const SUBCOMMANDS: &[&str] = &[
+const SUBCOMMANDS: &[&str] = &["resume", "fork"];
+
+const UNSUPPORTED_SUBCOMMANDS: &[&str] = &[
     "exec",
     "e",
-    "resume",
-    "fork",
     "review",
     "mcp",
+    "plugin",
     "mcp-server",
     "app-server",
+    "remote-control",
     "login",
     "logout",
     "completion",
+    "update",
+    "doctor",
     "sandbox",
     "debug",
     "apply",
     "app",
     "a",
     "cloud",
+    "exec-server",
     "features",
     "help",
 ];
 
-const EXEC_SUBCOMMANDS: &[&str] = &["exec", "e"];
+fn contextual_value_flag_key(flag: &str, _subcommand: Option<&str>) -> String {
+    let flag_lower = flag.to_lowercase();
+
+    match flag_lower.as_str() {
+        _ if CASE_SENSITIVE_VALUE_FLAGS.contains(&flag) => flag.to_string(),
+        _ => flag_lower,
+    }
+}
 
 /// Case-sensitive flags: -C -> --cd, -c -> --config
 /// These must be matched with original case, NOT lowercased.
@@ -51,16 +62,16 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "--oss",
     "--full-auto",
     "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
     "--search",
     "--no-alt-screen",
     "-h",
     "--help",
     "--version",
-    "--skip-git-repo-check",
-    "--json",
+    "--strict-config",
     "--last",
     "--all",
-    "--uncommitted",
+    "--include-non-interactive",
 ];
 
 const VALUE_FLAGS: &[&str] = &[
@@ -75,19 +86,15 @@ const VALUE_FLAGS: &[&str] = &[
     "--local-provider",
     "-p",
     "--profile",
+    "--profile-v2",
+    "--remote",
+    "--remote-auth-token-env",
     "-s",
     "--sandbox",
     "-a",
     "--ask-for-approval",
     "--cd",
     "--add-dir",
-    "--color",
-    "-o",
-    "--output-last-message",
-    "--output-schema",
-    "--base",
-    "--commit",
-    "--title",
 ];
 
 const CASE_SENSITIVE_VALUE_FLAGS: &[&str] = &["-C", "-c"];
@@ -121,7 +128,6 @@ fn flag_aliases() -> &'static HashMap<&'static str, &'static str> {
         m.insert("-p", "--profile");
         m.insert("-s", "--sandbox");
         m.insert("-a", "--ask-for-approval");
-        m.insert("-o", "--output-last-message");
         m
     })
 }
@@ -227,8 +233,6 @@ pub struct CodexArgsSpec {
     pub flag_values: HashMap<String, FlagValue>,
     pub errors: Vec<String>,
     pub subcommand: Option<String>,
-    pub is_json: bool,
-    pub is_exec: bool,
 }
 
 impl CodexArgsSpec {
@@ -328,7 +332,6 @@ impl CodexArgsSpec {
     /// Return new spec with requested updates applied.
     pub fn update(
         &self,
-        json_output: Option<bool>,
         prompt: Option<&str>,
         subcommand: Option<Option<&str>>,
         developer_instructions: Option<&str>,
@@ -338,10 +341,6 @@ impl CodexArgsSpec {
 
         if let Some(sub_opt) = subcommand {
             new_subcommand = sub_opt.map(|s| s.to_string());
-        }
-
-        if let Some(json) = json_output {
-            tokens = toggle_flag(&tokens, "--json", json);
         }
 
         if let Some(p) = prompt {
@@ -374,10 +373,10 @@ impl CodexArgsSpec {
 
 /// Resolve Codex args from CLI (highest precedence) or env string.
 pub fn resolve_codex_args(cli_args: Option<&[String]>, env_value: Option<&str>) -> CodexArgsSpec {
-    if let Some(args) = cli_args {
-        if !args.is_empty() {
-            return parse_tokens(args, SourceType::Cli);
-        }
+    if let Some(args) = cli_args
+        && !args.is_empty()
+    {
+        return parse_tokens(args, SourceType::Cli);
     }
 
     if let Some(env_str) = env_value {
@@ -443,16 +442,17 @@ pub fn merge_codex_args(env_spec: &CodexArgsSpec, cli_spec: &CodexArgsSpec) -> C
         if env_pos_set.contains(&i) {
             continue;
         }
-        if let Some(flag_name) = extract_flag_name_from_token(token) {
-            if cli_flag_names.contains(&flag_name) && !lookup.repeatable_set.contains(&flag_name) {
-                if !token.contains('=') && i + 1 < env_spec.clean_tokens.len() {
-                    let next = &env_spec.clean_tokens[i + 1];
-                    if !looks_like_flag(&next.to_lowercase()) {
-                        skip_next = true;
-                    }
+        if let Some(flag_name) = extract_flag_name_from_token(token)
+            && cli_flag_names.contains(&flag_name)
+            && !lookup.repeatable_set.contains(&flag_name)
+        {
+            if !token.contains('=') && i + 1 < env_spec.clean_tokens.len() {
+                let next = &env_spec.clean_tokens[i + 1];
+                if !looks_like_flag(&next.to_lowercase()) {
+                    skip_next = true;
                 }
-                continue;
             }
+            continue;
         }
         merged.push(token.clone());
     }
@@ -491,17 +491,17 @@ pub fn merge_codex_args(env_spec: &CodexArgsSpec, cli_spec: &CodexArgsSpec) -> C
 pub fn validate_conflicts(spec: &CodexArgsSpec) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    if spec.is_exec {
+    let first_token = spec.raw_tokens.first().map(|token| token.to_lowercase());
+    if first_token
+        .as_deref()
+        .is_some_and(|token| UNSUPPORTED_SUBCOMMANDS.contains(&token))
+    {
         warnings.push(
-            "ERROR: Codex exec mode not supported in hcom.\n\
-             Use interactive mode (no 'exec' subcommand) for PTY sessions.\n\
+            "ERROR: Codex subcommands are not supported in hcom.\n\
+             Use interactive mode (no subcommand) for PTY sessions.\n\
              For headless: use 'hcom N claude -p \"task\"'"
                 .to_string(),
         );
-    }
-
-    if spec.is_json && !spec.is_exec {
-        warnings.push("--json flag is only valid with 'exec' subcommand".to_string());
     }
 
     if spec.has_flag(&["--full-auto"], &[])
@@ -535,7 +535,6 @@ fn parse_tokens_with_errors(
     let mut flag_values: HashMap<String, FlagValue> = HashMap::new();
 
     let mut subcommand: Option<String> = None;
-    let mut is_json = false;
     let mut pending_flag: Option<String> = None;
     let mut after_double_dash = false;
 
@@ -545,14 +544,7 @@ fn parse_tokens_with_errors(
     if !raw_tokens.is_empty() {
         let first_lower = raw_tokens[0].to_lowercase();
         if SUBCOMMANDS.contains(&first_lower.as_str()) {
-            let normalized = if first_lower == "e" {
-                "exec"
-            } else if first_lower == "a" {
-                "apply"
-            } else {
-                &first_lower
-            };
-            subcommand = Some(normalized.to_string());
+            subcommand = Some(first_lower);
             i = 1;
         }
     }
@@ -571,7 +563,7 @@ fn parse_tokens_with_errors(
 
             // Determine flag key: case-sensitive or lowercase
             let is_cs = CASE_SENSITIVE_VALUE_FLAGS.contains(&pf.as_str());
-            let flag_key = if is_cs { pf.clone() } else { pf.to_lowercase() };
+            let flag_key = contextual_value_flag_key(pf, subcommand.as_deref());
             let is_repeatable = if is_cs {
                 // -c is repeatable (lowercase), -C is not
                 *pf == pf.to_lowercase() && lookup.repeatable_set.contains(&pf.to_lowercase())
@@ -616,6 +608,15 @@ fn parse_tokens_with_errors(
             continue;
         }
 
+        if subcommand.is_none()
+            && positional.is_empty()
+            && SUBCOMMANDS.contains(&token_lower.as_str())
+        {
+            subcommand = Some(token_lower);
+            i += 1;
+            continue;
+        }
+
         // Case-sensitive boolean flags (-V)
         if CASE_SENSITIVE_BOOLEAN_FLAGS.contains(&token.as_str()) {
             clean.push(token.clone());
@@ -626,9 +627,6 @@ fn parse_tokens_with_errors(
         // Boolean flags (lowercase matching)
         if lookup.bool_set.contains(&token_lower) {
             clean.push(token.clone());
-            if token_lower == "--json" {
-                is_json = true;
-            }
             i += 1;
             continue;
         }
@@ -652,7 +650,8 @@ fn parse_tokens_with_errors(
 
         if let Some(prefix) = matched_prefix {
             clean.push(token.clone());
-            let flag_key = prefix.trim_end_matches('=').to_string();
+            let flag_key =
+                contextual_value_flag_key(prefix.trim_end_matches('='), subcommand.as_deref());
             let value = token[prefix.len()..].to_string();
             if lookup.repeatable_set.contains(&flag_key) {
                 match flag_values.entry(flag_key) {
@@ -721,10 +720,6 @@ fn parse_tokens_with_errors(
         errors.push(format!("{} requires a value at end of arguments", pf));
     }
 
-    let is_exec = subcommand
-        .as_deref()
-        .is_some_and(|s| EXEC_SUBCOMMANDS.contains(&s));
-
     CodexArgsSpec {
         source,
         raw_tokens,
@@ -734,8 +729,6 @@ fn parse_tokens_with_errors(
         flag_values,
         errors,
         subcommand,
-        is_json,
-        is_exec,
     }
 }
 
@@ -751,8 +744,6 @@ mod tests {
     fn test_parse_empty() {
         let spec = resolve_codex_args(Some(&[]), None);
         assert!(spec.clean_tokens.is_empty());
-        assert!(!spec.is_json);
-        assert!(!spec.is_exec);
         assert!(spec.subcommand.is_none());
     }
 
@@ -777,22 +768,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_exec_subcommand() {
-        let args = sv(&["exec", "do something"]);
-        let spec = parse_tokens(&args, SourceType::Cli);
-        assert!(spec.is_exec);
-        assert_eq!(spec.subcommand, Some("exec".to_string()));
-    }
-
-    #[test]
-    fn test_parse_exec_alias() {
-        let args = sv(&["e", "do something"]);
-        let spec = parse_tokens(&args, SourceType::Cli);
-        assert!(spec.is_exec);
-        assert_eq!(spec.subcommand, Some("exec".to_string()));
-    }
-
-    #[test]
     fn test_parse_resume_subcommand() {
         let args = sv(&["resume", "thread-123"]);
         let spec = parse_tokens(&args, SourceType::Cli);
@@ -801,10 +776,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_json_flag() {
-        let args = sv(&["--json"]);
+    fn test_parse_new_current_root_flags_before_subcommand_not_positionals() {
+        let args = sv(&[
+            "--remote",
+            "ws://127.0.0.1:8080",
+            "--remote-auth-token-env",
+            "CODEX_TOKEN",
+            "--profile-v2",
+            "work",
+            "resume",
+            "--include-non-interactive",
+            "--last",
+        ]);
         let spec = parse_tokens(&args, SourceType::Cli);
-        assert!(spec.is_json);
+
+        assert_eq!(spec.subcommand, Some("resume".to_string()));
+        assert!(!spec.has_errors(), "{:?}", spec.errors);
+        assert!(spec.positional_tokens.is_empty());
+        assert!(spec.has_flag(&["--include-non-interactive"], &[]));
+        assert_eq!(
+            spec.get_flag_value("--remote"),
+            Some(FlagValue::Single("ws://127.0.0.1:8080".to_string()))
+        );
+        assert_eq!(
+            spec.get_flag_value("--remote-auth-token-env"),
+            Some(FlagValue::Single("CODEX_TOKEN".to_string()))
+        );
+        assert_eq!(
+            spec.get_flag_value("--profile-v2"),
+            Some(FlagValue::Single("work".to_string()))
+        );
     }
 
     #[test]
@@ -845,10 +846,11 @@ mod tests {
 
     #[test]
     fn test_parse_boolean_flags() {
-        let args = sv(&["--full-auto", "--oss"]);
+        let args = sv(&["--full-auto", "--oss", "--dangerously-bypass-hook-trust"]);
         let spec = parse_tokens(&args, SourceType::Cli);
         assert!(spec.has_flag(&["--full-auto"], &[]));
         assert!(spec.has_flag(&["--oss"], &[]));
+        assert!(spec.has_flag(&["--dangerously-bypass-hook-trust"], &[]));
     }
 
     #[test]
@@ -922,7 +924,25 @@ mod tests {
     fn test_validate_exec_error() {
         let spec = parse_tokens(&sv(&["exec", "do something"]), SourceType::Cli);
         let warnings = validate_conflicts(&spec);
-        assert!(warnings.iter().any(|w| w.contains("exec mode")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Codex subcommands are not supported"))
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_unsupported_first_token_aliases_and_commands() {
+        for subcommand in ["e", "review", "mcp", "plugin", "app-server", "a", "help"] {
+            let spec = parse_tokens(&sv(&[subcommand]), SourceType::Cli);
+            let warnings = validate_conflicts(&spec);
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("Codex subcommands are not supported")),
+                "{subcommand:?} should be rejected, got {warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -934,7 +954,7 @@ mod tests {
     #[test]
     fn test_update_developer_instructions() {
         let spec = parse_tokens(&sv(&["--model", "gpt-4"]), SourceType::Cli);
-        let updated = spec.update(None, None, None, Some("use hcom"));
+        let updated = spec.update(None, None, Some("use hcom"));
         // Should have -c developer_instructions=use hcom prepended
         assert!(updated.clean_tokens.contains(&"-c".to_string()));
         assert!(

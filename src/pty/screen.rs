@@ -291,11 +291,11 @@ impl ScreenTracker {
         // Find the column where prompt char is located
         let mut prompt_col: Option<u16> = None;
         for col in 0..cols {
-            if let Some(cell) = screen.cell(row, col) {
-                if cell.contents() == prompt_char {
-                    prompt_col = Some(col);
-                    break;
-                }
+            if let Some(cell) = screen.cell(row, col)
+                && cell.contents() == prompt_char
+            {
+                prompt_col = Some(col);
+                break;
             }
         }
         let prompt_col = prompt_col?;
@@ -483,16 +483,17 @@ impl ScreenTracker {
             // Old format: ╭ corner followed by │ > prompt on next row
             if line.contains('╭') {
                 let next_line = &lines[row_idx + 1];
-                if next_line.contains("│ >") && next_line.contains('│') {
-                    if let Some(start) = next_line.find("│ >") {
-                        let after = &next_line[start + "│ >".len()..];
-                        if let Some(end) = after.find('│') {
-                            let text = after[..end].trim();
-                            if text.is_empty() || self.is_ready() {
-                                return Some(String::new());
-                            }
-                            return Some(text.to_string());
+                if next_line.contains("│ >")
+                    && next_line.contains('│')
+                    && let Some(start) = next_line.find("│ >")
+                {
+                    let after = &next_line[start + "│ >".len()..];
+                    if let Some(end) = after.find('│') {
+                        let text = after[..end].trim();
+                        if text.is_empty() || self.is_ready() {
+                            return Some(String::new());
                         }
+                        return Some(text.to_string());
                     }
                 }
             }

@@ -7,10 +7,8 @@
 use crate::db::HcomDb;
 use crate::hooks::common::stop_instance;
 use crate::identity;
-use crate::instances::{
-    get_full_name, is_remote_instance, is_subagent_instance, parse_running_tasks,
-    resolve_display_name,
-};
+use crate::identity::{get_full_name, resolve_display_name};
+use crate::instances::{is_remote_instance, is_subagent_instance, parse_running_tasks};
 use crate::log::log_info;
 use crate::shared::{CommandContext, SENDER, SenderKind, is_inside_ai_tool};
 
@@ -28,12 +26,11 @@ fn resolve_initiator(
     ctx: Option<&CommandContext>,
     explicit_name: Option<&str>,
 ) -> String {
-    if let Some(c) = ctx {
-        if let Some(ref id) = c.identity {
-            if matches!(id.kind, SenderKind::Instance) {
-                return id.name.clone();
-            }
-        }
+    if let Some(c) = ctx
+        && let Some(ref id) = c.identity
+        && matches!(id.kind, SenderKind::Instance)
+    {
+        return id.name.clone();
     }
     if let Some(name) = explicit_name {
         return name.to_string();

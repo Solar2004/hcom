@@ -83,10 +83,11 @@ impl App {
 
     /// Active search query: overlay live input or persisted filter.
     pub fn active_search_query(&self) -> Option<&str> {
-        if let Some(ref overlay) = self.ui.overlay {
-            if overlay.kind == OverlayKind::Search && !overlay.input.is_empty() {
-                return Some(overlay.input.as_str());
-            }
+        if let Some(ref overlay) = self.ui.overlay
+            && overlay.kind == OverlayKind::Search
+            && !overlay.input.is_empty()
+        {
+            return Some(overlay.input.as_str());
         }
         self.ui.search_filter.as_deref()
     }
@@ -136,10 +137,10 @@ impl App {
             }
             offset += 1;
             if self.ui.remote_expanded {
-                if let Some(idx) = self.ui.cursor.checked_sub(offset) {
-                    if idx < self.data.remote_agents.len() {
-                        return CursorTarget::RemoteAgent(idx);
-                    }
+                if let Some(idx) = self.ui.cursor.checked_sub(offset)
+                    && idx < self.data.remote_agents.len()
+                {
+                    return CursorTarget::RemoteAgent(idx);
                 }
                 offset += self.data.remote_agents.len();
             }
@@ -151,10 +152,10 @@ impl App {
             }
             offset += 1;
             if self.ui.stopped_expanded {
-                if let Some(idx) = self.ui.cursor.checked_sub(offset) {
-                    if idx < self.data.stopped_agents.len() {
-                        return CursorTarget::StoppedAgent(idx);
-                    }
+                if let Some(idx) = self.ui.cursor.checked_sub(offset)
+                    && idx < self.data.stopped_agents.len()
+                {
+                    return CursorTarget::StoppedAgent(idx);
                 }
                 offset += self.data.stopped_agents.len();
             }
@@ -165,12 +166,11 @@ impl App {
                 return CursorTarget::OrphanHeader;
             }
             offset += 1;
-            if self.ui.orphans_expanded {
-                if let Some(idx) = self.ui.cursor.checked_sub(offset) {
-                    if idx < self.data.orphans.len() {
-                        return CursorTarget::Orphan(idx);
-                    }
-                }
+            if self.ui.orphans_expanded
+                && let Some(idx) = self.ui.cursor.checked_sub(offset)
+                && idx < self.data.orphans.len()
+            {
+                return CursorTarget::Orphan(idx);
             }
         }
 

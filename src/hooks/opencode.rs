@@ -37,10 +37,10 @@ fn parse_value_arg(argv: &[String], flags: &[&str]) -> Option<String> {
                 return argv.get(idx + 1).cloned();
             }
             let prefix = format!("{flag}=");
-            if let Some(value) = token.strip_prefix(&prefix) {
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+            if let Some(value) = token.strip_prefix(&prefix)
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
             }
         }
     }
@@ -95,12 +95,13 @@ fn upsert_plugin_notify_endpoint(db: &HcomDb, instance_name: &str, port: u16) {
     }
 }
 
-/// Send TCP wake to ALL of an instance's notify endpoints.
+/// Send TCP wake to ALL of an instance's wake endpoints.
 ///
 /// Used by status handler when instance becomes listening.
-/// Queries all kinds (pty, hook, plugin) and sends a brief TCP connect to each.
+/// Wakes every registered wake kind (pty, hook, plugin, listen variants,
+/// events_wait). The inject endpoint is excluded — it speaks RPC, not wake.
 fn notify_all_endpoints(db: &HcomDb, instance_name: &str) {
-    lifecycle::notify_instance_endpoints(db, instance_name, &[]);
+    crate::notify::wake(db, instance_name, &[]);
 }
 
 /// Get path to OpenCode's SQLite database.
@@ -221,22 +222,23 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     }
 
     // Initialize last_event_id BEFORE set_status() — set_status triggers
-    // notify_instance() which TCP-wakes the plugin's deliverPendingToIdle().
-    // If last_event_id is still 0, ALL historical events get delivered.
-    if let Ok(Some(existing)) = db.get_instance_full(&instance_name) {
-        if existing.last_event_id == 0 {
-            let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")
-                .ok()
-                .and_then(|s| s.parse().ok());
-            let current_max = db.get_last_event_id();
-            let new_id = match launch_event_id {
-                Some(lei) if lei <= current_max => lei,
-                _ => current_max,
-            };
-            let mut id_updates = serde_json::Map::new();
-            id_updates.insert("last_event_id".into(), serde_json::json!(new_id));
-            instances::update_instance_position(db, &instance_name, &id_updates);
-        }
+    // `crate::notify::wake` which TCP-wakes the plugin's
+    // deliverPendingToIdle(). If last_event_id is still 0, ALL historical
+    // events get delivered.
+    if let Ok(Some(existing)) = db.get_instance_full(&instance_name)
+        && existing.last_event_id == 0
+    {
+        let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let current_max = db.get_last_event_id();
+        let new_id = match launch_event_id {
+            Some(lei) if lei <= current_max => lei,
+            _ => current_max,
+        };
+        let mut id_updates = serde_json::Map::new();
+        id_updates.insert("last_event_id".into(), serde_json::json!(new_id));
+        instances::update_instance_position(db, &instance_name, &id_updates);
     }
 
     lifecycle::set_status(

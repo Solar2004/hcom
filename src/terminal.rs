@@ -111,18 +111,17 @@ pub fn detect_terminal_from_env() -> Option<String> {
     }
     // TOML-defined presets with pane_id_env
     let toml_path = crate::paths::config_toml_path();
-    if let Some(presets_val) = crate::config::load_toml_presets(&toml_path) {
-        if let Some(table) = presets_val.as_table() {
-            for (name, val) in table {
-                if let Some(env_var) = val.get("pane_id_env").and_then(|v| v.as_str()) {
-                    if std::env::var(env_var)
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                        .is_some()
-                    {
-                        return Some(name.clone());
-                    }
-                }
+    if let Some(presets_val) = crate::config::load_toml_presets(&toml_path)
+        && let Some(table) = presets_val.as_table()
+    {
+        for (name, val) in table {
+            if let Some(env_var) = val.get("pane_id_env").and_then(|v| v.as_str())
+                && std::env::var(env_var)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .is_some()
+            {
+                return Some(name.clone());
             }
         }
     }
@@ -232,12 +231,12 @@ fn find_kitten_binary() -> Option<String> {
     if let Some(path) = which_bin("kitten") {
         return Some(path);
     }
-    if cfg!(target_os = "macos") {
-        if let Some(app) = find_macos_app("kitty") {
-            let full = app.join("Contents/MacOS/kitten");
-            if full.exists() {
-                return Some(full.to_string_lossy().to_string());
-            }
+    if cfg!(target_os = "macos")
+        && let Some(app) = find_macos_app("kitty")
+    {
+        let full = app.join("Contents/MacOS/kitten");
+        if full.exists() {
+            return Some(full.to_string_lossy().to_string());
         }
     }
     None
@@ -277,10 +276,9 @@ pub fn find_kitty_socket() -> String {
         if let Ok(output) = Command::new(&kitten)
             .args(["@", "--to", &socket_uri, "ls"])
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                return socket_uri;
-            }
+            return socket_uri;
         }
     }
     String::new()
@@ -304,10 +302,10 @@ fn normalize_terminal_mode_for_launch(
     let mut kitty_socket = String::new();
 
     if opens_new_window {
-        if terminal_mode == "default" {
-            if let Some(detected) = detect_terminal_from_env() {
-                terminal_mode = detected;
-            }
+        if terminal_mode == "default"
+            && let Some(detected) = detect_terminal_from_env()
+        {
+            terminal_mode = detected;
         }
         if terminal_mode == "kitty" {
             if std::env::var("KITTY_WINDOW_ID")
@@ -492,20 +490,21 @@ pub fn resolve_terminal_preset(preset_name: &str) -> Option<String> {
     let mut open_cmd = merged.open;
     let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
 
-    if let Some(ref binary) = merged.binary {
-        if which_bin(binary).is_none() && cfg!(target_os = "macos") {
-            // New-window presets have hardcoded fallbacks using `open -a`
-            for &(name, fallback) in MACOS_APP_FALLBACKS {
-                if name == preset_name && find_macos_app(app_name).is_some() {
-                    return Some(rewrite_macos_open_app_command(fallback, app_name));
-                }
+    if let Some(ref binary) = merged.binary
+        && which_bin(binary).is_none()
+        && cfg!(target_os = "macos")
+    {
+        // New-window presets have hardcoded fallbacks using `open -a`
+        for &(name, fallback) in MACOS_APP_FALLBACKS {
+            if name == preset_name && find_macos_app(app_name).is_some() {
+                return Some(rewrite_macos_open_app_command(fallback, app_name));
             }
-            // Tab/split presets: substitute leading binary with full path
-            if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name) {
-                if open_cmd.starts_with(binary.as_str()) {
-                    open_cmd = format!("{}{}", full_path, &open_cmd[binary.len()..]);
-                }
-            }
+        }
+        // Tab/split presets: substitute leading binary with full path
+        if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name)
+            && open_cmd.starts_with(binary.as_str())
+        {
+            open_cmd = format!("{}{}", full_path, &open_cmd[binary.len()..]);
         }
     }
 
@@ -543,19 +542,19 @@ pub fn get_available_presets() -> Vec<(String, bool)> {
 
     // Add TOML-defined presets not already in built-ins
     let toml_path = crate::paths::config_toml_path();
-    if let Some(presets_val) = crate::config::load_toml_presets(&toml_path) {
-        if let Some(table) = presets_val.as_table() {
-            for (name, preset_val) in table {
-                if seen.contains(name) {
-                    continue;
-                }
-                let available = preset_val
-                    .get("binary")
-                    .and_then(|v| v.as_str())
-                    .map(|b| which_bin(b).is_some())
-                    .unwrap_or(true);
-                result.push((name.clone(), available));
+    if let Some(presets_val) = crate::config::load_toml_presets(&toml_path)
+        && let Some(table) = presets_val.as_table()
+    {
+        for (name, preset_val) in table {
+            if seen.contains(name) {
+                continue;
             }
+            let available = preset_val
+                .get("binary")
+                .and_then(|v| v.as_str())
+                .map(|b| which_bin(b).is_some())
+                .unwrap_or(true);
+            result.push((name.clone(), available));
         }
     }
 
@@ -651,12 +650,12 @@ pub fn create_bash_script(
     let mut paths_to_add: Vec<String> = Vec::new();
 
     fn add_path(paths: &mut Vec<String>, binary_path: Option<String>) {
-        if let Some(bp) = binary_path {
-            if let Some(dir) = Path::new(&bp).parent() {
-                let dir_str = dir.to_string_lossy().to_string();
-                if !paths.contains(&dir_str) {
-                    paths.push(dir_str);
-                }
+        if let Some(bp) = binary_path
+            && let Some(dir) = Path::new(&bp).parent()
+        {
+            let dir_str = dir.to_string_lossy().to_string();
+            if !paths.contains(&dir_str) {
+                paths.push(dir_str);
             }
         }
     }
@@ -692,25 +691,23 @@ pub fn create_bash_script(
     // On Termux, npm-installed tools have shebangs like #!/usr/bin/env node which
     // fail (no /usr/bin/env). Detect node shebangs and rewrite to: node /path/to/tool args
     let mut final_command = command_str.to_string();
-    if !tool_cmd.is_empty() {
-        if let Some(tool_path) = which_bin(tool_cmd) {
-            if let Some((launcher, prefix_args)) =
-                resolve_termux_tool_launcher(tool_cmd, &tool_path)
-            {
-                let mut replacement_parts = vec![shell_quote(&launcher)];
-                replacement_parts.extend(prefix_args.iter().map(|arg| shell_quote(arg)));
-                final_command = final_command.replacen(
-                    &format!("{} ", tool_cmd),
-                    &format!("{} ", replacement_parts.join(" ")),
-                    1,
-                );
-            } else {
-                final_command = final_command.replacen(
-                    &format!("{} ", tool_cmd),
-                    &format!("{} ", shell_quote(&tool_path)),
-                    1,
-                );
-            }
+    if !tool_cmd.is_empty()
+        && let Some(tool_path) = which_bin(tool_cmd)
+    {
+        if let Some((launcher, prefix_args)) = resolve_termux_tool_launcher(tool_cmd, &tool_path) {
+            let mut replacement_parts = vec![shell_quote(&launcher)];
+            replacement_parts.extend(prefix_args.iter().map(|arg| shell_quote(arg)));
+            final_command = final_command.replacen(
+                &format!("{} ", tool_cmd),
+                &format!("{} ", replacement_parts.join(" ")),
+                1,
+            );
+        } else {
+            final_command = final_command.replacen(
+                &format!("{} ", tool_cmd),
+                &format!("{} ", shell_quote(&tool_path)),
+                1,
+            );
         }
     }
 
@@ -897,10 +894,10 @@ fn build_warp_launch_yaml(config_name: &str, cwd: &str, script: &str) -> String 
 /// `cd subdir` lands where a non-Warp launch would. HOME is a last resort
 /// if current_dir() fails.
 fn resolve_warp_cwd(cwd: Option<&str>, home: &Path) -> String {
-    if let Some(c) = cwd {
-        if Path::new(c).is_absolute() {
-            return c.to_string();
-        }
+    if let Some(c) = cwd
+        && Path::new(c).is_absolute()
+    {
+        return c.to_string();
     }
     std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -1404,12 +1401,12 @@ pub fn launch_terminal(
             );
         }
         // Target launcher's tab for splits
-        if terminal_mode == "kitty-tab" || terminal_mode == "kitty-split" {
-            if let Ok(wid) = std::env::var("KITTY_WINDOW_ID") {
-                if !wid.is_empty() && cmd.contains(" -- ") {
-                    cmd = cmd.replacen(" -- ", &format!(" --match window_id:{} -- ", wid), 1);
-                }
-            }
+        if (terminal_mode == "kitty-tab" || terminal_mode == "kitty-split")
+            && let Ok(wid) = std::env::var("KITTY_WINDOW_ID")
+            && !wid.is_empty()
+            && cmd.contains(" -- ")
+        {
+            cmd = cmd.replacen(" -- ", &format!(" --match window_id:{} -- ", wid), 1);
         }
         Some(cmd)
     } else {
@@ -1602,20 +1599,20 @@ pub fn close_terminal_pane(
     // Resolve binary path via app bundle fallback
     if let Some(ref binary) = merged.binary {
         let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
-        if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name) {
-            if close_cmd.starts_with(binary.as_str()) {
-                close_cmd = format!("{}{}", full_path, &close_cmd[binary.len()..]);
-            }
+        if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name)
+            && close_cmd.starts_with(binary.as_str())
+        {
+            close_cmd = format!("{}{}", full_path, &close_cmd[binary.len()..]);
         }
     }
-    if close_cmd.starts_with("kitten ") {
-        if let Some(full_path) = find_kitten_binary() {
-            close_cmd = format!(
-                "{}{}",
-                shell_quote(&full_path),
-                &close_cmd["kitten".len()..]
-            );
-        }
+    if close_cmd.starts_with("kitten ")
+        && let Some(full_path) = find_kitten_binary()
+    {
+        close_cmd = format!(
+            "{}{}",
+            shell_quote(&full_path),
+            &close_cmd["kitten".len()..]
+        );
     }
 
     // Inject --to for kitten commands when we have the socket path
@@ -1729,55 +1726,55 @@ pub fn resolve_terminal_info(
         ..TerminalInfo::default()
     };
 
-    if let Some(launch_context_json) = launch_context_json.filter(|s| !s.is_empty()) {
-        if let Ok(lc) = serde_json::from_str::<serde_json::Value>(launch_context_json) {
-            if info.preset_name.is_empty() {
-                info.preset_name = lc
-                    .get("terminal_preset_effective")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        lc.get("terminal_preset")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                    })
-                    .unwrap_or("")
-                    .to_string();
-            }
-            info.pane_id = lc
-                .get("pane_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            info.process_id = lc
-                .get("process_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            info.terminal_id = lc
-                .get("terminal_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if is_zellij_preset(&info.preset_name) {
-                if let Some(pane_id) = zellij_pane_id_from_terminal_id(&info.terminal_id) {
-                    info.pane_id = pane_id;
-                }
-            }
-            // Kitty socket from launch context or env snapshot
-            let lc_env = lc.get("env").and_then(|v| v.as_object());
-            info.kitty_listen_on = lc
-                .get("kitty_listen_on")
+    if let Some(launch_context_json) = launch_context_json.filter(|s| !s.is_empty())
+        && let Ok(lc) = serde_json::from_str::<serde_json::Value>(launch_context_json)
+    {
+        if info.preset_name.is_empty() {
+            info.preset_name = lc
+                .get("terminal_preset_effective")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .or_else(|| lc_env.and_then(|e| e.get("KITTY_LISTEN_ON").and_then(|v| v.as_str())))
-                .unwrap_or("")
-                .to_string();
-            info.zellij_session_name = lc_env
-                .and_then(|e| e.get("ZELLIJ_SESSION_NAME").and_then(|v| v.as_str()))
+                .or_else(|| {
+                    lc.get("terminal_preset")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or("")
                 .to_string();
         }
+        info.pane_id = lc
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        info.process_id = lc
+            .get("process_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        info.terminal_id = lc
+            .get("terminal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if is_zellij_preset(&info.preset_name)
+            && let Some(pane_id) = zellij_pane_id_from_terminal_id(&info.terminal_id)
+        {
+            info.pane_id = pane_id;
+        }
+        // Kitty socket from launch context or env snapshot
+        let lc_env = lc.get("env").and_then(|v| v.as_object());
+        info.kitty_listen_on = lc
+            .get("kitty_listen_on")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| lc_env.and_then(|e| e.get("KITTY_LISTEN_ON").and_then(|v| v.as_str())))
+            .unwrap_or("")
+            .to_string();
+        info.zellij_session_name = lc_env
+            .and_then(|e| e.get("ZELLIJ_SESSION_NAME").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
     }
 
     // Legacy kitty launches may have pane/socket metadata but no persisted preset.
@@ -1807,6 +1804,37 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::os::unix::process::ExitStatusExt;
+
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn clear(vars: &'static [&'static str]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|&var| (var, std::env::var(var).ok()))
+                .collect::<Vec<_>>();
+            for &var in vars {
+                unsafe {
+                    std::env::remove_var(var);
+                }
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (var, value) in &self.0 {
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(var, value);
+                    } else {
+                        std::env::remove_var(var);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_shell_quote_empty() {
@@ -2065,8 +2093,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_normalize_terminal_mode_for_launch_resolves_socket_for_auto_detected_kitty() {
-        let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
-        let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -2076,26 +2103,12 @@ mod tests {
 
         assert_eq!(mode, "kitty-split");
         assert_eq!(socket, "unix:/tmp/kitty-test");
-
-        unsafe {
-            if let Some(value) = saved_window {
-                std::env::set_var("KITTY_WINDOW_ID", value);
-            } else {
-                std::env::remove_var("KITTY_WINDOW_ID");
-            }
-            if let Some(value) = saved_listen {
-                std::env::set_var("KITTY_LISTEN_ON", value);
-            } else {
-                std::env::remove_var("KITTY_LISTEN_ON");
-            }
-        }
     }
 
     #[test]
     #[serial]
     fn test_resolve_terminal_mode_for_tips_uses_normalized_auto_detected_mode() {
-        let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
-        let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -2105,19 +2118,6 @@ mod tests {
 
         assert_eq!(mode, "kitty-split");
         assert!(auto);
-
-        unsafe {
-            if let Some(value) = saved_window {
-                std::env::set_var("KITTY_WINDOW_ID", value);
-            } else {
-                std::env::remove_var("KITTY_WINDOW_ID");
-            }
-            if let Some(value) = saved_listen {
-                std::env::set_var("KITTY_LISTEN_ON", value);
-            } else {
-                std::env::remove_var("KITTY_LISTEN_ON");
-            }
-        }
     }
 
     #[test]
@@ -2260,12 +2260,6 @@ mod tests {
             "block:abc123"
         );
         assert_eq!(normalize_captured_terminal_id("terminal_6"), "terminal_6");
-    }
-
-    #[test]
-    fn test_kill_result_enum() {
-        assert_eq!(KillResult::Sent, KillResult::Sent);
-        assert_ne!(KillResult::Sent, KillResult::AlreadyDead);
     }
 
     #[test]

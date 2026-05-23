@@ -5,6 +5,7 @@
 //! initialization for newly launched or recovered sessions.
 
 use crate::db::{HcomDb, InstanceRow};
+use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
 use crate::shared::ST_INACTIVE;
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
@@ -91,20 +92,17 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         .copied()
         .collect();
 
-    if !missing.is_empty() {
-        if let Ok(Some(pos)) = db.get_instance_full(instance_name) {
-            if let Some(old_json) = &pos.launch_context {
-                if let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json) {
-                    for k in &missing {
-                        if let Some(val) = old_ctx.get(*k) {
-                            if let Some(s) = val.as_str() {
-                                if !s.is_empty() {
-                                    ctx.insert(k.to_string(), val.clone());
-                                }
-                            }
-                        }
-                    }
-                }
+    if !missing.is_empty()
+        && let Ok(Some(pos)) = db.get_instance_full(instance_name)
+        && let Some(old_json) = &pos.launch_context
+        && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
+    {
+        for k in &missing {
+            if let Some(val) = old_ctx.get(*k)
+                && let Some(s) = val.as_str()
+                && !s.is_empty()
+            {
+                ctx.insert(k.to_string(), val.clone());
             }
         }
     }
@@ -176,51 +174,48 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
     ];
     let mut env_map = serde_json::Map::new();
     for key in &env_keys {
-        if let Ok(val) = std::env::var(key) {
-            if !val.is_empty() {
-                env_map.insert((*key).to_string(), serde_json::json!(val));
-            }
+        if let Ok(val) = std::env::var(key)
+            && !val.is_empty()
+        {
+            env_map.insert((*key).to_string(), serde_json::json!(val));
         }
     }
     ctx.insert("env".into(), serde_json::Value::Object(env_map));
 
     // Pane IDs are late-bound. The launcher already persisted the effective preset.
-    if let Ok(preset_name) = std::env::var("HCOM_LAUNCHED_PRESET") {
-        if !preset_name.is_empty() {
-            if let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name) {
-                if let Ok(pane_id) = std::env::var(pane_id_env) {
-                    if !pane_id.is_empty() {
-                        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
-                    }
-                }
-            }
-        }
+    if let Ok(preset_name) = std::env::var("HCOM_LAUNCHED_PRESET")
+        && !preset_name.is_empty()
+        && let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name)
+        && let Ok(pane_id) = std::env::var(pane_id_env)
+        && !pane_id.is_empty()
+    {
+        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
     }
 
     // Process ID for kitty close-by-env matching
-    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID") {
-        if !pid.is_empty() {
-            ctx.insert("process_id".into(), serde_json::json!(pid));
+    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID")
+        && !pid.is_empty()
+    {
+        ctx.insert("process_id".into(), serde_json::json!(pid));
 
-            // Terminal ID from parent's stdout capture
-            let id_file = crate::paths::hcom_dir()
-                .join(".tmp")
-                .join("terminal_ids")
-                .join(&pid);
-            if id_file.exists() {
-                if let Ok(content) = std::fs::read_to_string(&id_file) {
-                    let terminal_id = content.trim().to_string();
-                    if !terminal_id.is_empty() {
-                        if std::env::var("HCOM_LAUNCHED_PRESET").as_deref() == Ok("zellij") {
-                            if let Some(pane_id) = zellij_pane_id_from_terminal_id(&terminal_id) {
-                                ctx.insert("pane_id".into(), serde_json::json!(pane_id));
-                            }
-                        }
-                        ctx.insert("terminal_id".into(), serde_json::json!(terminal_id));
+        // Terminal ID from parent's stdout capture
+        let id_file = crate::paths::hcom_dir()
+            .join(".tmp")
+            .join("terminal_ids")
+            .join(&pid);
+        if id_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&id_file) {
+                let terminal_id = content.trim().to_string();
+                if !terminal_id.is_empty() {
+                    if std::env::var("HCOM_LAUNCHED_PRESET").as_deref() == Ok("zellij")
+                        && let Some(pane_id) = zellij_pane_id_from_terminal_id(&terminal_id)
+                    {
+                        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
                     }
+                    ctx.insert("terminal_id".into(), serde_json::json!(terminal_id));
                 }
-                let _ = std::fs::remove_file(&id_file);
             }
+            let _ = std::fs::remove_file(&id_file);
         }
     }
 
@@ -297,99 +292,98 @@ pub fn bind_session_to_process(
         let mut resume_updates = serde_json::Map::new();
         resume_updates.insert("last_stop".into(), serde_json::json!(now));
 
-        if let Some(ref ph_name) = placeholder_name {
-            if ph_name != canonical_name {
-                // Always migrate notify_endpoints
-                if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
-                    crate::log::log_error(
-                        "binding",
-                        "bind_canonical.migrate_endpoints",
-                        &format!("{e}"),
-                    );
+        if let Some(ref ph_name) = placeholder_name
+            && ph_name != canonical_name
+        {
+            // Always migrate notify_endpoints
+            if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
+                crate::log::log_error(
+                    "binding",
+                    "bind_canonical.migrate_endpoints",
+                    &format!("{e}"),
+                );
+            }
+
+            let is_true_placeholder = placeholder_data
+                .as_ref()
+                .map(|d| d.session_id.is_none())
+                .unwrap_or(false);
+
+            if is_true_placeholder {
+                // Path 1a: True placeholder merge
+                if let Some(ref ph_data) = placeholder_data {
+                    if let Some(ref tag) = ph_data.tag {
+                        resume_updates.insert("tag".into(), serde_json::json!(tag));
+                    }
+                    if ph_data.background != 0 {
+                        resume_updates
+                            .insert("background".into(), serde_json::json!(ph_data.background));
+                    }
+                    if let Some(ref args) = ph_data.launch_args {
+                        resume_updates.insert("launch_args".into(), serde_json::json!(args));
+                    }
+                    // Reset status_context for ready event
+                    if std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1") {
+                        resume_updates.insert("status_context".into(), serde_json::json!("new"));
+                    }
                 }
 
-                let is_true_placeholder = placeholder_data
-                    .as_ref()
-                    .map(|d| d.session_id.is_none())
-                    .unwrap_or(false);
-
-                if is_true_placeholder {
-                    // Path 1a: True placeholder merge
-                    if let Some(ref ph_data) = placeholder_data {
-                        if let Some(ref tag) = ph_data.tag {
-                            resume_updates.insert("tag".into(), serde_json::json!(tag));
-                        }
-                        if ph_data.background != 0 {
-                            resume_updates
-                                .insert("background".into(), serde_json::json!(ph_data.background));
-                        }
-                        if let Some(ref args) = ph_data.launch_args {
-                            resume_updates.insert("launch_args".into(), serde_json::json!(args));
-                        }
-                        // Reset status_context for ready event
-                        if std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1") {
-                            resume_updates
-                                .insert("status_context".into(), serde_json::json!("new"));
-                        }
-                    }
-
-                    // Delete true placeholder (temporary identity)
-                    match db.delete_instance(ph_name) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
-                                crate::log::log_error(
-                                    "binding",
-                                    "bind_canonical.rollback_endpoints",
-                                    &format!("{e}"),
-                                );
-                            }
-                        }
-                        Err(e) => {
+                // Delete true placeholder (temporary identity)
+                match db.delete_instance(ph_name) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
                             crate::log::log_error(
                                 "binding",
-                                "bind_canonical.delete_placeholder",
+                                "bind_canonical.rollback_endpoints",
                                 &format!("{e}"),
                             );
-                            if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
-                                crate::log::log_error(
-                                    "binding",
-                                    "bind_canonical.rollback_endpoints",
-                                    &format!("{e}"),
-                                );
-                            }
                         }
                     }
-                } else {
-                    // Path 1b: Session switch — mark old instance inactive
-                    crate::instance_lifecycle::set_status(
-                        db,
-                        ph_name,
-                        ST_INACTIVE,
-                        "exit:session_switch",
-                        Default::default(),
-                    );
-                    if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
+                    Err(e) => {
                         crate::log::log_error(
                             "binding",
-                            "bind_canonical.delete_session_bindings",
+                            "bind_canonical.delete_placeholder",
                             &format!("{e}"),
                         );
+                        if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
+                            crate::log::log_error(
+                                "binding",
+                                "bind_canonical.rollback_endpoints",
+                                &format!("{e}"),
+                            );
+                        }
                     }
+                }
+            } else {
+                // Path 1b: Session switch — mark old instance inactive
+                crate::instance_lifecycle::set_status(
+                    db,
+                    ph_name,
+                    ST_INACTIVE,
+                    "exit:session_switch",
+                    Default::default(),
+                );
+                if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
+                    crate::log::log_error(
+                        "binding",
+                        "bind_canonical.delete_session_bindings",
+                        &format!("{e}"),
+                    );
                 }
             }
         }
 
         update_instance_position(db, canonical_name, &resume_updates);
 
-        if let Some(pid) = process_id {
-            if let Err(e) = db.set_process_binding(pid, session_id, canonical_name) {
-                crate::log::log_error(
-                    "binding",
-                    "bind_canonical.set_process_binding",
-                    &format!("{e}"),
-                );
-            }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, canonical_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "bind_canonical.set_process_binding",
+                &format!("{e}"),
+            );
         }
 
         return Some(canonical_name.clone());
@@ -418,14 +412,14 @@ pub fn bind_session_to_process(
                 &format!("{e}"),
             );
         }
-        if let Some(pid) = process_id {
-            if let Err(e) = db.set_process_binding(pid, session_id, ph_name) {
-                crate::log::log_error(
-                    "binding",
-                    "bind_placeholder.set_process_binding",
-                    &format!("{e}"),
-                );
-            }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, ph_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "bind_placeholder.set_process_binding",
+                &format!("{e}"),
+            );
         }
 
         return Some(ph_name.clone());
@@ -497,6 +491,9 @@ pub fn initialize_instance_in_position_file(
             }
 
             let is_true_placeholder = existing.session_id.is_none();
+            let is_pending_placeholder = is_true_placeholder
+                && existing.status == PLACEHOLDER_STATUS
+                && existing.status_context == PLACEHOLDER_CONTEXT;
             if existing.last_event_id == 0 && is_true_placeholder {
                 let current_max = db.get_last_event_id();
                 let launch_event_id = std::env::var("HCOM_LAUNCH_EVENT_ID")
@@ -516,6 +513,10 @@ pub fn initialize_instance_in_position_file(
 
             if !updates.is_empty() {
                 let _ = db.update_instance_fields(instance_name, &updates);
+            }
+
+            if is_pending_placeholder {
+                auto_subscribe_defaults(db, instance_name, tool.unwrap_or(existing.tool.as_str()));
             }
 
             true
@@ -559,12 +560,11 @@ pub fn initialize_instance_in_position_file(
 
             if let Some(t) = tag {
                 data.insert("tag".into(), serde_json::json!(t));
-            } else if session_id.is_some() || parent_session_id.is_some() || is_launched {
-                if let Ok(hcom_config) = crate::config::HcomConfig::load(None) {
-                    if !hcom_config.tag.is_empty() {
-                        data.insert("tag".into(), serde_json::json!(hcom_config.tag));
-                    }
-                }
+            } else if (session_id.is_some() || parent_session_id.is_some() || is_launched)
+                && let Ok(hcom_config) = crate::config::HcomConfig::load(None)
+                && !hcom_config.tag.is_empty()
+            {
+                data.insert("tag".into(), serde_json::json!(hcom_config.tag));
             }
 
             data.insert("project".into(), serde_json::Value::Null);
@@ -596,17 +596,14 @@ pub fn initialize_instance_in_position_file(
 
             match db.save_instance_named(instance_name, &data) {
                 Ok(true) => {
-                    let launcher =
-                        std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
-                    let event_data = serde_json::json!({
-                        "action": "created",
-                        "by": launcher,
-                        "is_hcom_launched": is_launched,
-                        "is_subagent": parent_session_id.is_some(),
-                        "parent_name": parent_name.unwrap_or(""),
-                    });
-                    let _ = db.log_event("life", instance_name, &event_data);
-                    auto_subscribe_defaults(db, instance_name, tool.unwrap_or(""));
+                    log_created_and_auto_subscribe(
+                        db,
+                        instance_name,
+                        is_launched,
+                        parent_session_id,
+                        parent_name,
+                        tool.unwrap_or(""),
+                    );
                     true
                 }
                 _ => true,
@@ -614,6 +611,26 @@ pub fn initialize_instance_in_position_file(
         }
         Err(_) => false,
     }
+}
+
+fn log_created_and_auto_subscribe(
+    db: &HcomDb,
+    instance_name: &str,
+    is_launched: bool,
+    parent_session_id: Option<&str>,
+    parent_name: Option<&str>,
+    tool: &str,
+) {
+    let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
+    let event_data = serde_json::json!({
+        "action": "created",
+        "by": launcher,
+        "is_hcom_launched": is_launched,
+        "is_subagent": parent_session_id.is_some(),
+        "parent_name": parent_name.unwrap_or(""),
+    });
+    let _ = db.log_event("life", instance_name, &event_data);
+    auto_subscribe_defaults(db, instance_name, tool);
 }
 
 /// Create orphaned PTY identity — called when process binding exists but session_id
@@ -661,10 +678,10 @@ pub fn create_orphaned_pty_identity(
     if let Err(e) = db.rebind_session(session_id, &name) {
         eprintln!("[hcom] warn: rebind_session failed for {name}: {e}");
     }
-    if let Some(pid) = process_id {
-        if let Err(e) = db.set_process_binding(pid, session_id, &name) {
-            eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
-        }
+    if let Some(pid) = process_id
+        && let Err(e) = db.set_process_binding(pid, session_id, &name)
+    {
+        eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
 
     Some(name)
@@ -682,20 +699,18 @@ pub fn resolve_instance_from_binding(
     session_id: Option<&str>,
     process_id: Option<&str>,
 ) -> Option<InstanceRow> {
-    if let Some(pid) = process_id {
-        if let Ok(Some(name)) = db.get_process_binding(pid) {
-            if let Ok(Some(instance)) = db.get_instance_full(&name) {
-                return Some(instance);
-            }
-        }
+    if let Some(pid) = process_id
+        && let Ok(Some(name)) = db.get_process_binding(pid)
+        && let Ok(Some(instance)) = db.get_instance_full(&name)
+    {
+        return Some(instance);
     }
 
-    if let Some(sid) = session_id {
-        if let Some(name) = db.get_session_binding(sid).ok().flatten() {
-            if let Ok(Some(instance)) = db.get_instance_full(&name) {
-                return Some(instance);
-            }
-        }
+    if let Some(sid) = session_id
+        && let Some(name) = db.get_session_binding(sid).ok().flatten()
+        && let Ok(Some(instance)) = db.get_instance_full(&name)
+    {
+        return Some(instance);
     }
 
     None
@@ -741,13 +756,12 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
                     .or_default()
                     .push(val.to_string());
             }
-            let _ = crate::commands::events::create_filter_subscription(
+            let _ = crate::db::subscriptions::create_filter_subscription(
                 db,
                 &filters,
                 &[],
                 instance_name,
                 false,
-                true,
                 None,
             );
         }
@@ -757,8 +771,34 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use serial_test::serial;
     use std::path::PathBuf;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn setup_test_db() -> (HcomDb, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -772,83 +812,6 @@ mod tests {
             test_id
         ));
 
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             PRAGMA journal_mode=WAL;
-
-             CREATE TABLE events (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 timestamp TEXT NOT NULL,
-                 type TEXT NOT NULL,
-                 instance TEXT,
-                 data TEXT NOT NULL
-             );
-
-             CREATE TABLE instances (
-                 name TEXT PRIMARY KEY,
-                 session_id TEXT UNIQUE,
-                 parent_session_id TEXT,
-                 parent_name TEXT,
-                  tag TEXT,
-                  project TEXT DEFAULT '',
-                  last_event_id INTEGER DEFAULT 0,
-                 status TEXT DEFAULT 'active',
-                 status_time INTEGER DEFAULT 0,
-                 status_context TEXT DEFAULT '',
-                 status_detail TEXT DEFAULT '',
-                 last_stop INTEGER DEFAULT 0,
-                 directory TEXT,
-                 created_at REAL NOT NULL DEFAULT 0,
-                 transcript_path TEXT DEFAULT '',
-                 tcp_mode INTEGER DEFAULT 0,
-                 wait_timeout INTEGER DEFAULT 86400,
-                 background INTEGER DEFAULT 0,
-                 background_log_file TEXT DEFAULT '',
-                 name_announced INTEGER DEFAULT 0,
-                 agent_id TEXT UNIQUE,
-                 running_tasks TEXT DEFAULT '',
-                 origin_device_id TEXT DEFAULT '',
-                 hints TEXT DEFAULT '',
-                 subagent_timeout INTEGER,
-                 tool TEXT DEFAULT 'claude',
-                 launch_args TEXT DEFAULT '',
-                 terminal_preset_requested TEXT DEFAULT '',
-                 terminal_preset_effective TEXT DEFAULT '',
-                 idle_since TEXT DEFAULT '',
-                 pid INTEGER DEFAULT NULL,
-                 launch_context TEXT DEFAULT '',
-                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
-             );
-
-             CREATE TABLE process_bindings (
-                 process_id TEXT PRIMARY KEY,
-                 session_id TEXT,
-                 instance_name TEXT,
-                 updated_at REAL NOT NULL
-             );
-
-             CREATE TABLE session_bindings (
-                 session_id TEXT PRIMARY KEY,
-                 instance_name TEXT NOT NULL,
-                 created_at REAL NOT NULL,
-                 FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE CASCADE
-             );
-
-             CREATE TABLE notify_endpoints (
-                 instance TEXT NOT NULL,
-                 kind TEXT NOT NULL,
-                 port INTEGER NOT NULL,
-                 updated_at REAL NOT NULL,
-                 PRIMARY KEY (instance, kind)
-             );
-
-             CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let db = HcomDb::open_raw(&db_path).unwrap();
         (db, db_path)
     }
 
@@ -1199,16 +1162,15 @@ mod tests {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("collision".to_string(), vec!["1".to_string()]);
 
-        let result = crate::commands::events::create_filter_subscription(
+        let result = crate::db::subscriptions::create_filter_subscription(
             &db,
             &filters,
             &[],
             "test-agent",
             false,
-            true,
             None,
         );
-        assert_eq!(result, 0, "subscription creation should succeed");
+        assert!(result.is_ok(), "subscription creation should succeed");
 
         let rows: Vec<String> = db
             .conn()
@@ -1219,6 +1181,92 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(rows.len(), 1, "should have 1 subscription");
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_pending_placeholder_promotion_auto_subscribes_without_created_event() {
+        let _env = EnvVarGuard::set("HCOM_AUTO_SUBSCRIBE", "collision");
+        let (db, path) = setup_test_db();
+
+        let now = now_epoch_i64();
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("luna"));
+        data.insert("status".into(), serde_json::json!(PLACEHOLDER_STATUS));
+        data.insert(
+            "status_context".into(),
+            serde_json::json!(PLACEHOLDER_CONTEXT),
+        );
+        data.insert("created_at".into(), serde_json::json!(now));
+        data.insert(
+            "last_event_id".into(),
+            serde_json::json!(db.get_last_event_id()),
+        );
+        db.save_instance_named("luna", &data).unwrap();
+
+        let ok = initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(ok);
+        let ok_again = initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(ok_again);
+
+        let created_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE instance = 'luna'
+                   AND type = 'life'
+                   AND json_extract(data, '$.action') = 'created'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_count, 0);
+
+        let collision_sub_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv
+                 WHERE key LIKE 'events_sub:%'
+                   AND json_extract(value, '$.caller') = 'luna'
+                   AND json_extract(value, '$.filters.collision[0]') IS NOT NULL
+                   AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(collision_sub_count, 1);
 
         cleanup(path);
     }

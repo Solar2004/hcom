@@ -171,6 +171,45 @@ pub fn format_recipients(delivered_to: &[String], max_show: usize) -> String {
     }
 }
 
+/// Build the "unknown @mention" error string with a "Did you mean" hint when
+/// an unmatched target (without `:`) has the same base name as a remote agent.
+///
+/// Without this hint, users hit `@zeli` → "non-existent" even though `zeli:ZOME`
+/// is right there in the available list and only takes a colon-suffix to reach.
+fn build_unmatched_error(unmatched: &[String], full_names: &[String]) -> String {
+    let unmatched_display: Vec<String> = unmatched.iter().map(|t| format!("@{}", t)).collect();
+
+    let mut suggestions: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    for target in unmatched {
+        if target.contains(':') {
+            continue;
+        }
+        let target_lower = target.to_lowercase();
+        for fn_ in full_names {
+            if let Some((prefix, _device)) = fn_.split_once(':')
+                && prefix.to_lowercase() == target_lower
+                && seen.insert(fn_.clone())
+            {
+                suggestions.push(format!("@{}", fn_));
+            }
+        }
+    }
+
+    let mut msg = format!(
+        "@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): {}",
+        unmatched_display.join(", "),
+    );
+    if !suggestions.is_empty() {
+        msg.push_str(&format!("\nDid you mean: {}?", suggestions.join(", ")));
+    }
+    msg.push_str(&format!(
+        "\nAvailable: {}",
+        format_recipients(full_names, 30)
+    ));
+    msg
+}
+
 /// Match a target against instance names with base-name fallback.
 ///
 /// Tries prefix match on full display name ({tag}-{name}) first.
@@ -303,14 +342,7 @@ pub fn compute_scope(
             }
 
             if !unmatched.is_empty() {
-                let display = format_recipients(&full_names, 30);
-                let unmatched_display: Vec<String> =
-                    unmatched.iter().map(|t| format!("@{}", t)).collect();
-                return Err(format!(
-                    "@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): {}\nAvailable: {}",
-                    unmatched_display.join(", "),
-                    display,
-                ));
+                return Err(build_unmatched_error(&unmatched, &full_names));
             }
 
             // Deduplicate preserving order
@@ -384,14 +416,7 @@ pub fn compute_scope(
                     ));
                 }
 
-                let display = format_recipients(&full_names, 30);
-                let unmatched_display: Vec<String> =
-                    unmatched.iter().map(|m| format!("@{}", m)).collect();
-                return Err(format!(
-                    "@mentions to non-existent or stopped agents (or you used '@' char for stuff that wasn't agent name): {}\nAvailable: {}",
-                    unmatched_display.join(", "),
-                    display,
-                ));
+                return Err(build_unmatched_error(&unmatched, &full_names));
             }
 
             let unique = dedup_preserving_order(&matched_base_names);
@@ -580,12 +605,11 @@ pub fn format_hook_messages(
 
     // Per-instance hints from data
     let mut hints = String::new();
-    if let Some(data) = get_instance_data(instance_name) {
-        if let Some(h) = data.get("hints").and_then(|v| v.as_str()) {
-            if !h.is_empty() {
-                hints = h.to_string();
-            }
-        }
+    if let Some(data) = get_instance_data(instance_name)
+        && let Some(h) = data.get("hints").and_then(|v| v.as_str())
+        && !h.is_empty()
+    {
+        hints = h.to_string();
     }
     if hints.is_empty() {
         hints = get_config_hints();
@@ -613,12 +637,10 @@ pub fn format_hook_messages(
             if let Some(intent) = msg.get("intent").and_then(|v| v.as_str()) {
                 let tip_key = format!("recv:intent:{}", intent);
                 let (seen, mark) = tip_fn(instance_name, &tip_key);
-                if !seen {
-                    if let Some(tip_text) = get_tip_text(&tip_key) {
-                        mark();
-                        result = format!("{}\n{}", result, tip_text);
-                        break; // Only show one tip per delivery
-                    }
+                if !seen && let Some(tip_text) = get_tip_text(&tip_key) {
+                    mark();
+                    result = format!("{}\n{}", result, tip_text);
+                    break; // Only show one tip per delivery
                 }
             }
         }
@@ -685,7 +707,7 @@ fn get_tip_text(tip_key: &str) -> Option<&'static str> {
 }
 
 fn get_thread_tip_text(instance_name: &str, thread: &str) -> String {
-    let sub_id = crate::shared::thread_membership_sub_id(thread, instance_name);
+    let sub_id = crate::db::subscriptions::thread_membership_sub_id(thread, instance_name);
     format!(
         "[tip] You joined thread {thread}. To leave: hcom events unsub {sub_id} (find your sub-id with: hcom events sub list)"
     )
@@ -788,19 +810,18 @@ pub fn compute_read_receipts(
             let inst_data = active_instances.get(inst_name);
 
             // Remote instance: compare msg_ts (timestamp-based)
-            if let Some(data) = inst_data {
-                if data
+            if let Some(data) = inst_data
+                && data
                     .get("origin_device_id")
                     .and_then(|v| v.as_str())
                     .is_some_and(|s| !s.is_empty())
+            {
+                if let Some(ts) = remote_msg_ts.get(inst_name)
+                    && ts >= msg_timestamp
                 {
-                    if let Some(ts) = remote_msg_ts.get(inst_name) {
-                        if ts >= msg_timestamp {
-                            read_by.push(inst_name.clone());
-                        }
-                    }
-                    continue;
+                    read_by.push(inst_name.clone());
                 }
+                continue;
             }
 
             // Local instance: check for deliver event after message
@@ -808,12 +829,12 @@ pub fn compute_read_receipts(
                 // External senders (no session_id, no parent, not remote) only count
                 // as "read" if they were explicitly @mentioned in the message text.
                 // This prevents false-positive read receipts for external watchers.
-                if let Some(data) = inst_data {
-                    if is_external_sender_data(data) {
-                        let inst_tag = data.get("tag").and_then(|v| v.as_str());
-                        if !is_mentioned(msg_text, inst_name, inst_tag) {
-                            continue;
-                        }
+                if let Some(data) = inst_data
+                    && is_external_sender_data(data)
+                {
+                    let inst_tag = data.get("tag").and_then(|v| v.as_str());
+                    if !is_mentioned(msg_text, inst_name, inst_tag) {
+                        continue;
                     }
                 }
                 read_by.push(inst_name.clone());
@@ -1144,6 +1165,25 @@ mod tests {
         let result = compute_scope("hello", &instances, Some(&targets), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("non-existent or stopped"));
+    }
+
+    #[test]
+    fn test_compute_scope_suggests_remote_match() {
+        // Bare `@zeli` shouldn't silently match remote `zeli:ZOME`, but the error
+        // should point users at the right form instead of just listing 30 names.
+        let instances = vec![info("zeli:ZOME", None), info("luna", None)];
+        let targets = vec!["zeli".to_string()];
+        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        assert!(err.contains("@zeli"), "got: {err}");
+        assert!(err.contains("Did you mean: @zeli:ZOME"), "got: {err}");
+    }
+
+    #[test]
+    fn test_compute_scope_no_suggestion_when_no_remote_match() {
+        let instances = vec![info("luna", None), info("nova", None)];
+        let targets = vec!["zeli".to_string()];
+        let err = compute_scope("hello", &instances, Some(&targets)).unwrap_err();
+        assert!(!err.contains("Did you mean"), "got: {err}");
     }
 
     #[test]

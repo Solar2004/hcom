@@ -1,8 +1,8 @@
-//! Instance display, classification, and generic row-update utilities.
+//! Instance classification predicates and generic row-update utilities.
 //!
-//! Session/process binding and launch-context persistence live in
-//! `instance_binding.rs`; this module stays focused on helpers shared by
-//! commands, UI rendering, and lifecycle code.
+//! Display-name and identity resolution live in `identity.rs`; session/process
+//! binding lives in `instance_binding.rs`. This module stays focused on small
+//! helpers shared by commands, UI rendering, and lifecycle code.
 
 use crate::db::{HcomDb, InstanceRow};
 use crate::shared::ST_INACTIVE;
@@ -49,95 +49,6 @@ pub fn is_launching_placeholder(data: &InstanceRow) -> bool {
         && (data.status == ST_INACTIVE || data.status == "pending")
 }
 
-/// Get full display name: "{tag}-{name}" if tag exists, else just "{name}".
-pub fn get_full_name(data: &InstanceRow) -> String {
-    match &data.tag {
-        Some(tag) if !tag.is_empty() => format!("{}-{}", tag, data.name),
-        _ => data.name.clone(),
-    }
-}
-
-/// Get display name for a base name by loading instance data.
-pub fn get_display_name(db: &HcomDb, base_name: &str) -> String {
-    match db.get_instance_full(base_name) {
-        Ok(Some(data)) => get_full_name(&data),
-        _ => base_name.to_string(),
-    }
-}
-
-/// Resolve base name or tag-name (e.g., "team-luna") to base name.
-/// Handles multi-hyphen tags like "vc-p0-p1-parallel-vani" -> tag="vc-p0-p1-parallel", name="vani".
-pub fn resolve_display_name(db: &HcomDb, input_name: &str) -> Option<String> {
-    if let Ok(Some(_)) = db.get_instance_full(input_name) {
-        return Some(input_name.to_string());
-    }
-
-    for (i, _) in input_name.match_indices('-') {
-        let tag = &input_name[..i];
-        let name = &input_name[i + 1..];
-        if name.is_empty() {
-            continue;
-        }
-        if let Ok(Some(data)) = db.get_instance_full(name) {
-            if data.tag.as_deref() == Some(tag) {
-                return Some(name.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Resolve base name or tag-name using live instances first, then stopped snapshots.
-pub fn resolve_display_name_or_stopped(db: &HcomDb, input_name: &str) -> Option<String> {
-    if let Some(name) = resolve_display_name(db, input_name) {
-        return Some(name);
-    }
-
-    if db
-        .conn()
-        .query_row(
-            "SELECT instance FROM events
-             WHERE type = 'life'
-               AND instance = ?1
-               AND json_extract(data, '$.action') = 'stopped'
-             LIMIT 1",
-            rusqlite::params![input_name],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .is_some()
-    {
-        return Some(input_name.to_string());
-    }
-
-    for (i, _) in input_name.match_indices('-') {
-        let tag = &input_name[..i];
-        let name = &input_name[i + 1..];
-        if name.is_empty() {
-            continue;
-        }
-        if db
-            .conn()
-            .query_row(
-                "SELECT instance FROM events
-                 WHERE type = 'life'
-                   AND instance = ?1
-                   AND json_extract(data, '$.action') = 'stopped'
-                   AND json_extract(data, '$.snapshot.tag') = ?2
-                 LIMIT 1",
-                rusqlite::params![name, tag],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .is_some()
-        {
-            return Some(name.to_string());
-        }
-    }
-
-    None
-}
-
 /// Parsed running_tasks JSON field.
 #[derive(Debug, Clone, Default)]
 pub struct RunningTasks {
@@ -175,13 +86,13 @@ pub fn update_instance_position(
 ) {
     let mut update_copy = updates.clone();
     for bool_field in &["tcp_mode", "background", "name_announced"] {
-        if let Some(val) = update_copy.get(*bool_field) {
-            if let Some(b) = val.as_bool() {
-                update_copy.insert(
-                    (*bool_field).to_string(),
-                    serde_json::json!(if b { 1 } else { 0 }),
-                );
-            }
+        if let Some(val) = update_copy.get(*bool_field)
+            && let Some(b) = val.as_bool()
+        {
+            update_copy.insert(
+                (*bool_field).to_string(),
+                serde_json::json!(if b { 1 } else { 0 }),
+            );
         }
     }
 
@@ -198,10 +109,9 @@ pub fn update_instance_position(
 mod tests {
     use super::*;
     use crate::instance_names::{
-        allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name, is_too_similar,
-        name_pool, score_name,
+        CVCV_SPACE, allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name,
+        is_too_similar, name_pool, score_name,
     };
-    use rusqlite::Connection;
     use std::collections::HashSet;
     use std::path::PathBuf;
 
@@ -217,83 +127,7 @@ mod tests {
             test_id
         ));
 
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             PRAGMA journal_mode=WAL;
-
-             CREATE TABLE events (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 timestamp TEXT NOT NULL,
-                 type TEXT NOT NULL,
-                 instance TEXT,
-                 data TEXT NOT NULL
-             );
-
-             CREATE TABLE instances (
-                 name TEXT PRIMARY KEY,
-                 session_id TEXT UNIQUE,
-                 parent_session_id TEXT,
-                 parent_name TEXT,
-                  tag TEXT,
-                  project TEXT DEFAULT '',
-                  last_event_id INTEGER DEFAULT 0,
-                 status TEXT DEFAULT 'active',
-                 status_time INTEGER DEFAULT 0,
-                 status_context TEXT DEFAULT '',
-                 status_detail TEXT DEFAULT '',
-                 last_stop INTEGER DEFAULT 0,
-                 directory TEXT,
-                 created_at REAL NOT NULL DEFAULT 0,
-                 transcript_path TEXT DEFAULT '',
-                 tcp_mode INTEGER DEFAULT 0,
-                 wait_timeout INTEGER DEFAULT 86400,
-                 background INTEGER DEFAULT 0,
-                 background_log_file TEXT DEFAULT '',
-                 name_announced INTEGER DEFAULT 0,
-                 agent_id TEXT UNIQUE,
-                 running_tasks TEXT DEFAULT '',
-                 origin_device_id TEXT DEFAULT '',
-                 hints TEXT DEFAULT '',
-                 subagent_timeout INTEGER,
-                 tool TEXT DEFAULT 'claude',
-                 launch_args TEXT DEFAULT '',
-                 terminal_preset_requested TEXT DEFAULT '',
-                 terminal_preset_effective TEXT DEFAULT '',
-                 idle_since TEXT DEFAULT '',
-                 pid INTEGER DEFAULT NULL,
-                 launch_context TEXT DEFAULT '',
-                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
-             );
-
-             CREATE TABLE process_bindings (
-                 process_id TEXT PRIMARY KEY,
-                 session_id TEXT,
-                 instance_name TEXT,
-                 updated_at REAL NOT NULL
-             );
-
-             CREATE TABLE session_bindings (
-                 session_id TEXT PRIMARY KEY,
-                 instance_name TEXT NOT NULL,
-                 created_at REAL NOT NULL,
-                 FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE CASCADE
-             );
-
-             CREATE TABLE notify_endpoints (
-                 instance TEXT NOT NULL,
-                 kind TEXT NOT NULL,
-                 port INTEGER NOT NULL,
-                 updated_at REAL NOT NULL,
-                 PRIMARY KEY (instance, kind)
-             );
-
-             CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path)
     }
 
@@ -350,8 +184,26 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let alive = taken.clone();
-        let name = allocate_name(&|n| taken.contains(n), &alive, 200, 1200, 900.0).unwrap();
+        let name = allocate_name(&|n| taken.contains(n), &alive, 200, 1200, 30.0).unwrap();
         assert!(!taken.contains(&name));
+    }
+
+    #[test]
+    fn test_allocate_name_avoids_alive_first_letter() {
+        // Forces the deterministic greedy tier (attempts=0 skips weighted
+        // sampling) so the spread penalty's effect on adjusted ordering can
+        // be asserted without RNG.
+        let alive: HashSet<String> = [
+            "luna", "lola", "lara", "lana", "lena", "lina", "lori", "loki",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let name = allocate_name(&|n| alive.contains(n), &alive, 0, 1200, 30.0).unwrap();
+        assert!(
+            !name.starts_with('l'),
+            "greedy pick under spread penalty should avoid `l`, got {name}"
+        );
     }
 
     #[test]
@@ -366,6 +218,17 @@ mod tests {
         let n1 = hash_to_name("device-123", 0);
         let n2 = hash_to_name("device-123", 1);
         assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn test_hash_to_name_probing_covers_full_cvcv_space() {
+        // Walking attempts 0..CVCV_SPACE must visit every distinct CVCV
+        // output exactly once — relay collision probing relies on this so
+        // fallback only triggers when every slot is genuinely taken.
+        let outputs: HashSet<String> = (0..CVCV_SPACE)
+            .map(|a| hash_to_name("device-123", a as u32))
+            .collect();
+        assert_eq!(outputs.len(), CVCV_SPACE);
     }
 
     #[test]
@@ -400,54 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_full_name() {
-        let plain = InstanceRow {
-            name: "luna".into(),
-            tag: None,
-            ..default_instance()
-        };
-        assert_eq!(get_full_name(&plain), "luna");
-
-        let tagged = InstanceRow {
-            name: "luna".into(),
-            tag: Some("team".into()),
-            ..default_instance()
-        };
-        assert_eq!(get_full_name(&tagged), "team-luna");
-    }
-
-    #[test]
-    fn test_resolve_display_name_or_stopped_tagged_snapshot() {
-        let (db, path) = setup_test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO events (timestamp, type, instance, data)
-                 VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'life', 'luna', ?1)",
-                rusqlite::params![
-                    serde_json::json!({
-                        "action": "stopped",
-                        "snapshot": {
-                            "tag": "team"
-                        }
-                    })
-                    .to_string()
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(
-            resolve_display_name_or_stopped(&db, "team-luna").as_deref(),
-            Some("luna")
-        );
-        assert_eq!(
-            resolve_display_name_or_stopped(&db, "luna").as_deref(),
-            Some("luna")
-        );
-
-        cleanup(path);
-    }
-
-    #[test]
     fn test_collect_taken_names_includes_stopped_snapshots() {
         let (db, path) = setup_test_db();
         db.conn()
@@ -470,6 +285,58 @@ mod tests {
         assert!(!alive_names.contains("vera"));
         assert!(taken_names.contains("luna"));
         assert!(taken_names.contains("vera"));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_collect_taken_names_ignores_placeholder_stops() {
+        let (db, path) = setup_test_db();
+        for (name, placeholder) in [("vera", true), ("zara", false)] {
+            db.conn()
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data)
+                     VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'life', ?1, ?2)",
+                    rusqlite::params![
+                        name,
+                        serde_json::json!({
+                            "action": "stopped",
+                            "placeholder": placeholder
+                        })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let (_, taken_names) = collect_taken_names(&db).unwrap();
+        assert!(!taken_names.contains("vera"));
+        assert!(taken_names.contains("zara"));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_save_instance_reservation_does_not_replace_existing_row() {
+        let (db, path) = setup_test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(0.0));
+
+        db.save_instance_reservation("luna", &data).unwrap();
+
+        let mut replacement = serde_json::Map::new();
+        replacement.insert("status".into(), serde_json::json!("listening"));
+        assert!(db.save_instance_reservation("luna", &replacement).is_err());
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            "pending"
+        );
 
         cleanup(path);
     }

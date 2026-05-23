@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use crate::agent_prompts;
 use crate::db::HcomDb;
+use crate::db::subscriptions::create_request_watches;
 use crate::identity;
-use crate::instance_lifecycle;
 use crate::instances;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
@@ -233,7 +233,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     for name in delivered_to {
         if let Ok(Some(data)) = db.get_instance_full(name) {
             let icon = status_icon(&data.status);
-            let display = instances::get_display_name(db, name);
+            let display = identity::get_display_name(db, name);
             parts.push(format!("{icon} {display}"));
         } else {
             parts.push(format!("◌ {name}"));
@@ -356,14 +356,14 @@ pub fn send_message(
                 data["reply_to_local"] = serde_json::json!(local_id);
 
                 // Ack-on-ack loop prevention
-                if env.intent.as_ref().map(|i| i.as_str()) == Some("ack") {
-                    if let Some(parent_intent) = get_intent_from_event(db, local_id) {
-                        if parent_intent == "ack" {
-                            return Err("Ack-on-ack loop detected. Message blocked.".to_string());
-                        }
-                        if parent_intent == "inform" {
-                            return Err("Cannot ack an inform - informational messages don't need acknowledgment.".to_string());
-                        }
+                if env.intent.as_ref().map(|i| i.as_str()) == Some("ack")
+                    && let Some(parent_intent) = get_intent_from_event(db, local_id)
+                {
+                    if parent_intent == "ack" {
+                        return Err("Ack-on-ack loop detected. Message blocked.".to_string());
+                    }
+                    if parent_intent == "inform" {
+                        return Err("Cannot ack an inform - informational messages don't need acknowledgment.".to_string());
                     }
                 }
             }
@@ -408,7 +408,7 @@ pub fn send_message(
     }
 
     // Notify all instances (wake delivery loops)
-    instance_lifecycle::notify_all_instances(db);
+    crate::notify::wake_all(db);
 
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
@@ -464,36 +464,6 @@ fn get_intent_from_event(db: &HcomDb, event_id: i64) -> Option<String> {
         )
         .ok()
         .flatten()
-}
-
-/// Create request-watch subscriptions for each recipient.
-fn create_request_watches(db: &HcomDb, sender: &str, request_event_id: i64, recipients: &[String]) {
-    let last_id = db.get_last_event_id();
-    let now = crate::shared::time::now_epoch_f64();
-
-    for recipient in recipients {
-        let sub_id = format!("reqwatch-{request_event_id}-{recipient}");
-        let sub_key = format!("events_sub:{sub_id}");
-
-        let sql = "(type='status' AND instance=? AND status_val='listening') OR (type='life' AND instance=? AND life_action='stopped')";
-
-        let sub_data = serde_json::json!({
-            "id": sub_id,
-            "caller": sender,
-            "sql": sql,
-            "params": [recipient, recipient],
-            "filters": {
-                "request_watch": true,
-                "request_id": request_event_id,
-                "target": recipient,
-            },
-            "once": true,
-            "last_id": last_id,
-            "created": now,
-        });
-
-        let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-    }
 }
 
 /// Resolve message from one of 5 source modes.
@@ -666,17 +636,14 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             .or_else(|| identity::resolve_identity(db, None, None, None, None, None, None).ok());
         match actor {
             Some(ref actor) if matches!(actor.kind, SenderKind::Instance) => {
-                if let Some(ref data) = actor.instance_data {
-                    if data
+                if let Some(ref data) = actor.instance_data
+                    && data
                         .get("parent_name")
                         .and_then(|v| v.as_str())
                         .is_some_and(|s| !s.is_empty())
-                    {
-                        eprintln!(
-                            "Error: Subagents cannot use --from/-b (external sender spoofing)"
-                        );
-                        return 1;
-                    }
+                {
+                    eprintln!("Error: Subagents cannot use --from/-b (external sender spoofing)");
+                    return 1;
                 }
             }
             _ => {}
@@ -722,10 +689,10 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     if let Some(ref reply_to) = envelope.reply_to {
         if let Some(local_id) = resolve_reply_to_local(db, reply_to) {
-            if envelope.thread.is_none() {
-                if let Some(parent_thread) = get_thread_from_event(db, local_id) {
-                    envelope.thread = Some(parent_thread);
-                }
+            if envelope.thread.is_none()
+                && let Some(parent_thread) = get_thread_from_event(db, local_id)
+            {
+                envelope.thread = Some(parent_thread);
             }
         } else {
             eprintln!("Error: Invalid --reply-to: event not found or not a message");
@@ -975,12 +942,12 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         let messages = db.get_unread_messages(&sender_identity.name);
         if !messages.is_empty() {
             // Advance cursor
-            if let Some(last) = messages.last() {
-                if let Some(id) = last.event_id {
-                    let mut updates = serde_json::Map::new();
-                    updates.insert("last_event_id".into(), serde_json::json!(id));
-                    instances::update_instance_position(db, &sender_identity.name, &updates);
-                }
+            if let Some(last) = messages.last()
+                && let Some(id) = last.event_id
+            {
+                let mut updates = serde_json::Map::new();
+                updates.insert("last_event_id".into(), serde_json::json!(id));
+                instances::update_instance_position(db, &sender_identity.name, &updates);
             }
 
             // Separate subagent messages from main messages
@@ -1043,11 +1010,11 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // Show intent tip
-    if let Some(ref intent) = envelope.intent {
-        if matches!(sender_identity.kind, SenderKind::Instance) {
-            let tip_key = format!("send:intent:{}", intent.as_str());
-            crate::core::tips::maybe_show_tip(db, &sender_identity.name, &tip_key, false);
-        }
+    if let Some(ref intent) = envelope.intent
+        && matches!(sender_identity.kind, SenderKind::Instance)
+    {
+        let tip_key = format!("send:intent:{}", intent.as_str());
+        crate::core::tips::maybe_show_tip(db, &sender_identity.name, &tip_key, false);
     }
 
     crate::relay::worker::ensure_worker(true);
@@ -1061,11 +1028,11 @@ fn format_messages_for_hook(
     messages: &[&crate::db::Message],
     instance_name: &str,
 ) -> String {
-    let recipient_display = instances::get_display_name(db, instance_name);
+    let recipient_display = identity::get_display_name(db, instance_name);
 
     if messages.len() == 1 {
         let msg = messages[0];
-        let sender_display = instances::get_display_name(db, &msg.from);
+        let sender_display = identity::get_display_name(db, &msg.from);
         let prefix =
             cli_context_build_prefix(msg.intent.as_deref(), msg.thread.as_deref(), msg.event_id);
         format!(
@@ -1076,7 +1043,7 @@ fn format_messages_for_hook(
         let parts: Vec<String> = messages
             .iter()
             .map(|msg| {
-                let sender_display = instances::get_display_name(db, &msg.from);
+                let sender_display = identity::get_display_name(db, &msg.from);
                 let prefix = cli_context_build_prefix(
                     msg.intent.as_deref(),
                     msg.thread.as_deref(),
@@ -1392,8 +1359,7 @@ mod tests {
             test_id
         ));
 
-        let db = HcomDb::open_raw(&db_path).unwrap();
-        db.init_db().unwrap();
+        let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path)
     }
 

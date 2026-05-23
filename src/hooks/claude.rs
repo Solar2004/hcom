@@ -388,30 +388,29 @@ fn get_real_session_id(raw: &Value, env_file: Option<&str>, is_fork: bool) -> St
         hook_session_id
     };
 
-    if let Some(env_file) = env_file {
-        if is_fork {
-            let path = Path::new(env_file);
-            let parts: Vec<&str> = path
-                .components()
-                .filter_map(|c| c.as_os_str().to_str())
-                .collect();
-            if let Some(idx) = parts.iter().position(|&p| p == "session-env") {
-                if idx + 1 < parts.len() {
-                    let candidate = parts[idx + 1];
-                    // Sanity: UUID format (36 chars, 4 hyphens)
-                    if candidate.len() == 36 && candidate.chars().filter(|&c| c == '-').count() == 4
-                    {
-                        log::log_info(
-                            "hooks",
-                            "get_real_session_id.from_env_file",
-                            &format!(
-                                "candidate={} hook_session_id={}",
-                                candidate, hook_session_id
-                            ),
-                        );
-                        return candidate.to_string();
-                    }
-                }
+    if let Some(env_file) = env_file
+        && is_fork
+    {
+        let path = Path::new(env_file);
+        let parts: Vec<&str> = path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect();
+        if let Some(idx) = parts.iter().position(|&p| p == "session-env")
+            && idx + 1 < parts.len()
+        {
+            let candidate = parts[idx + 1];
+            // Sanity: UUID format (36 chars, 4 hyphens)
+            if candidate.len() == 36 && candidate.chars().filter(|&c| c == '-').count() == 4 {
+                log::log_info(
+                    "hooks",
+                    "get_real_session_id.from_env_file",
+                    &format!(
+                        "candidate={} hook_session_id={}",
+                        candidate, hook_session_id
+                    ),
+                );
+                return candidate.to_string();
             }
         }
     }
@@ -445,20 +444,20 @@ fn handle_sessionstart(
     );
 
     // Persist session_id to CLAUDE_ENV_FILE for bash commands
-    if let Some(ref env_file) = ctx.claude_env_file {
-        if !session_id.is_empty() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(env_file) {
-                use std::io::Write;
-                let _ = writeln!(f, "export HCOM_CLAUDE_UNIX_SESSION_ID={}", session_id);
-            }
-        }
+    if let Some(ref env_file) = ctx.claude_env_file
+        && !session_id.is_empty()
+        && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(env_file)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "export HCOM_CLAUDE_UNIX_SESSION_ID={}", session_id);
     }
 
     // Compaction recovery: re-inject bootstrap
-    if source == "compact" && !session_id.is_empty() {
-        if let Some(output) = handle_compact_recovery(db, ctx, session_id, process_id) {
-            return (0, serde_json::to_string(&output).unwrap_or_default());
-        }
+    if source == "compact"
+        && !session_id.is_empty()
+        && let Some(output) = handle_compact_recovery(db, ctx, session_id, process_id)
+    {
+        return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
     // Vanilla instance - show hint
@@ -1113,20 +1112,20 @@ fn handle_userpromptsubmit(
     }
 
     // Bootstrap fallback (rarely fires)
-    if !name_announced && ctx.is_launched {
-        if let Some(bootstrap_text) =
+    if !name_announced
+        && ctx.is_launched
+        && let Some(bootstrap_text) =
             common::inject_bootstrap_once(db, ctx, instance_name, instance_data, "claude")
-        {
-            let output = serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": bootstrap_text,
-                }
-            });
-            paths::increment_flag_counter("instance_count");
-            lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
-            return (0, serde_json::to_string(&output).unwrap_or_default());
-        }
+    {
+        let output = serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": bootstrap_text,
+            }
+        });
+        paths::increment_flag_counter("instance_count");
+        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
+        return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
     // PTY mode: deliver messages
@@ -1642,14 +1641,13 @@ fn subagent_stop(db: &HcomDb, raw: &Value, session_id: &str) -> (i32, String) {
     };
 
     // Store transcript_path if not already set
-    if existing_transcript.is_empty() {
-        if let Some(tp) = raw.get("agent_transcript_path").and_then(|v| v.as_str()) {
-            if !tp.is_empty() {
-                let mut updates = serde_json::Map::new();
-                updates.insert("transcript_path".into(), Value::String(tp.to_string()));
-                instances::update_instance_position(db, &subagent_name, &updates);
-            }
-        }
+    if existing_transcript.is_empty()
+        && let Some(tp) = raw.get("agent_transcript_path").and_then(|v| v.as_str())
+        && !tp.is_empty()
+    {
+        let mut updates = serde_json::Map::new();
+        updates.insert("transcript_path".into(), Value::String(tp.to_string()));
+        instances::update_instance_position(db, &subagent_name, &updates);
     }
 
     // Idle gate: a dormant subagent (never opted in via `hcom start`, never
@@ -1848,10 +1846,10 @@ fn bind_vanilla_from_marker(
     let instance_name = caps.get(1)?.as_str();
 
     // Don't rebind if already bound to a different instance
-    if let Some(current) = current_instance {
-        if current != instance_name {
-            return None;
-        }
+    if let Some(current) = current_instance
+        && current != instance_name
+    {
+        return None;
     }
 
     if session_id.is_empty() {
@@ -1966,10 +1964,10 @@ static RE_SH_HCOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"sh\s+-c.*hcom
 ///
 /// Priority: CLAUDE_CONFIG_DIR env var → tool_config_root()/.claude
 fn claude_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     paths::get_project_root().join(".claude")
 }
@@ -2920,10 +2918,10 @@ mod tests {
                 "type": "command",
                 "command": format!("{} {}", hook_cmd, cmd_suffix),
             });
-            if timeout.is_some() {
-                if let Some(t) = new_timeout {
-                    hook_entry["timeout"] = serde_json::json!(t);
-                }
+            if timeout.is_some()
+                && let Some(t) = new_timeout
+            {
+                hook_entry["timeout"] = serde_json::json!(t);
             }
             let mut hook_dict = serde_json::json!({"hooks": [hook_entry]});
             if !matcher.is_empty() {
@@ -3143,11 +3141,11 @@ mod tests {
             for matcher in matchers {
                 if let Some(hook_list) = matcher.get("hooks").and_then(|v| v.as_array()) {
                     for hook in hook_list {
-                        if let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) {
-                            if cmd == expected_full {
-                                found = true;
-                                break;
-                            }
+                        if let Some(cmd) = hook.get("command").and_then(|v| v.as_str())
+                            && cmd == expected_full
+                        {
+                            found = true;
+                            break;
                         }
                     }
                 }

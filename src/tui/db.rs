@@ -647,26 +647,25 @@ const ORPHAN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
     // Check cache first
-    if let Ok(guard) = ORPHAN_CACHE.lock() {
-        if let Some((ts, ref cached)) = *guard {
-            if ts.elapsed() < ORPHAN_CACHE_TTL {
-                // Still need to filter by active DB PIDs
-                let active_db_pids: Vec<u32> = conn
-                    .prepare("SELECT pid FROM instances WHERE pid IS NOT NULL")
+    if let Ok(guard) = ORPHAN_CACHE.lock()
+        && let Some((ts, ref cached)) = *guard
+        && ts.elapsed() < ORPHAN_CACHE_TTL
+    {
+        // Still need to filter by active DB PIDs
+        let active_db_pids: Vec<u32> = conn
+            .prepare("SELECT pid FROM instances WHERE pid IS NOT NULL")
+            .ok()
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, i64>(0))
                     .ok()
-                    .and_then(|mut stmt| {
-                        stmt.query_map([], |row| row.get::<_, i64>(0))
-                            .ok()
-                            .map(|rows| rows.flatten().map(|p| p as u32).collect())
-                    })
-                    .unwrap_or_default();
-                return cached
-                    .iter()
-                    .filter(|o| !active_db_pids.contains(&o.pid))
-                    .cloned()
-                    .collect();
-            }
-        }
+                    .map(|rows| rows.flatten().map(|p| p as u32).collect())
+            })
+            .unwrap_or_default();
+        return cached
+            .iter()
+            .filter(|o| !active_db_pids.contains(&o.pid))
+            .cloned()
+            .collect();
     }
 
     let path = paths::pidtrack_path();
@@ -1399,17 +1398,16 @@ pub fn get_available_presets() -> Vec<String> {
     }
 
     // User-defined presets from config.toml [terminal.presets.*]
-    if let Some(table) = read_config_toml() {
-        if let Some(presets_table) = table
+    if let Some(table) = read_config_toml()
+        && let Some(presets_table) = table
             .get("terminal")
             .and_then(|v| v.as_table())
             .and_then(|t| t.get("presets"))
             .and_then(|v| v.as_table())
-        {
-            for name in presets_table.keys() {
-                if !result.iter().any(|r| r == name) {
-                    result.push(name.clone());
-                }
+    {
+        for name in presets_table.keys() {
+            if !result.iter().any(|r| r == name) {
+                result.push(name.clone());
             }
         }
     }

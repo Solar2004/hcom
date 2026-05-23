@@ -9,12 +9,11 @@ use rusqlite::params;
 use serde_json::Value;
 
 use crate::db::HcomDb;
-use crate::instance_lifecycle;
 use crate::log;
 
 use super::crypto;
 use super::replay::ReplayGuard;
-use super::{device_short_id, safe_kv_get, safe_kv_set};
+use super::{device_short_id_for_db, remember_device_short_id, safe_kv_get, safe_kv_set};
 
 /// Crypto + replay context shared by all inbound message handlers.
 pub struct InboundContext<'a> {
@@ -118,6 +117,7 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
     if let Some(ref short) = short_id {
         safe_kv_set(db, &format!("relay_short_{}", short), None);
     }
+    safe_kv_set(db, &format!("relay_uuid_short_{}", device_id), None);
     let prefix = super::device_id_prefix(device_id);
     let label = short_id.as_deref().unwrap_or(prefix);
     emit_device_event(
@@ -161,7 +161,7 @@ pub fn handle_control_message(
         return false;
     }
 
-    let own_short_id = device_short_id(own_device);
+    let own_short_id = device_short_id_for_db(db, own_device);
     let events = if let Some(arr) = data.get("events").and_then(|v| v.as_array()) {
         arr.clone()
     } else if data.get("type").and_then(|v| v.as_str()) == Some("control") {
@@ -272,6 +272,7 @@ pub fn handle_state_message(
             false,
         );
     }
+    remember_device_short_id(db, device_id, &short_id);
     // Cache the peer's advertised capabilities. Distinguish three states:
     //   - "null"  → peer state arrived without a `capabilities` field at all
     //               (legacy / pre-capability peer); treated as unknown by the
@@ -355,7 +356,7 @@ pub fn handle_state_message(
     }
 
     // Upsert remote instances
-    let own_short_id = device_short_id(own_device);
+    let own_short_id = device_short_id_for_db(db, own_device);
     let instances = state
         .get("instances")
         .and_then(|v| v.as_object())
@@ -512,8 +513,7 @@ pub fn handle_state_message(
     );
 
     // Wake local TCP instances so they see new messages immediately.
-    //
-    instance_lifecycle::notify_all_instances(db);
+    crate::notify::wake_all(db);
 
     should_push
 }
@@ -618,13 +618,13 @@ fn import_remote_events(
         // - `mentions` / `delivered_to` strip *our own* suffix -> local delivery still matches
         if let Some(obj) = data.as_object_mut() {
             // Namespace 'from' field
-            if let Some(from) = obj.get("from").and_then(|v| v.as_str()).map(String::from) {
-                if !from.contains(':') {
-                    obj.insert(
-                        "from".to_string(),
-                        Value::String(super::add_device_suffix(&from, short_id)),
-                    );
-                }
+            if let Some(from) = obj.get("from").and_then(|v| v.as_str()).map(String::from)
+                && !from.contains(':')
+            {
+                obj.insert(
+                    "from".to_string(),
+                    Value::String(super::add_device_suffix(&from, short_id)),
+                );
             }
 
             // Strip own device suffix from mentions and delivered_to
@@ -694,6 +694,9 @@ fn import_remote_events(
 
 /// Reverse lookup: find short_id for a device UUID.
 fn resolve_short_id(db: &HcomDb, device_id: &str) -> Option<String> {
+    if let Some(short_id) = safe_kv_get(db, &format!("relay_uuid_short_{}", device_id)) {
+        return Some(short_id);
+    }
     if let Ok(entries) = db.kv_prefix("relay_short_") {
         for (key, val) in entries {
             if val == device_id {

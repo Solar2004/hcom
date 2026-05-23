@@ -38,6 +38,7 @@ struct PreparedResume {
     launch: LaunchParams,
     last_event_id: i64,
     session_id: String,
+    tracked_fork_identity: Option<TrackedForkIdentity>,
 }
 
 struct ResumeOutputContext {
@@ -48,6 +49,24 @@ struct ResumeOutputContext {
     background: bool,
     run_here: Option<bool>,
     launcher_name: String,
+}
+
+struct TrackedForkIdentity {
+    parent_name: String,
+    effective_tag: Option<String>,
+    custom_initial_prompt: Option<String>,
+    custom_system_prompt: Option<String>,
+}
+
+struct ResumePromptInput<'a> {
+    tool: &'a str,
+    display_name: &'a str,
+    fork: bool,
+    is_adoption: bool,
+    child_name: Option<&'a str>,
+    effective_tag: Option<&'a str>,
+    custom_system_prompt: Option<&'a str>,
+    custom_initial_prompt: Option<&'a str>,
 }
 
 /// Run the resume command. `argv` is the full argv[1..].
@@ -95,7 +114,7 @@ pub fn do_resume(
     flags: &GlobalFlags,
 ) -> Result<i32> {
     let db = HcomDb::open()?;
-    let name = crate::instances::resolve_display_name_or_stopped(&db, name)
+    let name = crate::identity::resolve_display_name_or_stopped(&db, name)
         .unwrap_or_else(|| name.to_string());
     let hcom_config = load_hcom_config();
     let ctx = crate::shared::HcomContext::from_os();
@@ -111,11 +130,13 @@ pub fn do_resume(
                 );
             }
         }
-        if ctx.is_inside_ai_tool() && !flags.go && should_preview_resume_rpc(extra_args) {
-            if let Ok(plan) = prepare_resume_plan(&db, &name, fork, extra_args, flags) {
-                print_resume_preview(&plan, &hcom_config, &name, fork);
-                return Ok(0);
-            }
+        if ctx.is_inside_ai_tool()
+            && !flags.go
+            && should_preview_resume_rpc(extra_args)
+            && let Ok(plan) = prepare_resume_plan(&db, &name, fork, extra_args, flags)
+        {
+            print_resume_preview(&plan, &hcom_config, &name, fork);
+            return Ok(0);
         }
 
         let launcher_name =
@@ -211,24 +232,24 @@ fn resolve_name_to_plan(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<(String, PreparedResume)> {
-    let mut current = crate::instances::resolve_display_name_or_stopped(db, name)
+    let mut current = crate::identity::resolve_display_name_or_stopped(db, name)
         .unwrap_or_else(|| name.to_string());
 
     // A loop over reclaim hops (binding → events → redirect to instance name).
     // Bounded by MAX_HOPS in case of pathological DB state.
     for _ in 0..8 {
         if is_session_id(&current) {
-            if let Ok(Some(bound)) = db.get_session_binding(&current) {
-                if matches!(db.get_instance_full(&bound), Ok(Some(_))) {
-                    bail!(
-                        "Session {} is currently active as '{}' — run hcom kill {} first",
-                        current,
-                        bound,
-                        bound
-                    );
-                }
-                // Stale binding: events are authoritative. Fall through.
+            if let Ok(Some(bound)) = db.get_session_binding(&current)
+                && matches!(db.get_instance_full(&bound), Ok(Some(_)))
+            {
+                bail!(
+                    "Session {} is currently active as '{}' — run hcom kill {} first",
+                    current,
+                    bound,
+                    bound
+                );
             }
+            // Stale binding: events are authoritative. Fall through.
             if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&current) {
                 current = instance_name;
                 continue;
@@ -239,28 +260,26 @@ fn resolve_name_to_plan(
 
         if matches!(db.get_instance_full(&current), Ok(None) | Err(_))
             && crate::relay::control::split_device_suffix(&current).is_none()
+            && let Some(session_id) = resolve_thread_name(&current)?
         {
-            if let Some(session_id) = resolve_thread_name(&current)? {
-                if let Ok(Some(bound)) = db.get_session_binding(&session_id) {
-                    if matches!(db.get_instance_full(&bound), Ok(Some(_))) {
-                        bail!(
-                            "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
-                            session_id,
-                            current,
-                            bound,
-                            bound
-                        );
-                    }
-                    // Stale binding: fall through to events.
-                }
-                if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id)
-                {
-                    current = instance_name;
-                    continue;
-                }
-                let plan = build_adopt_plan(db, &session_id, fork, extra_args, flags)?;
-                return Ok((session_id, plan));
+            if let Ok(Some(bound)) = db.get_session_binding(&session_id)
+                && matches!(db.get_instance_full(&bound), Ok(Some(_)))
+            {
+                bail!(
+                    "Session {} (thread '{}') is currently active as '{}' — run hcom kill {} first",
+                    session_id,
+                    current,
+                    bound,
+                    bound
+                );
             }
+            // Stale binding: fall through to events.
+            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
+                current = instance_name;
+                continue;
+            }
+            let plan = build_adopt_plan(db, &session_id, fork, extra_args, flags)?;
+            return Ok((session_id, plan));
         }
 
         let plan = prepare_resume_plan(db, &current, fork, extra_args, flags)?;
@@ -305,10 +324,8 @@ fn prepare_resume_plan_from_source(
         display_name,
     ) = match source {
         ResumeSource::Instance { name } => {
-            if !fork {
-                if let Ok(Some(_)) = db.get_instance_full(name) {
-                    bail!("'{}' is still active — run hcom kill {} first", name, name);
-                }
+            if !fork && let Ok(Some(_)) = db.get_instance_full(name) {
+                bail!("'{}' is still active — run hcom kill {} first", name, name);
             }
             let (tool, sid, largs, tag, bg, leid, snap) = if fork {
                 load_instance_data(db, name)?
@@ -420,83 +437,33 @@ fn prepare_resume_plan_from_source(
         resolve_launcher_name(db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
     let launcher_name_for_output = launcher_name.clone();
 
-    // Pre-allocate a fork child name only for tracked-instance forks, since the
-    // identity-reset prompts reference it. For adoption-fork there is no prior
-    // hcom identity in the transcript, so the SessionStart hook handles naming.
+    // Choose a preview child name only for tracked-instance forks, since the
+    // identity-reset prompts reference it. Actual launch reserves a fresh name
+    // under the shared flock in execute_prepared_resume_result.
     let fork_child_name = if fork && !is_adoption {
-        let (alive_names, taken_names) = crate::instance_names::collect_taken_names(db)?;
-        let candidate = crate::instance_names::allocate_name(
-            &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
-            &alive_names,
-            200,
-            1200,
-            900.0,
-        )?;
-        Some(candidate)
+        Some(crate::instance_names::allocate_unreserved_name(db)?)
     } else {
         None
     };
     let effective_tag = launch_flags.tag.clone().or(inherited_tag.clone());
 
-    // Codex fork identity-reset: only for tracked-instance forks. Adoption-fork
-    // transcripts have no prior hcom identity to override.
-    let fork_initial_prompt = if fork && tool == "codex" && !is_adoption {
-        let child_name = fork_child_name
-            .as_deref()
-            .expect("fork child name should be generated");
-        let child_display = effective_tag
-            .as_deref()
-            .map(|tag| format!("{tag}-{child_name}"))
-            .unwrap_or_else(|| child_name.to_string());
-        let parent = display_name.as_str();
-        let identity_reset = format!(
-            "You are a fork of {parent}, but your new hcom identity is now {child_display}.\n\
-             Your hcom name is {child_name}.\n\
-             Do not use {parent}'s hcom identity anymore, even if it appears in inherited thread history.\n\
-             Use [hcom:{child_name}] in your first response only.\n\
-             Use `hcom ... --name {child_name}` for all hcom commands.\n\
-             If asked about your identity, answer exactly: {child_display}"
-        );
-        Some(match launch_flags.initial_prompt.as_deref() {
-            Some(user_prompt) if !user_prompt.trim().is_empty() => {
-                format!("{identity_reset}\n\n{user_prompt}")
-            }
-            _ => identity_reset,
-        })
-    } else {
-        launch_flags.initial_prompt.clone()
-    };
+    let (effective_system_prompt, fork_initial_prompt, append_reply_handoff) =
+        build_resume_prompts(ResumePromptInput {
+            tool: &tool,
+            display_name: &display_name,
+            fork,
+            is_adoption,
+            child_name: fork_child_name.as_deref(),
+            effective_tag: effective_tag.as_deref(),
+            custom_system_prompt: launch_flags.system_prompt.as_deref(),
+            custom_initial_prompt: launch_flags.initial_prompt.as_deref(),
+        });
     let output_tag = effective_tag.clone();
     let launch_tag = effective_tag.clone();
 
-    // System prompt:
-    // - Tracked-instance resume/fork: identity-carrying prompt (existing behavior).
-    // - Adoption: None — the SessionStart hook issues the normal fresh-launch
-    //   bootstrap under the auto-allocated name. The transcript has no prior hcom
-    //   context to override.
-    let base_system_prompt = if is_adoption {
-        None
-    } else {
-        Some(resume_system_prompt(
-            &tool,
-            &display_name,
-            fork,
-            fork_child_name.as_deref(),
-        ))
-    };
-    let effective_system_prompt = match (base_system_prompt, launch_flags.system_prompt.as_deref())
-    {
-        (Some(base), Some(custom)) if !custom.trim().is_empty() => {
-            Some(format!("{base}\n\n{custom}"))
-        }
-        (Some(base), _) => Some(base),
-        (None, Some(custom)) if !custom.trim().is_empty() => Some(custom.to_string()),
-        (None, _) => None,
-    };
-
     // Instance name for LaunchParams:
     // - Adoption: None (launcher allocates; SessionStart hook binds via session_bindings)
-    // - Tracked fork: pre-allocated fork_child_name
+    // - Tracked fork: preview-only fork_child_name; execute swaps in a reserved name
     // - Tracked resume: preserve existing hcom name
     let launch_name = if is_adoption {
         None
@@ -504,6 +471,16 @@ fn prepare_resume_plan_from_source(
         fork_child_name.clone()
     } else {
         Some(display_name.clone())
+    };
+    let tracked_fork_identity = if fork && !is_adoption {
+        Some(TrackedForkIdentity {
+            parent_name: display_name.clone(),
+            effective_tag: effective_tag.clone(),
+            custom_initial_prompt: launch_flags.initial_prompt.clone(),
+            custom_system_prompt: launch_flags.system_prompt.clone(),
+        })
+    } else {
+        None
     };
 
     Ok(PreparedResume {
@@ -537,10 +514,11 @@ fn prepare_resume_plan_from_source(
             // Codex tracked-instance fork uses initial_prompt for an identity
             // reset; don't dilute it with a reply-handoff suffix. Adoption-fork
             // has no identity-reset prompt, so normal handoff rules apply.
-            append_reply_handoff: !(fork && tool == "codex" && !is_adoption),
+            append_reply_handoff,
         },
         last_event_id,
         session_id,
+        tracked_fork_identity,
     })
 }
 
@@ -586,7 +564,8 @@ fn execute_prepared_resume_result(
     fork: bool,
     plan: &PreparedResume,
 ) -> Result<LaunchResult> {
-    let result = launcher::launch(db, plan.launch.clone())?;
+    let launch = prepare_launch_for_execution(db, plan)?;
+    let result = launcher::launch(db, launch.clone())?;
 
     if !fork && plan.last_event_id > 0 {
         crate::instances::update_instance_position(
@@ -608,7 +587,7 @@ fn execute_prepared_resume_result(
         // launcher::launch to current max) — no zero-cursor window to
         // protect against.
         let current_max = db.get_last_event_id();
-        if let Some(ref child_name) = plan.launch.name {
+        if let Some(ref child_name) = launch.name {
             crate::instances::update_instance_position(
                 db,
                 child_name,
@@ -617,6 +596,31 @@ fn execute_prepared_resume_result(
         }
     }
     Ok(result)
+}
+
+fn prepare_launch_for_execution(db: &HcomDb, plan: &PreparedResume) -> Result<LaunchParams> {
+    let mut launch = plan.launch.clone();
+    let Some(identity) = &plan.tracked_fork_identity else {
+        return Ok(launch);
+    };
+
+    let reserved_child_name = crate::instance_names::reserve_generated_name(db)?;
+    let (system_prompt, initial_prompt, append_reply_handoff) =
+        build_resume_prompts(ResumePromptInput {
+            tool: &launch.tool,
+            display_name: &identity.parent_name,
+            fork: true,
+            is_adoption: false,
+            child_name: Some(&reserved_child_name),
+            effective_tag: identity.effective_tag.as_deref(),
+            custom_system_prompt: identity.custom_system_prompt.as_deref(),
+            custom_initial_prompt: identity.custom_initial_prompt.as_deref(),
+        });
+    launch.name = Some(reserved_child_name);
+    launch.system_prompt = system_prompt;
+    launch.initial_prompt = initial_prompt;
+    launch.append_reply_handoff = append_reply_handoff;
+    Ok(launch)
 }
 
 fn build_remote_resume_output(
@@ -723,6 +727,66 @@ fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
     Ok(())
 }
 
+fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option<String>, bool) {
+    let ResumePromptInput {
+        tool,
+        display_name,
+        fork,
+        is_adoption,
+        child_name,
+        effective_tag,
+        custom_system_prompt,
+        custom_initial_prompt,
+    } = input;
+
+    // Codex tracked-instance fork identity reset belongs in the initial prompt.
+    // Adoption-fork has no prior hcom identity, so normal bootstrap handles it.
+    let initial_prompt = if fork && tool == "codex" && !is_adoption {
+        let child_name = child_name.expect("tracked fork child name should be available");
+        let child_display = effective_tag
+            .map(|tag| format!("{tag}-{child_name}"))
+            .unwrap_or_else(|| child_name.to_string());
+        let identity_reset = format!(
+            "You are a fork of {display_name}, but your new hcom identity is now {child_display}.\n\
+             Your hcom name is {child_name}.\n\
+             Do not use {display_name}'s hcom identity anymore, even if it appears in inherited thread history.\n\
+             Use [hcom:{child_name}] in your first response only.\n\
+             Use `hcom ... --name {child_name}` for all hcom commands.\n\
+             If asked about your identity, answer exactly: {child_display}"
+        );
+        Some(match custom_initial_prompt {
+            Some(user_prompt) if !user_prompt.trim().is_empty() => {
+                format!("{identity_reset}\n\n{user_prompt}")
+            }
+            _ => identity_reset,
+        })
+    } else {
+        custom_initial_prompt.map(ToString::to_string)
+    };
+
+    // System prompt:
+    // - Tracked-instance resume/fork: identity-carrying prompt (existing behavior).
+    // - Adoption: None — SessionStart issues the normal fresh-launch bootstrap.
+    let base_system_prompt = if is_adoption {
+        None
+    } else {
+        Some(resume_system_prompt(tool, display_name, fork, child_name))
+    };
+    let system_prompt = match (base_system_prompt, custom_system_prompt) {
+        (Some(base), Some(custom)) if !custom.trim().is_empty() => {
+            Some(format!("{base}\n\n{custom}"))
+        }
+        (Some(base), _) => Some(base),
+        (None, Some(custom)) if !custom.trim().is_empty() => Some(custom.to_string()),
+        (None, _) => None,
+    };
+
+    // Codex tracked-instance fork uses initial_prompt for an identity reset;
+    // don't dilute it with a reply-handoff suffix. Adoption-fork has no reset.
+    let append_reply_handoff = !(fork && tool == "codex" && !is_adoption);
+    (system_prompt, initial_prompt, append_reply_handoff)
+}
+
 fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&str>) -> String {
     if fork {
         if tool == "codex" {
@@ -798,55 +862,54 @@ fn load_stopped_snapshot(
         .collect();
 
     for data_str in &rows {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str) {
-            if data.get("action").and_then(|v| v.as_str()) == Some("stopped") {
-                if let Some(snapshot) = data.get("snapshot") {
-                    let tool = snapshot
-                        .get("tool")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let session_id = snapshot
-                        .get("session_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let launch_args = snapshot
-                        .get("launch_args")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let tag = snapshot
-                        .get("tag")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let background = snapshot
-                        .get("background")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                        != 0;
-                    let last_event_id = snapshot
-                        .get("last_event_id")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let directory = snapshot
-                        .get("directory")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
+            && data.get("action").and_then(|v| v.as_str()) == Some("stopped")
+            && let Some(snapshot) = data.get("snapshot")
+        {
+            let tool = snapshot
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session_id = snapshot
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let launch_args = snapshot
+                .get("launch_args")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tag = snapshot
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let background = snapshot
+                .get("background")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                != 0;
+            let last_event_id = snapshot
+                .get("last_event_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let directory = snapshot
+                .get("directory")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
-                    return Ok((
-                        tool,
-                        session_id,
-                        launch_args,
-                        tag,
-                        background,
-                        last_event_id,
-                        directory,
-                    ));
-                }
-            }
+            return Ok((
+                tool,
+                session_id,
+                launch_args,
+                tag,
+                background,
+                last_event_id,
+                directory,
+            ));
         }
     }
 
@@ -1062,16 +1125,16 @@ fn resolve_claude_thread_name(name: &str) -> Result<Option<String>> {
                 };
                 last_title = Some((title, session_id));
             }
-            if let Some((title, session_id)) = last_title {
-                if title == name {
-                    let when = sub_entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .map(format_system_time)
-                        .unwrap_or_else(|| "unknown".to_string());
-                    matches.push(ThreadMatch { session_id, when });
-                }
+            if let Some((title, session_id)) = last_title
+                && title == name
+            {
+                let when = sub_entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(format_system_time)
+                    .unwrap_or_else(|| "unknown".to_string());
+                matches.push(ThreadMatch { session_id, when });
             }
         }
     }
@@ -1188,10 +1251,10 @@ fn is_opencode_session_id(s: &str) -> bool {
 /// it's absent) so callers can surface a useful "searched here" message.
 fn opencode_data_dir() -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            candidates.push(std::path::PathBuf::from(xdg).join("opencode"));
-        }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        candidates.push(std::path::PathBuf::from(xdg).join("opencode"));
     }
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".local/share/opencode"));
@@ -1273,16 +1336,16 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
 
     // 2. Claude: iterate project dirs, check for exact filename
     let projects_dir = claude_config_dir().join("projects");
-    if projects_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    let candidate = entry.path().join(format!("{}.jsonl", session_id));
-                    if candidate.exists() {
-                        let path_str = candidate.to_string_lossy().to_string();
-                        let tool = detect_agent_type(&path_str).to_string();
-                        return Some((tool, Some(path_str)));
-                    }
+    if projects_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&projects_dir)
+    {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let candidate = entry.path().join(format!("{}.jsonl", session_id));
+                if candidate.exists() {
+                    let path_str = candidate.to_string_lossy().to_string();
+                    let tool = detect_agent_type(&path_str).to_string();
+                    return Some((tool, Some(path_str)));
                 }
             }
         }
@@ -1343,10 +1406,10 @@ fn scan_lines_for_cwd(
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
-        if let Some(cwd) = pick(&parsed) {
-            if !cwd.is_empty() {
-                return Some(cwd.to_string());
-            }
+        if let Some(cwd) = pick(&parsed)
+            && !cwd.is_empty()
+        {
+            return Some(cwd.to_string());
         }
     }
     None
@@ -1734,6 +1797,42 @@ mod tests {
     }
 
     #[test]
+    fn test_tracked_fork_plan_does_not_reserve_until_execution() {
+        let db = test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!("session-123"));
+        data.insert("tool".into(), json!("codex"));
+        data.insert("status".into(), json!("listening"));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named("luna", &data).unwrap();
+
+        let before_count = db.iter_instances_full().unwrap().len();
+        let plan = prepare_resume_plan(&db, "luna", true, &[], &GlobalFlags::default()).unwrap();
+        let preview_name = plan
+            .launch
+            .name
+            .as_ref()
+            .expect("tracked fork should have preview name")
+            .clone();
+
+        assert_eq!(db.iter_instances_full().unwrap().len(), before_count);
+        assert!(db.get_instance_full(&preview_name).unwrap().is_none());
+        assert!(plan.tracked_fork_identity.is_some());
+
+        let launch = prepare_launch_for_execution(&db, &plan).unwrap();
+        let reserved_name = launch.name.as_ref().expect("reserved name");
+        assert!(db.get_instance_full(reserved_name).unwrap().is_some());
+        assert_eq!(db.iter_instances_full().unwrap().len(), before_count + 1);
+        assert!(
+            launch
+                .initial_prompt
+                .as_deref()
+                .unwrap_or("")
+                .contains(&format!("[hcom:{reserved_name}]"))
+        );
+    }
+
+    #[test]
     fn test_resume_system_prompt_codex_fork_does_not_tell_agent_to_rebind() {
         let prompt = resume_system_prompt("codex", "luna", true, None);
         assert!(prompt.contains("already-assigned hcom identity"));
@@ -1871,7 +1970,8 @@ mod tests {
     fn test_resolve_claude_thread_name_prefers_last_custom_title() {
         // A session renamed A → B → C must match for C (the current title),
         // not A or B (obsolete).
-        let cfg = std::env::temp_dir().join("hcom_test_claude_rename_chain");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path();
         let projects = cfg.join("projects/proj");
         std::fs::create_dir_all(&projects).unwrap();
         std::fs::write(
@@ -1883,7 +1983,7 @@ mod tests {
         )
         .unwrap();
 
-        let (old, mid, cur) = with_claude_config_dir(&cfg, || {
+        let (old, mid, cur) = with_claude_config_dir(cfg, || {
             (
                 resolve_claude_thread_name("A").unwrap(),
                 resolve_claude_thread_name("B").unwrap(),
@@ -1894,7 +1994,6 @@ mod tests {
         assert_eq!(old, None, "obsolete title A must not resolve");
         assert_eq!(mid, None, "obsolete title B must not resolve");
         assert_eq!(cur, Some("s1".to_string()), "current title C must resolve");
-        std::fs::remove_dir_all(&cfg).ok();
     }
 
     #[test]
@@ -1902,7 +2001,8 @@ mod tests {
     fn test_resolve_claude_thread_name_bails_on_within_tool_duplicate() {
         // Two distinct sessions both currently have customTitle="dup" — must
         // bail rather than silently pick by mtime.
-        let cfg = std::env::temp_dir().join("hcom_test_claude_dup_title");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path();
         let projects = cfg.join("projects/proj");
         std::fs::create_dir_all(&projects).unwrap();
         std::fs::write(
@@ -1918,7 +2018,7 @@ mod tests {
         )
         .unwrap();
 
-        let res = with_claude_config_dir(&cfg, || resolve_claude_thread_name("dup"));
+        let res = with_claude_config_dir(cfg, || resolve_claude_thread_name("dup"));
 
         let err = res.unwrap_err().to_string();
         assert!(err.contains("matches 2 Claude sessions"), "got: {err}");
@@ -1926,7 +2026,6 @@ mod tests {
             err.contains("sess-aaaa") && err.contains("sess-bbbb"),
             "got: {err}"
         );
-        std::fs::remove_dir_all(&cfg).ok();
     }
 
     #[test]
@@ -2003,9 +2102,8 @@ mod tests {
     #[test]
     fn test_extract_cwd_claude() {
         // Claude records cwd in the first (and every) line. Read one line.
-        let dir = std::env::temp_dir().join("hcom_test_cwd_claude");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
         std::fs::write(
             &path,
             r#"{"type":"user","cwd":"/start/dir","message":"hi"}
@@ -2015,16 +2113,14 @@ mod tests {
         .unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
         assert_eq!(result, Some("/start/dir".to_string()));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_extract_cwd_claude_skips_permission_mode_header() {
         // Real Claude transcripts start with a `permission-mode` line that has
         // no `cwd`; cwd first appears on a later entry. Must scan forward.
-        let dir = std::env::temp_dir().join("hcom_test_cwd_claude_header");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
         std::fs::write(
             &path,
             r#"{"type":"permission-mode","permissionMode":"default","sessionId":"abc"}
@@ -2035,16 +2131,14 @@ mod tests {
         .unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
         assert_eq!(result, Some("/real/cwd".to_string()));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_extract_cwd_claude_gives_up_after_cap() {
         // If no cwd appears in the first 20 lines, return None rather than
         // reading the full transcript.
-        let dir = std::env::temp_dir().join("hcom_test_cwd_claude_cap");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
         let mut content = String::new();
         for _ in 0..25 {
             content.push_str(r#"{"type":"noise"}"#);
@@ -2055,15 +2149,13 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
         assert_eq!(result, None);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_extract_cwd_codex() {
         // Codex records cwd in the session_meta payload on line 1.
-        let dir = std::env::temp_dir().join("hcom_test_cwd_codex");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
         std::fs::write(
             &path,
             r#"{"type":"session_meta","payload":{"cwd":"/start/dir"}}
@@ -2073,7 +2165,6 @@ mod tests {
         .unwrap();
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "codex");
         assert_eq!(result, Some("/start/dir".to_string()));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2083,7 +2174,8 @@ mod tests {
         // stores cwd → short-id in ~/.gemini/projects.json. This test wires up
         // a fake GEMINI_CLI_HOME and confirms the reverse lookup.
         use sha2::{Digest, Sha256};
-        let base = std::env::temp_dir().join("hcom_test_cwd_gemini_ok");
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = base_dir.path();
         let gemini = base.join(".gemini");
         let session_dir = gemini.join("tmp/myproj/chats");
         std::fs::create_dir_all(&session_dir).unwrap();
@@ -2113,7 +2205,7 @@ mod tests {
         // SAFETY: test is single-threaded enough for this module; serial_test
         // isn't in scope here, but other tests don't touch GEMINI_CLI_HOME.
         unsafe {
-            std::env::set_var("GEMINI_CLI_HOME", &base);
+            std::env::set_var("GEMINI_CLI_HOME", base);
         }
         let result = extract_cwd_from_transcript(session_path.to_str().unwrap(), "gemini");
         match prev {
@@ -2122,21 +2214,21 @@ mod tests {
         }
 
         assert_eq!(result, Some(fake_cwd.to_string()));
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     #[serial_test::serial]
     fn test_extract_cwd_gemini_no_registry_returns_none() {
         // When projects.json is missing, we can't reverse the hash → return None.
-        let base = std::env::temp_dir().join("hcom_test_cwd_gemini_noreg");
+        let base_dir = tempfile::tempdir().unwrap();
+        let base = base_dir.path();
         let gemini = base.join(".gemini/tmp/x/chats");
         std::fs::create_dir_all(&gemini).unwrap();
         let path = gemini.join("test.json");
         std::fs::write(&path, r#"{"projectHash":"deadbeef"}"#).unwrap();
         let prev = std::env::var("GEMINI_CLI_HOME").ok();
         unsafe {
-            std::env::set_var("GEMINI_CLI_HOME", &base);
+            std::env::set_var("GEMINI_CLI_HOME", base);
         }
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "gemini");
         match prev {
@@ -2144,6 +2236,5 @@ mod tests {
             None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
         }
         assert_eq!(result, None);
-        std::fs::remove_dir_all(&base).ok();
     }
 }

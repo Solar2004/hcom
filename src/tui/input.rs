@@ -182,11 +182,11 @@ impl App {
     pub fn handle_paste(&mut self, text: &str) {
         let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
         if self.ui.mode == InputMode::Relay {
-            if let Some(ref mut popup) = self.ui.relay_popup {
-                if popup.editing_token {
-                    for c in clean.chars() {
-                        insert_at(&mut popup.token_input, &mut popup.token_cursor, c);
-                    }
+            if let Some(ref mut popup) = self.ui.relay_popup
+                && popup.editing_token
+            {
+                for c in clean.chars() {
+                    insert_at(&mut popup.token_input, &mut popup.token_cursor, c);
                 }
             }
         } else if self.ui.mode == InputMode::Launch && self.ui.launch.editing.is_some() {
@@ -273,22 +273,22 @@ impl App {
             KeyCode::Esc => {
                 self.ui.confirm = None;
             }
-            KeyCode::Char('n') => {
-                // n = "No" shortcut, not applicable to OrphanAction (Kill/Recover)
+            KeyCode::Char('n')
                 if !matches!(
                     self.ui.confirm.as_ref().map(|c| &c.action),
                     Some(ConfirmAction::OrphanAction(_))
-                ) {
-                    self.ui.confirm = None;
-                }
+                ) =>
+            {
+                // n = "No" shortcut, not applicable to OrphanAction (Kill/Recover)
+                self.ui.confirm = None;
             }
             KeyCode::Char('y') => {
                 // y = "Yes" shortcut, not applicable to OrphanAction
-                if let Some(confirm) = self.ui.confirm.as_ref() {
-                    if !matches!(confirm.action, ConfirmAction::OrphanAction(_)) {
-                        let confirm = self.ui.confirm.take().unwrap();
-                        self.execute_confirm(confirm.action);
-                    }
+                if let Some(confirm) = self.ui.confirm.as_ref()
+                    && !matches!(confirm.action, ConfirmAction::OrphanAction(_))
+                {
+                    let confirm = self.ui.confirm.take().unwrap();
+                    self.execute_confirm(confirm.action);
                 }
             }
             _ => {}
@@ -305,25 +305,20 @@ impl App {
 
         match code {
             // MOVEMENT — always work, no conditions
-            KeyCode::Up => {
-                if self.ui.cursor > 0 {
-                    self.ui.cursor -= 1;
-                }
+            KeyCode::Up if self.ui.cursor > 0 => {
+                self.ui.cursor -= 1;
             }
-            KeyCode::Down => {
-                if self.ui.cursor + 1 < self.total_visible_rows() {
-                    self.ui.cursor += 1;
-                }
+            KeyCode::Down if self.ui.cursor + 1 < self.total_visible_rows() => {
+                self.ui.cursor += 1;
             }
-            KeyCode::Left if self.ui.view_mode == ViewMode::Inline => {
-                if self.ui.cursor > 0 {
-                    self.ui.cursor -= 1;
-                }
+            KeyCode::Left if self.ui.view_mode == ViewMode::Inline && self.ui.cursor > 0 => {
+                self.ui.cursor -= 1;
             }
-            KeyCode::Right if self.ui.view_mode == ViewMode::Inline => {
-                if self.ui.cursor + 1 < self.total_visible_rows() {
-                    self.ui.cursor += 1;
-                }
+            KeyCode::Right
+                if self.ui.view_mode == ViewMode::Inline
+                    && self.ui.cursor + 1 < self.total_visible_rows() =>
+            {
+                self.ui.cursor += 1;
             }
             KeyCode::Home => {
                 if self.ui.view_mode == ViewMode::Inline {
@@ -1039,17 +1034,13 @@ impl App {
                 KeyCode::Down => self.ui.launch.cursor_down(),
                 KeyCode::Left => self.ui.launch.adjust_left(),
                 KeyCode::Right => self.ui.launch.adjust_right(),
-                KeyCode::Enter => {
-                    if !self.ui.launch.is_text_field() {
-                        self.ui.launch.toggle_or_select();
-                    }
+                KeyCode::Enter if !self.ui.launch.is_text_field() => {
+                    self.ui.launch.toggle_or_select();
                 }
                 KeyCode::Char(' ') => self.ui.launch.toggle_or_select(),
-                KeyCode::Char(c) => {
-                    if self.ui.launch.is_text_field() {
-                        self.ui.launch.start_editing();
-                        self.ui.launch.insert_char(c);
-                    }
+                KeyCode::Char(c) if self.ui.launch.is_text_field() => {
+                    self.ui.launch.start_editing();
+                    self.ui.launch.insert_char(c);
                 }
                 _ => {}
             }
@@ -1153,31 +1144,29 @@ impl App {
                     popup.token_input.clear();
                     popup.token_cursor = 0;
                 }
-                KeyCode::Enter => {
-                    if !popup.token_input.is_empty() {
-                        let token = popup.token_input.clone();
-                        let cmd = format!("relay connect {}", token);
-                        if let Err(e) = self.enqueue_rpc(RpcOp::RelayConnect {
-                            token: token.clone(),
-                        }) {
-                            self.ui.command_result = Some(CommandResult {
-                                label: cmd,
-                                output: vec![format!("Error: {}", e)],
-                            });
-                        } else {
-                            self.ui.command_result = Some(CommandResult {
-                                label: cmd,
-                                output: vec!["(running...)".into()],
-                            });
-                        }
-                        self.ui.relay_popup = None;
-                        if self.ui.view_mode == ViewMode::Inline {
-                            self.ui.pending_eject_cmd = true;
-                            self.ui.mode = InputMode::Navigate;
-                        } else {
-                            self.ui.mode = InputMode::CommandOutput;
-                            self.ui.msg_scroll = 0;
-                        }
+                KeyCode::Enter if !popup.token_input.is_empty() => {
+                    let token = popup.token_input.clone();
+                    let cmd = format!("relay connect {}", token);
+                    if let Err(e) = self.enqueue_rpc(RpcOp::RelayConnect {
+                        token: token.clone(),
+                    }) {
+                        self.ui.command_result = Some(CommandResult {
+                            label: cmd,
+                            output: vec![format!("Error: {}", e)],
+                        });
+                    } else {
+                        self.ui.command_result = Some(CommandResult {
+                            label: cmd,
+                            output: vec!["(running...)".into()],
+                        });
+                    }
+                    self.ui.relay_popup = None;
+                    if self.ui.view_mode == ViewMode::Inline {
+                        self.ui.pending_eject_cmd = true;
+                        self.ui.mode = InputMode::Navigate;
+                    } else {
+                        self.ui.mode = InputMode::CommandOutput;
+                        self.ui.msg_scroll = 0;
                     }
                 }
                 KeyCode::Left => cursor_left(&popup.token_input, &mut popup.token_cursor),
@@ -1194,15 +1183,11 @@ impl App {
                 self.ui.relay_popup = None;
                 self.ui.mode = InputMode::Navigate;
             }
-            KeyCode::Up => {
-                if popup.cursor > 0 {
-                    popup.cursor -= 1;
-                }
+            KeyCode::Up if popup.cursor > 0 => {
+                popup.cursor -= 1;
             }
-            KeyCode::Down => {
-                if popup.cursor < RELAY_ACTIONS.len() as u8 {
-                    popup.cursor += 1;
-                }
+            KeyCode::Down if popup.cursor < RELAY_ACTIONS.len() as u8 => {
+                popup.cursor += 1;
             }
             KeyCode::Enter | KeyCode::Char(' ') => match popup.cursor {
                 0 => {

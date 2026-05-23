@@ -9,25 +9,6 @@ use super::args_common::{
     shell_split, toggle_flag,
 };
 
-const SUBCOMMANDS: &[&str] = &[
-    "mcp",
-    "extensions",
-    "extension",
-    "hooks",
-    "hook",
-    "skills",
-    "skill",
-];
-
-fn subcommand_alias(s: &str) -> &str {
-    match s {
-        "extension" => "extensions",
-        "hook" => "hooks",
-        "skill" => "skills",
-        _ => s,
-    }
-}
-
 fn flag_aliases() -> &'static HashMap<&'static str, &'static str> {
     static ALIASES: OnceLock<HashMap<&str, &str>> = OnceLock::new();
     ALIASES.get_or_init(|| {
@@ -41,6 +22,7 @@ fn flag_aliases() -> &'static HashMap<&'static str, &'static str> {
         m.insert("-e", "--extensions");
         m.insert("-l", "--list-extensions");
         m.insert("-r", "--resume");
+        m.insert("-w", "--worktree");
         m.insert("-o", "--output-format");
         m.insert("-v", "--version");
         m.insert("-h", "--help");
@@ -63,6 +45,8 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "--version",
     "-h",
     "--help",
+    "--skip-trust",
+    "--acp",
     "--experimental-acp",
     "--raw-output",
     "--accept-raw-output-risk",
@@ -78,15 +62,19 @@ const VALUE_FLAGS: &[&str] = &[
     "--approval-mode",
     "--allowed-mcp-server-names",
     "--allowed-tools",
+    "--policy",
+    "--admin-policy",
     "-e",
     "--extensions",
+    "--session-file",
+    "--session-id",
     "--delete-session",
     "--include-directories",
     "-o",
     "--output-format",
 ];
 
-const OPTIONAL_VALUE_FLAGS: &[&str] = &["--resume", "-r"];
+const OPTIONAL_VALUE_FLAGS: &[&str] = &["--resume", "-r", "-w", "--worktree"];
 
 const REPEATABLE_FLAGS: &[&str] = &[
     "-e",
@@ -94,6 +82,8 @@ const REPEATABLE_FLAGS: &[&str] = &[
     "--include-directories",
     "--allowed-mcp-server-names",
     "--allowed-tools",
+    "--policy",
+    "--admin-policy",
 ];
 
 struct GeminiFlagLookup {
@@ -326,17 +316,12 @@ impl GeminiArgsSpec {
         json_output: Option<bool>,
         stream_json: Option<bool>,
         prompt: Option<&str>,
-        subcommand: Option<Option<&str>>,
+        _subcommand: Option<Option<&str>>,
         yolo: Option<bool>,
         approval_mode: Option<&str>,
         include_directories: Option<&[String]>,
     ) -> GeminiArgsSpec {
         let mut tokens = self.clean_tokens.clone();
-        let mut new_subcommand = self.subcommand.clone();
-
-        if let Some(sub_opt) = subcommand {
-            new_subcommand = sub_opt.map(|s| s.to_string());
-        }
 
         if let Some(y) = yolo {
             tokens = toggle_flag(&tokens, "--yolo", y);
@@ -369,22 +354,16 @@ impl GeminiArgsSpec {
             }
         }
 
-        let mut combined = Vec::new();
-        if let Some(ref sub) = new_subcommand {
-            combined.push(sub.clone());
-        }
-        combined.extend(tokens);
-
-        parse_tokens(&combined, self.source)
+        parse_tokens(&tokens, self.source)
     }
 }
 
 /// Resolve Gemini args from CLI (highest precedence) or env string.
 pub fn resolve_gemini_args(cli_args: Option<&[String]>, env_value: Option<&str>) -> GeminiArgsSpec {
-    if let Some(args) = cli_args {
-        if !args.is_empty() {
-            return parse_tokens(args, SourceType::Cli);
-        }
+    if let Some(args) = cli_args
+        && !args.is_empty()
+    {
+        return parse_tokens(args, SourceType::Cli);
     }
 
     if let Some(env_str) = env_value {
@@ -407,11 +386,6 @@ pub fn resolve_gemini_args(cli_args: Option<&[String]>, env_value: Option<&str>)
 
 /// Merge env and CLI specs with smart precedence rules.
 pub fn merge_gemini_args(env_spec: &GeminiArgsSpec, cli_spec: &GeminiArgsSpec) -> GeminiArgsSpec {
-    let final_subcommand = cli_spec
-        .subcommand
-        .clone()
-        .or_else(|| env_spec.subcommand.clone());
-
     let final_positionals: Vec<String> = if !cli_spec.positional_tokens.is_empty() {
         if cli_spec.positional_tokens == [""] {
             vec![]
@@ -437,18 +411,18 @@ pub fn merge_gemini_args(env_spec: &GeminiArgsSpec, cli_spec: &GeminiArgsSpec) -
         if env_pos_set.contains(&i) {
             continue;
         }
-        if let Some(flag_name) = extract_flag_name_from_token(token) {
-            if cli_flag_names.contains(&flag_name) {
-                // Repeatable flags: keep env version (CLI will be appended)
-                if !lookup.repeatable_set.contains(&flag_name) {
-                    if !token.contains('=') && i + 1 < env_spec.clean_tokens.len() {
-                        let next = &env_spec.clean_tokens[i + 1];
-                        if !looks_like_flag(&next.to_lowercase()) {
-                            skip_next = true;
-                        }
+        if let Some(flag_name) = extract_flag_name_from_token(token)
+            && cli_flag_names.contains(&flag_name)
+        {
+            // Repeatable flags: keep env version (CLI will be appended)
+            if !lookup.repeatable_set.contains(&flag_name) {
+                if !token.contains('=') && i + 1 < env_spec.clean_tokens.len() {
+                    let next = &env_spec.clean_tokens[i + 1];
+                    if !looks_like_flag(&next.to_lowercase()) {
+                        skip_next = true;
                     }
-                    continue;
                 }
+                continue;
             }
         }
         merged.push(token.clone());
@@ -468,13 +442,7 @@ pub fn merge_gemini_args(env_spec: &GeminiArgsSpec, cli_spec: &GeminiArgsSpec) -
         merged.push(pos.clone());
     }
 
-    let mut combined = Vec::new();
-    if let Some(ref sub) = final_subcommand {
-        combined.push(sub.clone());
-    }
-    combined.extend(merged);
-
-    parse_tokens(&combined, SourceType::Cli)
+    parse_tokens(&merged, SourceType::Cli)
 }
 
 /// Check for conflicting flag combinations.
@@ -516,22 +484,22 @@ pub fn validate_conflicts(spec: &GeminiArgsSpec) -> Vec<String> {
             .push("ERROR: --prompt and --prompt-interactive cannot be used together".to_string());
     }
 
-    if let Some(FlagValue::Single(ref val)) = spec.get_flag_value("--approval-mode") {
-        if !["default", "auto_edit", "yolo", "plan"].contains(&val.to_lowercase().as_str()) {
-            warnings.push(format!(
-                "ERROR: invalid --approval-mode value '{}' (must be: default, auto_edit, yolo, plan)",
-                val
-            ));
-        }
+    if let Some(FlagValue::Single(ref val)) = spec.get_flag_value("--approval-mode")
+        && !["default", "auto_edit", "yolo", "plan"].contains(&val.to_lowercase().as_str())
+    {
+        warnings.push(format!(
+            "ERROR: invalid --approval-mode value '{}' (must be: default, auto_edit, yolo, plan)",
+            val
+        ));
     }
 
-    if let Some(FlagValue::Single(ref val)) = spec.get_flag_value("--output-format") {
-        if !["text", "json", "stream-json"].contains(&val.to_lowercase().as_str()) {
-            warnings.push(format!(
-                "ERROR: invalid --output-format value '{}' (must be: text, json, stream-json)",
-                val
-            ));
-        }
+    if let Some(FlagValue::Single(ref val)) = spec.get_flag_value("--output-format")
+        && !["text", "json", "stream-json"].contains(&val.to_lowercase().as_str())
+    {
+        warnings.push(format!(
+            "ERROR: invalid --output-format value '{}' (must be: text, json, stream-json)",
+            val
+        ));
     }
 
     warnings
@@ -555,7 +523,7 @@ fn parse_tokens_with_errors(
     let mut positional_indexes: Vec<usize> = Vec::new();
     let mut flag_values: HashMap<String, FlagValue> = HashMap::new();
 
-    let mut subcommand: Option<String> = None;
+    let subcommand: Option<String> = None;
     let mut is_headless = false;
     let mut is_json = false;
     let mut is_yolo = false;
@@ -566,16 +534,6 @@ fn parse_tokens_with_errors(
     let mut after_double_dash = false;
 
     let mut i: usize = 0;
-
-    // Check for subcommand as first token
-    if !raw_tokens.is_empty() {
-        let first_lower = raw_tokens[0].to_lowercase();
-        if SUBCOMMANDS.contains(&first_lower.as_str()) {
-            let normalized = subcommand_alias(&first_lower);
-            subcommand = Some(normalized.to_string());
-            i = 1;
-        }
-    }
 
     while i < raw_tokens.len() {
         let token = &raw_tokens[i];
@@ -666,13 +624,16 @@ fn parse_tokens_with_errors(
             continue;
         }
 
-        // Optional value flags (--resume, -r)
+        // Optional value flags (--resume, -r, --worktree, -w)
         if lookup.opt_val_set.contains(&token_lower) {
             clean.push(token.clone());
             if i + 1 < raw_tokens.len() {
                 let next = &raw_tokens[i + 1];
                 let next_lower = next.to_lowercase();
-                if !looks_like_flag(&next_lower) && looks_like_session_id(next) {
+                let value_allowed = token_lower == "-w"
+                    || token_lower == "--worktree"
+                    || looks_like_session_id(next);
+                if !looks_like_flag(&next_lower) && value_allowed {
                     flag_values.insert(token_lower.clone(), FlagValue::Single(next.clone()));
                     clean.push(next.clone());
                     i += 2;
@@ -881,21 +842,41 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_subcommand() {
-        let args = sv(&["mcp", "--model", "gemini-2.0"]);
+    fn test_parse_new_current_value_flags_not_positionals() {
+        let args = sv(&[
+            "--skip-trust",
+            "--acp",
+            "--policy",
+            "policy.json",
+            "--admin-policy=admin.json",
+            "--session-file",
+            "session.json",
+            "--session-id",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--worktree",
+            "branch-name",
+        ]);
         let spec = parse_tokens(&args, SourceType::Cli);
-        assert_eq!(spec.subcommand, Some("mcp".to_string()));
-        assert_eq!(
-            spec.get_flag_value("--model"),
-            Some(FlagValue::Single("gemini-2.0".to_string()))
-        );
-    }
 
-    #[test]
-    fn test_parse_subcommand_alias() {
-        let args = sv(&["extension"]);
-        let spec = parse_tokens(&args, SourceType::Cli);
-        assert_eq!(spec.subcommand, Some("extensions".to_string()));
+        assert!(spec.subcommand.is_none());
+        assert!(!spec.has_errors(), "{:?}", spec.errors);
+        assert!(spec.positional_tokens.is_empty());
+        assert!(spec.has_flag(&["--skip-trust"], &[]));
+        assert!(spec.has_flag(&["--acp"], &[]));
+        assert_eq!(
+            spec.get_flag_value("--session-file"),
+            Some(FlagValue::Single("session.json".to_string()))
+        );
+        assert_eq!(
+            spec.get_flag_value("--session-id"),
+            Some(FlagValue::Single(
+                "550e8400-e29b-41d4-a716-446655440000".to_string()
+            ))
+        );
+        assert_eq!(
+            spec.get_flag_value("--worktree"),
+            Some(FlagValue::Single("branch-name".to_string()))
+        );
     }
 
     #[test]
@@ -1074,16 +1055,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_tokens_with_subcommand() {
-        let args = sv(&["mcp", "--model", "gemini-2.0"]);
-        let spec = parse_tokens(&args, SourceType::Cli);
-        let tokens = spec.rebuild_tokens(true, true);
-        assert_eq!(tokens[0], "mcp");
-    }
-
-    #[test]
-    fn test_rebuild_tokens_without_subcommand() {
-        let args = sv(&["mcp", "--model", "gemini-2.0"]);
+    fn test_rebuild_tokens_ignores_subcommand_parameter() {
+        let args = sv(&["--model", "gemini-2.0"]);
         let spec = parse_tokens(&args, SourceType::Cli);
         let tokens = spec.rebuild_tokens(true, false);
         assert_eq!(tokens[0], "--model");

@@ -68,57 +68,55 @@ pub(crate) fn clean_temp_files() {
     let cutoff_30d = crate::shared::time::now_epoch_f64() - 30.0 * 86400.0;
 
     let launch_dir = base.join(LAUNCH_DIR);
-    if launch_dir.exists() {
-        if let Ok(rd) = fs::read_dir(&launch_dir) {
-            for entry in rd.filter_map(|e| e.ok()) {
-                if entry.path().is_file() {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            let secs = crate::shared::system_time_to_epoch_f64(mtime);
-                            if secs < cutoff_24h {
-                                let _ = fs::remove_file(entry.path());
-                            }
-                        }
-                    }
+    if launch_dir.exists()
+        && let Ok(rd) = fs::read_dir(&launch_dir)
+    {
+        for entry in rd.filter_map(|e| e.ok()) {
+            if entry.path().is_file()
+                && let Ok(meta) = entry.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                let secs = crate::shared::system_time_to_epoch_f64(mtime);
+                if secs < cutoff_24h {
+                    let _ = fs::remove_file(entry.path());
                 }
             }
         }
     }
 
     let prompts_dir = base.join(".tmp").join("prompts");
-    if prompts_dir.exists() {
-        if let Ok(rd) = fs::read_dir(&prompts_dir) {
-            for entry in rd.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            let secs = crate::shared::system_time_to_epoch_f64(mtime);
-                            if secs < cutoff_24h {
-                                let _ = fs::remove_file(path);
-                            }
-                        }
-                    }
+    if prompts_dir.exists()
+        && let Ok(rd) = fs::read_dir(&prompts_dir)
+    {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md")
+                && let Ok(meta) = entry.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                let secs = crate::shared::system_time_to_epoch_f64(mtime);
+                if secs < cutoff_24h {
+                    let _ = fs::remove_file(path);
                 }
             }
         }
     }
 
     let logs_dir = base.join(LOGS_DIR);
-    if logs_dir.exists() {
-        if let Ok(rd) = fs::read_dir(&logs_dir) {
-            for entry in rd.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.starts_with("background_") && name.ends_with(".log") {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(mtime) = meta.modified() {
-                            let secs = crate::shared::system_time_to_epoch_f64(mtime);
-                            if secs < cutoff_30d {
-                                let _ = fs::remove_file(path);
-                            }
-                        }
-                    }
+    if logs_dir.exists()
+        && let Ok(rd) = fs::read_dir(&logs_dir)
+    {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with("background_")
+                && name.ends_with(".log")
+                && let Ok(meta) = entry.metadata()
+                && let Ok(mtime) = meta.modified()
+            {
+                let secs = crate::shared::system_time_to_epoch_f64(mtime);
+                if secs < cutoff_30d {
+                    let _ = fs::remove_file(path);
                 }
             }
         }

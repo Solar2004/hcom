@@ -257,15 +257,15 @@ fn write_embedded_to_temp(name: &str, content: &str) -> std::io::Result<tempfile
 pub fn cmd_run(db: &HcomDb, args: &RunArgs, ctx: Option<&CommandContext>) -> i32 {
     // Re-inject --name for scripts that parse it themselves
     let mut argv = args.args.clone();
-    if let Some(ctx) = ctx {
-        if let Some(ref name) = ctx.explicit_name {
-            let canonical =
-                crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.clone());
-            argv = vec!["--name".to_string(), canonical]
-                .into_iter()
-                .chain(argv)
-                .collect();
-        }
+    if let Some(ctx) = ctx
+        && let Some(ref name) = ctx.explicit_name
+    {
+        let canonical =
+            crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.clone());
+        argv = vec!["--name".to_string(), canonical]
+            .into_iter()
+            .chain(argv)
+            .collect();
     }
 
     if argv.is_empty() {

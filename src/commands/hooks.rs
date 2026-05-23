@@ -30,7 +30,8 @@ fn get_tool_status() -> Vec<(&'static str, bool, String)> {
         .to_string_lossy()
         .to_string();
 
-    let codex_installed = crate::hooks::codex::verify_codex_hooks_installed(false);
+    let codex_installed = crate::hooks::codex::verify_codex_hooks_installed(false)
+        && crate::hooks::codex::codex_current_feature_enabled();
     let codex_path = crate::hooks::codex::get_codex_config_path()
         .to_string_lossy()
         .to_string();
@@ -114,7 +115,10 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions)
             }
             "gemini" => crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions),
-            "codex" => crate::hooks::codex::verify_codex_hooks_installed(include_permissions),
+            "codex" => {
+                crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
+                    && crate::hooks::codex::codex_current_feature_enabled()
+            }
             "opencode" => crate::hooks::opencode::verify_opencode_plugin_installed(),
             "kilocode" => crate::hooks::kilo::verify_kilocode_plugin_installed(),
             "cline" | "clinecode" => crate::hooks::cline::verify_cline_plugin_installed(),

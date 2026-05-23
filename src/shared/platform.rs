@@ -52,10 +52,10 @@ fn detect_termux() -> bool {
         return true;
     }
     // Fallback: PREFIX check
-    if let Ok(prefix) = env::var("PREFIX") {
-        if prefix.contains("com.termux") {
-            return true;
-        }
+    if let Ok(prefix) = env::var("PREFIX")
+        && prefix.contains("com.termux")
+    {
+        return true;
     }
     false
 }
@@ -69,10 +69,10 @@ pub fn shorten_path(path: &str) -> String {
         if path == home {
             return "~".to_string();
         }
-        if let Some(rest) = path.strip_prefix(home.as_str()) {
-            if rest.starts_with('/') {
-                return format!("~{rest}");
-            }
+        if let Some(rest) = path.strip_prefix(home.as_str())
+            && rest.starts_with('/')
+        {
+            return format!("~{rest}");
         }
     }
     path.to_string()

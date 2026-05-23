@@ -122,9 +122,9 @@ fn format_time(timestamp: f64) -> String {
 /// Get device short ID via FNV-1a hash
 /// Auto-creates device_id file if missing (via read_device_uuid).
 /// Returns "?" when the device_id file cannot be created or read — display only.
-fn get_device_short_id() -> String {
+fn get_device_short_id(db: &HcomDb) -> String {
     match crate::relay::read_device_uuid() {
-        Some(uuid) => crate::relay::device_short_id(&uuid),
+        Some(uuid) => crate::relay::device_short_id_for_db(db, &uuid),
         None => "?".to_string(),
     }
 }
@@ -211,7 +211,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         println!("Broker:    auto (public fallback)");
     }
 
-    println!("Device:    {}", get_device_short_id());
+    println!("Device:    {}", get_device_short_id(db));
 
     // Queued events
     let last_push_id: i64 = db
@@ -224,7 +224,11 @@ fn relay_status(db: &HcomDb) -> i32 {
     let queued: i64 = db
         .conn()
         .query_row(
-            "SELECT COUNT(*) FROM events WHERE id > ?1 AND instance NOT LIKE '%:%'",
+            "SELECT COUNT(*) FROM events
+             WHERE id > ?1
+             AND instance NOT LIKE '%:%'
+             AND instance != '_device'
+             AND json_extract(data, '$._relay') IS NULL",
             rusqlite::params![last_push_id],
             |r| r.get(0),
         )
@@ -274,13 +278,11 @@ fn relay_status(db: &HcomDb) -> i32 {
         "SELECT origin_device_id, COUNT(*) as cnt FROM instances \
          WHERE origin_device_id IS NOT NULL AND origin_device_id != '' \
          GROUP BY origin_device_id",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }) {
-            for row in rows.filter_map(|r| r.ok()) {
-                agent_counts.insert(row.0, row.1);
-            }
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        for row in rows.filter_map(|r| r.ok()) {
+            agent_counts.insert(row.0, row.1);
         }
     }
 
@@ -421,6 +423,7 @@ fn relay_notify_off_all(db: &HcomDb, config: &crate::config::HcomConfig) {
     let mut sent = 0usize;
     for short in &peers {
         if relay::control::send_one_way_control_ephemeral(
+            db,
             config,
             "relay_off",
             short,

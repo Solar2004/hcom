@@ -315,14 +315,13 @@ pub fn resolve_action(argv: &[String]) -> Action {
         };
     }
     // Numeric count + tool: `hcom 3 claude`
-    if cmd_token.parse::<u32>().is_ok() {
-        if let Some(second) = stripped.get(1) {
-            if is_launch_tool(second.as_str()) {
-                return Action::Launch {
-                    args: argv.to_vec(),
-                };
-            }
-        }
+    if cmd_token.parse::<u32>().is_ok()
+        && let Some(second) = stripped.get(1)
+        && is_launch_tool(second.as_str())
+    {
+        return Action::Launch {
+            args: argv.to_vec(),
+        };
     }
 
     // --new-terminal can appear after flags: `hcom --name foo --new-terminal`
@@ -411,10 +410,10 @@ fn is_config_dev_root_invocation(argv: &[String]) -> bool {
 }
 
 pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'static str)> {
-    if let Ok(r) = env::var("HCOM_DEV_ROOT") {
-        if !r.is_empty() {
-            return Some((PathBuf::from(r), "env"));
-        }
+    if let Ok(r) = env::var("HCOM_DEV_ROOT")
+        && !r.is_empty()
+    {
+        return Some((PathBuf::from(r), "env"));
     }
 
     read_dev_root_from_kv(db_path).map(|path| (path, "kv"))
@@ -496,10 +495,9 @@ pub fn dispatch() -> anyhow::Result<()> {
             action,
             Action::Command { .. } | Action::Launch { .. } | Action::Version | Action::Help
         )
+        && let Some(notice) = crate::update::get_update_notice()
     {
-        if let Some(notice) = crate::update::get_update_notice() {
-            eprintln!("{notice}");
-        }
+        eprintln!("{notice}");
     }
 
     match action {
@@ -758,16 +756,14 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     if crate::identity::requires_identity(cmd)
         && ctx.explicit_name.is_none()
         && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
+        && let Some(ref identity) = ctx.identity
+        && crate::instances::in_subagent_context(&db, &identity.name)
     {
-        if let Some(ref identity) = ctx.identity {
-            if crate::instances::in_subagent_context(&db, &identity.name) {
-                eprintln!(
-                    "Error: Subagent context active - explicit identity required\n\
+        eprintln!(
+            "Error: Subagent context active - explicit identity required\n\
                      Use: hcom {cmd} --name parent (for parent) or --name <uuid> (for subagent)"
-                );
-                return 1;
-            }
-        }
+        );
+        return 1;
     }
 
     // Set hookless command status (subagent/codex/adhoc)
@@ -910,14 +906,13 @@ mod tests {
     fn read_dev_root_from_kv_returns_stored_value() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
+        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2)",
+                rusqlite::params![DEV_ROOT_KV_KEY, "/tmp/dev-root"],
+            )
             .unwrap();
-        conn.execute(
-            "INSERT INTO kv (key, value) VALUES (?1, ?2)",
-            rusqlite::params![DEV_ROOT_KV_KEY, "/tmp/dev-root"],
-        )
-        .unwrap();
 
         assert_eq!(
             read_dev_root_from_kv(&db_path),
@@ -929,9 +924,7 @@ mod tests {
     fn read_dev_root_from_kv_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
-            .unwrap();
+        crate::db::HcomDb::open_at(&db_path).unwrap();
 
         assert_eq!(read_dev_root_from_kv(&db_path), None);
     }

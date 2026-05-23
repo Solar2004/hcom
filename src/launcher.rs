@@ -247,10 +247,10 @@ fn write_system_prompt_file(system_prompt: &str, tool: &str) -> String {
     let filepath = get_system_prompt_path(tool);
 
     // Only write if content differs
-    if let Ok(existing) = fs::read_to_string(&filepath) {
-        if existing == system_prompt {
-            return filepath.to_string_lossy().to_string();
-        }
+    if let Ok(existing) = fs::read_to_string(&filepath)
+        && existing == system_prompt
+    {
+        return filepath.to_string_lossy().to_string();
     }
 
     if let Err(e) = fs::write(&filepath, system_prompt) {
@@ -370,22 +370,34 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
             Ok(())
         }
         LaunchTool::Codex => {
-            if crate::hooks::codex::verify_codex_hooks_installed(include_permissions) {
+            if crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
+                && crate::hooks::codex::codex_current_feature_enabled()
+            {
                 return Ok(());
             }
             if let Err(e) = crate::hooks::codex::try_setup_codex_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[
-                        ("config_path", crate::hooks::codex::get_codex_config_path()),
-                        ("hooks_path", crate::hooks::codex::get_codex_hooks_path()),
-                    ],
-                );
-                bail!(
-                    "Failed to setup Codex hooks: {e}\n\
-                     Run: hcom hooks add codex\n\
-                     {diag}"
-                );
+                if matches!(e, crate::hooks::codex::SetupError::HookTrustFailed { .. }) {
+                    crate::log::log_warn(
+                        "codex",
+                        "codex.hook_trust_setup_warn",
+                        &format!(
+                            "Codex hook setup could not write trust state; launch preprocessing may fall back to hook-trust bypass: {e}"
+                        ),
+                    );
+                } else {
+                    let diag = install_diag_context(
+                        tool,
+                        &[
+                            ("config_path", crate::hooks::codex::get_codex_config_path()),
+                            ("hooks_path", crate::hooks::codex::get_codex_hooks_path()),
+                        ],
+                    );
+                    bail!(
+                        "Failed to setup Codex hooks: {e}\n\
+                         Run: hcom hooks add codex\n\
+                         {diag}"
+                    );
+                }
             }
             Ok(())
         }
@@ -478,21 +490,20 @@ pub fn create_runner_script(
     let mut path_dirs: Vec<String> = Vec::new();
 
     // Dev mode: prepend the worktree's Cargo output dir
-    if let Ok(dev_root) = std::env::var("HCOM_DEV_ROOT") {
-        if let Some(bin) = crate::shared::dev_root_binary(Path::new(&dev_root)) {
-            if let Some(dir) = bin.parent() {
-                path_dirs.push(dir.to_string_lossy().into_owned());
-            }
-        }
+    if let Ok(dev_root) = std::env::var("HCOM_DEV_ROOT")
+        && let Some(bin) = crate::shared::dev_root_binary(Path::new(&dev_root))
+        && let Some(dir) = bin.parent()
+    {
+        path_dirs.push(dir.to_string_lossy().into_owned());
     }
 
     for bin_name in &[tool, "hcom", "python3", "node"] {
-        if let Some(bin_path) = terminal::which_bin(bin_name) {
-            if let Some(dir) = Path::new(&bin_path).parent() {
-                let d = dir.to_string_lossy().to_string();
-                if !path_dirs.contains(&d) {
-                    path_dirs.push(d);
-                }
+        if let Some(bin_path) = terminal::which_bin(bin_name)
+            && let Some(dir) = Path::new(&bin_path).parent()
+        {
+            let d = dir.to_string_lossy().to_string();
+            if !path_dirs.contains(&d) {
+                path_dirs.push(d);
             }
         }
     }
@@ -783,6 +794,23 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // Ensure agents dir exists for per-agent prompts
     crate::agent_prompts::ensure_agents_dir().ok();
 
+    // HCOM_DIR placement: refuse if it sits under a tool-protected metadata
+    // directory. codex hard-denies apply_patch into these via
+    // FileSystemSandboxPolicy with no approval path; claude/gemini gate them
+    // behind permission prompts on every hcom write. Either way the user gets
+    // a broken session — fail fast at launch with a clear message instead.
+    let hcom_dir_path = paths::hcom_dir();
+    if let Some(protected) = paths::protected_hcom_dir_component(&hcom_dir_path) {
+        bail!(
+            "HCOM_DIR ({}) sits under a protected directory component '{}'.\n\
+             AI tools (codex/claude/gemini) deny writes under .git/.codex/.claude/.agents,\n\
+             which would block hcom DB writes from the launched agent.\n\
+             Set HCOM_DIR to a path outside these directories.",
+            hcom_dir_path.display(),
+            protected
+        );
+    }
+
     // Ensure hooks are installed (strict: refuse to launch without hooks)
     ensure_hooks_installed(&normalized)?;
 
@@ -846,11 +874,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     // System prompt file for Gemini/Codex
-    if let Some(ref sp) = params.system_prompt {
-        if normalized == LaunchTool::Gemini {
-            let path = write_system_prompt_file(sp, "gemini");
-            base_env.insert("GEMINI_SYSTEM_MD".to_string(), path);
-        }
+    if let Some(ref sp) = params.system_prompt
+        && normalized == LaunchTool::Gemini
+    {
+        let path = write_system_prompt_file(sp, "gemini");
+        base_env.insert("GEMINI_SYSTEM_MD".to_string(), path);
     }
 
     let working_dir = params.cwd.as_deref().unwrap_or(".");
@@ -975,10 +1003,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         };
 
         // Process ID export: allow custom env var name
-        if let Ok(export_var) = std::env::var("HCOM_PROCESS_ID_EXPORT") {
-            if !export_var.is_empty() {
-                instance_env.insert(export_var, process_id.clone());
-            }
+        if let Ok(export_var) = std::env::var("HCOM_PROCESS_ID_EXPORT")
+            && !export_var.is_empty()
+        {
+            instance_env.insert(export_var, process_id.clone());
         }
 
         // Name/process export vars
