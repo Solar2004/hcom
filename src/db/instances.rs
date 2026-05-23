@@ -801,6 +801,7 @@ impl HcomDb {
             "launch_args",
             "launch_context",
             "name_announced",
+            "project",
             "running_tasks",
             "idle_since",
             "terminal_preset_requested",
