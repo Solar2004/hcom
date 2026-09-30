@@ -331,11 +331,12 @@ fn migrate_placeholder_runtime_state(
     if let Some(pid) = ph.pid
         && let Ok(pid_u32) = u32::try_from(pid)
     {
+        // Carry the placeholder's stored identity (or its absence) over as-is:
+        // re-observing now could adopt an unrelated process that reused the PID.
         let update_result = match db.get_instance_pid_identity(&ph.name) {
-            Ok(Some(identity)) => {
-                db.update_instance_pid_with_identity(canonical_name, pid_u32, &identity)
+            Ok(identity) => {
+                db.update_instance_pid_with_identity(canonical_name, pid_u32, identity.as_deref())
             }
-            Ok(None) => db.update_instance_pid(canonical_name, pid_u32),
             Err(e) => {
                 crate::log::log_error(
                     "binding",
@@ -1934,7 +1935,7 @@ mod tests {
         mozi_data.insert("status_context".into(), serde_json::json!("new"));
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc", "", "mozi").unwrap();
-        db.update_instance_pid_with_identity("mozi", 4242, "spawn-incarnation")
+        db.update_instance_pid_with_identity("mozi", 4242, Some("spawn-incarnation"))
             .unwrap();
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-99"}"#)
             .unwrap();
@@ -1995,7 +1996,7 @@ mod tests {
         mozi_data.insert("status_context".into(), serde_json::json!("start"));
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc-ready", "", "mozi").unwrap();
-        db.update_instance_pid_with_identity("mozi", 4343, "ready-incarnation")
+        db.update_instance_pid_with_identity("mozi", 4343, Some("ready-incarnation"))
             .unwrap();
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-101"}"#)
             .unwrap();

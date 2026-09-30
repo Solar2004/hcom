@@ -35,6 +35,7 @@ pub use events::Message;
 pub use instances::InstanceRow;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;
+pub use instances::observe_pid_identity;
 
 /// Schema version - bump on any schema change.
 const SCHEMA_VERSION: i32 = 18;

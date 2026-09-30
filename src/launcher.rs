@@ -1397,23 +1397,25 @@ fn finalize_background_launch(
     );
     let updates =
         serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]);
-    let pid_identity = crate::sys::process::identity(pid);
-    let persist_result = match pid_identity.as_deref() {
-        Some(identity) => ctx.db.update_instance_pid_with_identity_and_fields(
-            ctx.instance_name,
-            pid,
-            identity,
-            &updates,
-        ),
-        None => Err(anyhow::anyhow!("process {pid} has no observable identity")),
-    };
+    let pid_identity = crate::db::observe_pid_identity(pid);
+    let persist_result = pid_identity
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .and_then(|identity| {
+            ctx.db.update_instance_pid_with_identity_and_fields(
+                ctx.instance_name,
+                pid,
+                identity.as_deref(),
+                &updates,
+            )
+        });
     if let Err(e) = persist_result {
         // Keep the log path as diagnostics even though PID ownership was not
         // established. Never kill by an unverified PID: it may already have
         // exited and been reused.
         let _ = ctx.db.update_instance_fields(ctx.instance_name, &updates);
-        if let Some(expected_identity) = pid_identity.as_deref()
-            && crate::sys::process::identity(pid).as_deref() == Some(expected_identity)
+        if let Ok(Some(expected_identity)) = pid_identity.as_ref()
+            && crate::sys::process::identity(pid).as_ref() == Some(expected_identity)
         {
             let _ = crate::sys::process::kill_group(pid);
         }
@@ -1423,7 +1425,7 @@ fn finalize_background_launch(
             &format!("instance={} pid={} err={}", ctx.instance_name, pid, e),
         );
         bail!(
-            "failed to persist background process identity for '{}': {}",
+            "failed to persist background process for '{}': {}",
             ctx.instance_name,
             e
         );

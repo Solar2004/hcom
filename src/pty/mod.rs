@@ -719,10 +719,13 @@ impl Proxy {
         if let Some(ref instance_name) = config.instance_name {
             let persist_result = (|| -> Result<()> {
                 let db = crate::db::HcomDb::open()?;
-                let identity = child_identity.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("spawned process {child_pid} has no observable identity")
-                })?;
-                db.update_instance_pid_with_identity(instance_name, child_pid, identity)?;
+                // Our unreaped child can't have been recycled, so a missing identity
+                // (unobservable on this platform) just means no reuse protection.
+                db.update_instance_pid_with_identity(
+                    instance_name,
+                    child_pid,
+                    child_identity.as_deref(),
+                )?;
 
                 // Capture minimal launch context early so kill can close the terminal pane.
                 // The start hook may later overwrite with richer context (git_branch, tty, env).
@@ -731,15 +734,12 @@ impl Proxy {
                 Ok(())
             })();
             if let Err(error) = persist_result {
-                if let Some(expected_identity) = child_identity.as_deref()
-                    && crate::sys::process::identity(child_pid).as_deref()
-                        == Some(expected_identity)
-                {
-                    let _ = crate::sys::process::kill_group(child_pid);
-                    let _ = child.kill();
-                }
+                // The child is still unreaped, so its PID (and the process group it
+                // leads after setsid) can't have been reused yet.
+                let _ = crate::sys::process::kill_group(child_pid);
+                let _ = child.kill();
                 let _ = child.wait();
-                return Err(error.context("failed to persist PTY process identity"));
+                return Err(error.context("failed to persist PTY process"));
             }
         }
 

@@ -165,7 +165,13 @@ impl Proxy {
                     .process_id()
                     .context("ConPTY child has no process id")?;
                 let db = HcomDb::open()?;
-                db.update_instance_pid(instance_name, pid)?;
+                // The child handle keeps this PID from being reused, so a missing
+                // identity only means no reuse protection for later cleanup.
+                db.update_instance_pid_with_identity(
+                    instance_name,
+                    pid,
+                    crate::sys::process::identity(pid).as_deref(),
+                )?;
 
                 // Capture minimal launch context early so kill can close the terminal pane.
                 // The start hook may later overwrite with richer context (git_branch, tty, env).
@@ -179,7 +185,7 @@ impl Proxy {
                 } else {
                     let _ = child.kill();
                 }
-                return Err(error.context("failed to persist ConPTY process identity"));
+                return Err(error.context("failed to persist ConPTY process"));
             }
         }
 

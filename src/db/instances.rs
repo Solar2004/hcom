@@ -138,6 +138,32 @@ pub(super) const INSTANCE_COLUMNS: &str =
      terminal_preset_requested, terminal_preset_effective,
      idle_since, pid, launch_context";
 
+/// Observe a live PID's process incarnation for storage.
+///
+/// Returns `Ok(None)` when the process is running but the platform can't report
+/// an identity (e.g. a sandbox hiding `/proc/sys/kernel/random/boot_id`): the
+/// PID is still tracked, just without PID-reuse protection, and cleanup falls
+/// back to plain liveness for that row. Only a PID that is already gone errors.
+pub fn observe_pid_identity(pid: u32) -> Result<Option<String>> {
+    // 0 and values that wrap negative as pid_t address process groups (or
+    // every process) in kill(), so liveness would be meaningless.
+    if pid == 0 || i32::try_from(pid).is_err() {
+        anyhow::bail!("invalid pid {pid}");
+    }
+    if let Some(identity) = crate::sys::process::identity(pid) {
+        return Ok(Some(identity));
+    }
+    if !crate::sys::process::is_alive(pid) {
+        anyhow::bail!("process {pid} is not running");
+    }
+    crate::log::log_warn(
+        "db",
+        "pid_identity.unavailable",
+        &format!("pid={pid} tracked without process identity"),
+    );
+    Ok(None)
+}
+
 impl HcomDb {
     /// Get instance status by name
     ///
@@ -220,30 +246,45 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Update instance PID after spawn, recording the exact process incarnation.
+    /// Update instance PID after spawn, recording the exact process incarnation
+    /// when the platform can observe it (see [`observe_pid_identity`]).
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
-        let pid_identity = crate::sys::process::identity(pid)
-            .ok_or_else(|| anyhow::anyhow!("process {pid} has no observable identity"))?;
-        self.update_instance_pid_with_identity(name, pid, &pid_identity)
+        let pid_identity = observe_pid_identity(pid)?;
+        self.update_instance_pid_with_identity(name, pid, pid_identity.as_deref())
     }
 
-    /// Update an instance PID while preserving an already-observed process incarnation.
+    /// Update an instance PID with an already-observed process incarnation.
+    /// `None` stores the PID without reuse protection and drops any stale
+    /// identity so it can't be mistaken for this process.
     pub fn update_instance_pid_with_identity(
         &self,
         name: &str,
         pid: u32,
-        pid_identity: &str,
+        pid_identity: Option<&str>,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE instances
-             SET pid = ?,
-                 launch_context = json_set(
-                     CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
-                     '$.pid_identity', ?
-                 )
-             WHERE name = ?",
-            params![pid as i64, pid_identity, name],
-        )?;
+        match pid_identity {
+            Some(pid_identity) => self.conn.execute(
+                "UPDATE instances
+                 SET pid = ?,
+                     launch_context = json_set(
+                         CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                         '$.pid_identity', ?
+                     )
+                 WHERE name = ?",
+                params![pid as i64, pid_identity, name],
+            )?,
+            None => self.conn.execute(
+                "UPDATE instances
+                 SET pid = ?,
+                     launch_context = CASE
+                         WHEN json_valid(launch_context)
+                         THEN json_remove(launch_context, '$.pid_identity')
+                         ELSE launch_context
+                     END
+                 WHERE name = ?",
+                params![pid as i64, name],
+            )?,
+        };
         Ok(())
     }
 
@@ -254,9 +295,13 @@ impl HcomDb {
         pid: u32,
         updates: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
-        let pid_identity = crate::sys::process::identity(pid)
-            .ok_or_else(|| anyhow::anyhow!("process {pid} has no observable identity"))?;
-        self.update_instance_pid_with_identity_and_fields(name, pid, &pid_identity, updates)
+        let pid_identity = observe_pid_identity(pid)?;
+        self.update_instance_pid_with_identity_and_fields(
+            name,
+            pid,
+            pid_identity.as_deref(),
+            updates,
+        )
     }
 
     /// Atomically persist an already-observed PID incarnation with related fields.
@@ -264,7 +309,7 @@ impl HcomDb {
         &self,
         name: &str,
         pid: u32,
-        pid_identity: &str,
+        pid_identity: Option<&str>,
         updates: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
         self.conn
@@ -1276,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_instance_pid_rejects_unobservable_process() {
+    fn test_update_instance_pid_rejects_process_that_is_gone() {
         let (db, db_path) = setup_full_test_db();
         db.conn
             .execute(
@@ -1294,6 +1339,38 @@ mod tests {
             .unwrap();
         assert_eq!(pid, None);
         assert_eq!(db.get_instance_pid_identity("luna").unwrap(), None);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_pid_without_observable_identity_is_tracked_and_drops_stale_identity() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, '{\"pane_id\":\"42\",\"pid_identity\":\"old\"}')",
+                [],
+            )
+            .unwrap();
+
+        // Platforms that can't report an identity must still record the PID
+        // (so launches don't fail), and must not keep a previous identity.
+        db.update_instance_pid_with_identity("luna", 4242, None)
+            .unwrap();
+
+        let (pid, launch_context): (Option<i64>, String) = db
+            .conn
+            .query_row(
+                "SELECT pid, launch_context FROM instances WHERE name = 'luna'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, Some(4242));
+        assert_eq!(db.get_instance_pid_identity("luna").unwrap(), None);
+        let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
+        assert_eq!(launch_context["pane_id"], "42");
 
         cleanup_test_db(db_path);
     }
@@ -1383,7 +1460,7 @@ mod tests {
             .unwrap()
             .expect("current process identity");
 
-        db.update_instance_pid_with_identity("luna", pid, "replacement-incarnation")
+        db.update_instance_pid_with_identity("luna", pid, Some("replacement-incarnation"))
             .unwrap();
         let event = serde_json::json!({"action": "stopped", "reason": "process_exit"});
         assert!(
