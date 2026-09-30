@@ -657,7 +657,7 @@ impl Proxy {
         // SAFETY: pre_exec closure runs in the child process after fork() but before exec().
         // All operations are async-signal-safe (setsid, ioctl, dup2, close).
         // slave_fd and master_fd are i32 (Copy), captured by value before the OwnedFds are moved.
-        let child = unsafe {
+        let mut child = unsafe {
             Command::new(command)
                 .args(args)
                 .envs(
@@ -714,14 +714,23 @@ impl Proxy {
         let startup_trace = shared::StartupTrace::new(spawned_at, config.instance_name.as_deref());
 
         // Write PID and launch context to database for hcom kill
-        if let Some(ref instance_name) = config.instance_name
-            && let Ok(db) = crate::db::HcomDb::open()
-        {
-            let _ = db.update_instance_pid(instance_name, child.id());
+        if let Some(ref instance_name) = config.instance_name {
+            let persist_result = (|| -> Result<()> {
+                let db = crate::db::HcomDb::open()?;
+                db.update_instance_pid(instance_name, child.id())?;
 
-            // Capture minimal launch context early so kill can close the terminal pane.
-            // The start hook may later overwrite with richer context (git_branch, tty, env).
-            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                // Capture minimal launch context early so kill can close the terminal pane.
+                // The start hook may later overwrite with richer context (git_branch, tty, env).
+                let _ =
+                    db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                Ok(())
+            })();
+            if let Err(error) = persist_result {
+                let _ = crate::sys::process::kill_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("failed to persist PTY process identity"));
+            }
         }
 
         // Close slave in parent

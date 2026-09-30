@@ -139,7 +139,7 @@ impl Proxy {
             cmd.cwd(crate::shared::platform::child_process_path(&cwd));
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .context("ConPTY spawn failed")?;
@@ -156,15 +156,28 @@ impl Proxy {
         let writer = pair.master.take_writer().context("take_writer failed")?;
 
         // Persist PID so `hcom kill` can target the agent.
-        if let Some(ref instance_name) = config.instance_name
-            && let Ok(db) = HcomDb::open()
-            && let Some(pid) = child.process_id()
-        {
-            let _ = db.update_instance_pid(instance_name, pid);
+        if let Some(ref instance_name) = config.instance_name {
+            let persist_result = (|| -> Result<()> {
+                let pid = child
+                    .process_id()
+                    .context("ConPTY child has no process id")?;
+                let db = HcomDb::open()?;
+                db.update_instance_pid(instance_name, pid)?;
 
-            // Capture minimal launch context early so kill can close the terminal pane.
-            // The start hook may later overwrite with richer context (git_branch, tty, env).
-            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                // Capture minimal launch context early so kill can close the terminal pane.
+                // The start hook may later overwrite with richer context (git_branch, tty, env).
+                let _ =
+                    db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                Ok(())
+            })();
+            if let Err(error) = persist_result {
+                if let Some(pid) = child.process_id() {
+                    let _ = crate::sys::process::kill_group(pid);
+                } else {
+                    let _ = child.kill();
+                }
+                return Err(error.context("failed to persist ConPTY process identity"));
+            }
         }
 
         // Tie the child to a kill-on-close job so its whole tree is reaped if we

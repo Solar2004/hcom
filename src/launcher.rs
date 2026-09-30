@@ -1387,7 +1387,7 @@ fn finalize_background_launch(
     log_file: String,
     pid: u32,
     effective_preset: String,
-) {
+) -> Result<()> {
     instance_binding::persist_terminal_launch_context(
         ctx.db,
         ctx.instance_name,
@@ -1401,10 +1401,16 @@ fn finalize_background_launch(
         .db
         .update_instance_pid_with_fields(ctx.instance_name, pid, &updates)
     {
+        let _ = crate::sys::process::kill_group(pid);
         crate::log::log_error(
             "launcher",
             "background.persist_pid",
             &format!("instance={} pid={} err={}", ctx.instance_name, pid, e),
+        );
+        bail!(
+            "failed to persist background process identity for '{}': {}",
+            ctx.instance_name,
+            e
         );
     }
     crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
@@ -1426,6 +1432,7 @@ fn finalize_background_launch(
         "log_file": log_file,
         "pid": pid,
     }));
+    Ok(())
 }
 
 fn launch_background_runner(
@@ -1492,7 +1499,7 @@ fn launch_pty_or_background(
             ctx.terminal_mode,
             inside_ai_tool,
         )?;
-        finalize_background_launch(ctx, log_file, pid, effective_preset);
+        finalize_background_launch(ctx, log_file, pid, effective_preset)?;
         Ok(true)
     } else {
         let effective_run_here = will_run_in_current_terminal(
@@ -2101,7 +2108,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                     log_file,
                                     pid,
                                     effective_preset,
-                                );
+                                )?;
                                 Ok(true)
                             }
                             _ => Ok(false),
