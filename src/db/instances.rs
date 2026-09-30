@@ -312,25 +312,10 @@ impl HcomDb {
         pid_identity: Option<&str>,
         updates: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<()> {
-        self.conn
-            .execute_batch("SAVEPOINT hcom_update_instance_pid_with_fields")?;
-        let result = (|| -> Result<()> {
+        self.with_write_scope(|| {
             self.update_instance_fields(name, updates)?;
             self.update_instance_pid_with_identity(name, pid, pid_identity)
-        })();
-
-        if let Err(error) = result {
-            let _ = self
-                .conn
-                .execute_batch("ROLLBACK TO hcom_update_instance_pid_with_fields");
-            let _ = self
-                .conn
-                .execute_batch("RELEASE hcom_update_instance_pid_with_fields");
-            return Err(error);
-        }
-        self.conn
-            .execute_batch("RELEASE hcom_update_instance_pid_with_fields")?;
-        Ok(())
+        })
     }
 
     /// Stored process incarnation for an instance PID.
@@ -369,8 +354,9 @@ impl HcomDb {
     /// currently missing or empty so late-bound PTY metadata can be persisted
     /// without clobbering richer hook-captured context.
     pub fn store_launch_context(&self, name: &str, context_json: &str) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
+        // A write scope rather than BEGIN IMMEDIATE so this also works inside a
+        // caller's transaction (e.g. placeholder migration during a tool bind).
+        self.with_write_scope(|| {
             let existing_json: Option<String> = self
                 .conn
                 .query_row(
@@ -424,18 +410,7 @@ impl HcomDb {
                 )?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Get instance tag (for display name computation).

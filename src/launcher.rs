@@ -1411,12 +1411,17 @@ fn finalize_background_launch(
         });
     if let Err(e) = persist_result {
         // Keep the log path as diagnostics even though PID ownership was not
-        // established. Never kill by an unverified PID: it may already have
-        // exited and been reused.
+        // established, and stop the untracked runner. Never kill by an
+        // unverified PID: it may already have exited and been reused. A runner
+        // that was alive but had no observable identity is still our unreaped
+        // child, so its PID can't have been recycled yet.
         let _ = ctx.db.update_instance_fields(ctx.instance_name, &updates);
-        if let Ok(Some(expected_identity)) = pid_identity.as_ref()
-            && crate::sys::process::identity(pid).as_ref() == Some(expected_identity)
-        {
+        let still_ours = match pid_identity.as_ref() {
+            Ok(Some(expected)) => crate::sys::process::identity(pid).as_ref() == Some(expected),
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if still_ours {
             let _ = crate::sys::process::kill_group(pid);
         }
         crate::log::log_error(

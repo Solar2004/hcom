@@ -180,11 +180,14 @@ impl Proxy {
                 Ok(())
             })();
             if let Err(error) = persist_result {
+                // We still hold the child's handle, so its PID can't have been
+                // reused. Kill the tree, then the child itself, and reap it so
+                // nothing outlives the failed launch (matches the Unix path).
                 if let Some(pid) = child.process_id() {
                     let _ = crate::sys::process::kill_group(pid);
-                } else {
-                    let _ = child.kill();
                 }
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(error.context("failed to persist ConPTY process"));
             }
         }

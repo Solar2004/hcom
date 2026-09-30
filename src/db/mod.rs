@@ -160,6 +160,31 @@ impl HcomDb {
         Ok(result)
     }
 
+    /// Run `f` atomically on this connection: in its own `BEGIN IMMEDIATE`
+    /// transaction when none is open, or in a savepoint nested inside the
+    /// caller's transaction. Any error rolls back every write made by `f`.
+    pub fn with_write_scope<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let own_transaction = self.conn.is_autocommit();
+        let (begin, commit, rollback) = if own_transaction {
+            ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
+        } else {
+            (
+                "SAVEPOINT hcom_write_scope",
+                "RELEASE hcom_write_scope",
+                "ROLLBACK TO hcom_write_scope; RELEASE hcom_write_scope",
+            )
+        };
+        self.conn.execute_batch(begin)?;
+        let result = f().and_then(|value| {
+            self.conn.execute_batch(commit)?;
+            Ok(value)
+        });
+        if result.is_err() {
+            let _ = self.conn.execute_batch(rollback);
+        }
+        result
+    }
+
     /// Access the filesystem path backing this DB handle.
     pub fn path(&self) -> &std::path::Path {
         &self.db_path

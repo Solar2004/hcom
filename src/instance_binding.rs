@@ -96,32 +96,42 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         "terminal_preset_effective",
         "pid_identity",
     ];
-    let mut ctx = new_ctx;
-
     let missing: Vec<&str> = preserve_keys
         .iter()
-        .filter(|k| launch_context_value_missing(ctx.get(**k)))
+        .filter(|k| launch_context_value_missing(new_ctx.get(**k)))
         .copied()
         .collect();
 
-    if !missing.is_empty()
-        && let Ok(Some(pos)) = db.get_instance_full(instance_name)
-        && let Some(old_json) = &pos.launch_context
-        && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
-    {
-        for k in &missing {
-            if let Some(val) = old_ctx.get(*k)
-                && !launch_context_value_missing(Some(val))
-            {
-                ctx.insert(k.to_string(), val.clone());
+    // Read-merge-write under one write lock: a concurrent PTY PID write must
+    // not be overwritten with a stale pid_identity (or lose its identity).
+    let result = db.with_write_scope(|| {
+        let mut ctx = new_ctx;
+        if !missing.is_empty()
+            && let Some(pos) = db.get_instance_full(instance_name)?
+            && let Some(old_json) = &pos.launch_context
+            && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
+        {
+            for k in &missing {
+                if let Some(val) = old_ctx.get(*k)
+                    && !launch_context_value_missing(Some(val))
+                {
+                    ctx.insert(k.to_string(), val.clone());
+                }
             }
         }
-    }
 
-    let json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
-    let mut updates = serde_json::Map::new();
-    updates.insert("launch_context".into(), serde_json::json!(json));
-    update_instance_position(db, instance_name, &updates);
+        let json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
+        let mut updates = serde_json::Map::new();
+        updates.insert("launch_context".into(), serde_json::json!(json));
+        db.update_instance_fields(instance_name, &updates)
+    });
+    if let Err(e) = result {
+        crate::log::log_error(
+            "binding",
+            "capture_launch_context",
+            &format!("instance={instance_name} err={e}"),
+        );
+    }
 }
 
 /// "Missing" for the preserve-from-prior-context check. Treats absent, JSON
@@ -328,36 +338,27 @@ fn migrate_placeholder_runtime_state(
     let Some(ph) = placeholder_data else {
         return true;
     };
-    if let Some(pid) = ph.pid
-        && let Ok(pid_u32) = u32::try_from(pid)
-    {
-        // Carry the placeholder's stored identity (or its absence) over as-is:
-        // re-observing now could adopt an unrelated process that reused the PID.
-        let update_result = match db.get_instance_pid_identity(&ph.name) {
-            Ok(identity) => {
-                db.update_instance_pid_with_identity(canonical_name, pid_u32, identity.as_deref())
-            }
-            Err(e) => {
-                crate::log::log_error(
-                    "binding",
-                    "placeholder.read_pid_identity",
-                    &format!("placeholder={} err={e}", ph.name),
-                );
-                return false;
-            }
-        };
-        if let Err(e) = update_result {
-            crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
-            return false;
+    // PID and launch context move together: a PID copied without its context
+    // (or vice versa) would leave both rows claiming the same process.
+    let result = db.with_write_scope(|| {
+        if let Some(pid) = ph.pid
+            && let Ok(pid_u32) = u32::try_from(pid)
+        {
+            // Carry the placeholder's stored identity (or its absence) over as-is:
+            // re-observing now could adopt an unrelated process that reused the PID.
+            let identity = db.get_instance_pid_identity(&ph.name)?;
+            db.update_instance_pid_with_identity(canonical_name, pid_u32, identity.as_deref())?;
         }
-    }
-    if let Some(ref ctx) = ph.launch_context
-        && let Err(e) = db.store_launch_context(canonical_name, ctx)
-    {
+        if let Some(ref ctx) = ph.launch_context {
+            db.store_launch_context(canonical_name, ctx)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
         crate::log::log_error(
             "binding",
-            "placeholder.migrate_launch_context",
-            &format!("{e}"),
+            "placeholder.migrate_runtime_state",
+            &format!("placeholder={} canonical={canonical_name} err={e}", ph.name),
         );
         return false;
     }
@@ -474,9 +475,37 @@ pub fn bind_session_to_process(
     session_id: &str,
     process_id: Option<&str>,
 ) -> Option<String> {
+    bind_session_to_process_checked(db, session_id, process_id).unwrap_or(None)
+}
+
+/// Like [`bind_session_to_process`], but distinguishes "nothing to bind"
+/// (`Ok(None)`) from a failed PID/launch-context migration (`Err`). On `Err`
+/// every write the bind made (session rebind, placeholder retirement, ...) has
+/// been rolled back, so ownership stays with the placeholder.
+fn bind_session_to_process_checked(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let result = db.with_write_scope(|| bind_session_to_process_inner(db, session_id, process_id));
+    if let Err(ref e) = result {
+        crate::log::log_error(
+            "binding",
+            "bind_session_to_process.rolled_back",
+            &format!("session_id={session_id} process_id={process_id:?} err={e}"),
+        );
+    }
+    result
+}
+
+fn bind_session_to_process_inner(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: Option<&str>,
+) -> anyhow::Result<Option<String>> {
     if session_id.is_empty() {
         crate::log::log_info("binding", "bind_session_to_process.no_session_id", "");
-        return None;
+        return Ok(None);
     }
 
     crate::log::log_info(
@@ -597,7 +626,7 @@ pub fn bind_session_to_process(
         update_instance_position(db, canonical_name, &resume_updates);
 
         if !ownership_migrated {
-            return None;
+            anyhow::bail!("placeholder runtime state was not migrated");
         }
         if let Some(pid) = process_id
             && let Err(e) = db.set_process_binding(pid, session_id, canonical_name)
@@ -609,7 +638,7 @@ pub fn bind_session_to_process(
             );
         }
 
-        return Some(canonical_name.clone());
+        return Ok(Some(canonical_name.clone()));
     }
 
     // Path 2: session_bindings CASCADE'd on delete — recover canonical name from life.stopped
@@ -636,7 +665,7 @@ pub fn bind_session_to_process(
                 "restore_stopped.no_instance",
                 &format!("stopped_name={stopped_name}, session_id={session_id}"),
             );
-            return None;
+            return Ok(None);
         }
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
@@ -666,7 +695,7 @@ pub fn bind_session_to_process(
         }
 
         if !ownership_migrated {
-            return None;
+            anyhow::bail!("placeholder runtime state was not migrated");
         }
         if let Some(pid) = process_id
             && let Err(e) = db.set_process_binding(pid, session_id, &stopped_name)
@@ -678,7 +707,7 @@ pub fn bind_session_to_process(
             );
         }
 
-        return Some(stopped_name);
+        return Ok(Some(stopped_name));
     }
 
     // Path 3: No canonical, but placeholder exists — bind session to placeholder
@@ -714,11 +743,11 @@ pub fn bind_session_to_process(
             );
         }
 
-        return Some(ph_name.clone());
+        return Ok(Some(ph_name.clone()));
     }
 
     crate::log::log_info("binding", "bind_session_to_process.return_none", "");
-    None
+    Ok(None)
 }
 
 /// Bind a session without allowing a hook from one tool to adopt another
@@ -837,13 +866,16 @@ pub fn bind_session_to_process_for_tool(
         }
     }
 
-    let bound = bind_session_to_process(db, session_id, process_id).or_else(|| {
-        if create_if_unbound {
+    // A failed migration must not fall through to orphan creation: reject so
+    // the transaction drops and ownership stays where it was.
+    let bound = match bind_session_to_process_checked(db, session_id, process_id) {
+        Ok(Some(name)) => Some(name),
+        Ok(None) if create_if_unbound => {
             create_orphaned_pty_identity(db, session_id, process_id, expected_tool)
-        } else {
-            None
         }
-    });
+        Ok(None) => None,
+        Err(_) => return ToolCheckedBind::Rejected,
+    };
     if let Some(ref name) = bound {
         let tool = db
             .get_instance_full(name)
@@ -1959,6 +1991,61 @@ mod tests {
                 .contains("kitty-99"),
             "launch_context not migrated: {:?}",
             fano.launch_context
+        );
+
+        cleanup(path);
+    }
+
+    /// The tool-checked bind (Kimi) runs inside a transaction; migrating the
+    /// placeholder's launch_context must not need its own top-level one, or the
+    /// stopped identity is abandoned for a fresh orphan.
+    #[test]
+    #[serial]
+    fn test_tool_checked_restore_stopped_migrates_launch_context_inside_transaction() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("kimi"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-kimi", "tool": "kimi" })),
+        )
+        .unwrap();
+
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("kimi"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-kimi", "", "mozi").unwrap();
+        db.update_instance_pid_with_identity("mozi", 4242, Some("spawn-incarnation"))
+            .unwrap();
+        db.store_launch_context("mozi", r#"{"pane_id":"kitty-7"}"#)
+            .unwrap();
+
+        let result =
+            bind_session_to_process_for_tool(&db, "ses-kimi", Some("pid-kimi"), "kimi", true);
+        assert_eq!(result, ToolCheckedBind::Bound("fano".to_string()));
+
+        assert!(db.get_instance_full("mozi").unwrap().is_none());
+        let fano = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(fano.pid, Some(4242));
+        assert!(
+            fano.launch_context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kitty-7")
         );
 
         cleanup(path);
