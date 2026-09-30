@@ -150,6 +150,9 @@ impl Proxy {
             spawned_at.duration_since(spawn_started),
             command,
         );
+        // Install descendant cleanup immediately. Any later setup failure must
+        // still reap the spawned process tree.
+        let job = child.process_id().and_then(job::KillOnDropJob::assign);
         // The parent does not need the slave handle once the child holds it.
         drop(pair.slave);
 
@@ -179,10 +182,6 @@ impl Proxy {
                 return Err(error.context("failed to persist ConPTY process identity"));
             }
         }
-
-        // Tie the child to a kill-on-close job so its whole tree is reaped if we
-        // die abnormally (the explicit snapshot-kill in Drop covers clean exit).
-        let job = child.process_id().and_then(job::KillOnDropJob::assign);
 
         let initial_name = config.instance_name.clone().unwrap_or_default();
 

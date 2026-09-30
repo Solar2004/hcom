@@ -1348,49 +1348,50 @@ fn stop_instance_inner(
         }
     };
 
-    // Finish children first while the parent row keeps the teardown retryable.
-    // Concurrent callers may repeat this work; every child has its own atomic
-    // event/delete gate.
-    for sub_name in session_subagents {
-        if let StopOutcome::RetryableError(error) = stop_instance_inner(
-            db,
-            &sub_name,
-            initiated_by,
-            "parent_stopped",
-            false,
-            depth + 1,
-            None,
-        ) {
-            log::log_warn(
-                "hooks",
-                "finalize.child_stop_incomplete",
-                &format!("parent={instance_name} child={sub_name} err={error}"),
-            );
-            return StopOutcome::RetryableError(format!(
-                "could not stop child {sub_name}: {error}"
-            ));
+    // A guarded stale-stop must win its PID-incarnation CAS before causing
+    // side effects in child rows. An unguarded stop keeps the historical
+    // children-first behavior so a child failure leaves the parent retryable.
+    if pid_guard.is_none() {
+        for sub_name in &session_subagents {
+            if let StopOutcome::RetryableError(error) = stop_instance_inner(
+                db,
+                sub_name,
+                initiated_by,
+                "parent_stopped",
+                false,
+                depth + 1,
+                None,
+            ) {
+                log::log_warn(
+                    "hooks",
+                    "finalize.child_stop_incomplete",
+                    &format!("parent={instance_name} child={sub_name} err={error}"),
+                );
+                return StopOutcome::RetryableError(format!(
+                    "could not stop child {sub_name}: {error}"
+                ));
+            }
         }
-    }
 
-    // Native subagent rows carry session_id=NULL and inherit the root session
-    // as parent_session_id, so only parent_name links nested children. A row
-    // already stopped via the session set is a no-op here.
-    for child in native_children {
-        if let StopOutcome::RetryableError(error) = stop_instance_inner(
-            db,
-            &child,
-            initiated_by,
-            "parent_stopped",
-            false,
-            depth + 1,
-            None,
-        ) {
-            log::log_warn(
-                "hooks",
-                "finalize.child_stop_incomplete",
-                &format!("parent={instance_name} child={child} err={error}"),
-            );
-            return StopOutcome::RetryableError(format!("could not stop child {child}: {error}"));
+        for child in &native_children {
+            if let StopOutcome::RetryableError(error) = stop_instance_inner(
+                db,
+                child,
+                initiated_by,
+                "parent_stopped",
+                false,
+                depth + 1,
+                None,
+            ) {
+                log::log_warn(
+                    "hooks",
+                    "finalize.child_stop_incomplete",
+                    &format!("parent={instance_name} child={child} err={error}"),
+                );
+                return StopOutcome::RetryableError(format!(
+                    "could not stop child {child}: {error}"
+                ));
+            }
         }
     }
 
@@ -1436,6 +1437,26 @@ fn stop_instance_inner(
             return StopOutcome::RetryableError(format!(
                 "could not finalize stop for {instance_name}: {e}"
             ));
+        }
+    }
+
+    if pid_guard.is_some() {
+        for child in session_subagents.iter().chain(native_children.iter()) {
+            if let StopOutcome::RetryableError(error) = stop_instance_inner(
+                db,
+                child,
+                initiated_by,
+                "parent_stopped",
+                false,
+                depth + 1,
+                None,
+            ) {
+                log::log_warn(
+                    "hooks",
+                    "finalize.child_stop_incomplete",
+                    &format!("parent={instance_name} child={child} err={error}"),
+                );
+            }
         }
     }
 

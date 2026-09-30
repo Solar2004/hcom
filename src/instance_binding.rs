@@ -324,9 +324,9 @@ fn migrate_placeholder_runtime_state(
     db: &HcomDb,
     canonical_name: &str,
     placeholder_data: Option<&InstanceRow>,
-) {
+) -> bool {
     let Some(ph) = placeholder_data else {
-        return;
+        return true;
     };
     if let Some(pid) = ph.pid
         && let Ok(pid_u32) = u32::try_from(pid)
@@ -342,11 +342,12 @@ fn migrate_placeholder_runtime_state(
                     "placeholder.read_pid_identity",
                     &format!("placeholder={} err={e}", ph.name),
                 );
-                return;
+                return false;
             }
         };
         if let Err(e) = update_result {
             crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
+            return false;
         }
     }
     if let Some(ref ctx) = ph.launch_context
@@ -357,7 +358,9 @@ fn migrate_placeholder_runtime_state(
             "placeholder.migrate_launch_context",
             &format!("{e}"),
         );
+        return false;
     }
+    true
 }
 
 fn delete_true_placeholder_if_migrated(
@@ -369,8 +372,9 @@ fn delete_true_placeholder_if_migrated(
     if is_true_launch_placeholder(placeholder_data) {
         // Move pid/launch_context to the canonical row before dropping the placeholder
         // so the restored agent stays killable and its pane closeable.
-        migrate_placeholder_runtime_state(db, canonical_name, placeholder_data);
-        delete_true_placeholder_instance(db, placeholder_name);
+        if migrate_placeholder_runtime_state(db, canonical_name, placeholder_data) {
+            delete_true_placeholder_instance(db, placeholder_name);
+        }
     }
 }
 
@@ -408,7 +412,9 @@ fn retire_switched_identity(
     new_name: &str,
     old_data: Option<&InstanceRow>,
 ) {
-    migrate_placeholder_runtime_state(db, new_name, old_data);
+    if !migrate_placeholder_runtime_state(db, new_name, old_data) {
+        return;
+    }
     if let Err(e) = db.clear_instance_pid(name) {
         crate::log::log_error("binding", "session_switch.clear_pid", &format!("{e}"));
     }

@@ -1397,11 +1397,26 @@ fn finalize_background_launch(
     );
     let updates =
         serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]);
-    if let Err(e) = ctx
-        .db
-        .update_instance_pid_with_fields(ctx.instance_name, pid, &updates)
-    {
-        let _ = crate::sys::process::kill_group(pid);
+    let pid_identity = crate::sys::process::identity(pid);
+    let persist_result = match pid_identity.as_deref() {
+        Some(identity) => ctx.db.update_instance_pid_with_identity_and_fields(
+            ctx.instance_name,
+            pid,
+            identity,
+            &updates,
+        ),
+        None => Err(anyhow::anyhow!("process {pid} has no observable identity")),
+    };
+    if let Err(e) = persist_result {
+        // Keep the log path as diagnostics even though PID ownership was not
+        // established. Never kill by an unverified PID: it may already have
+        // exited and been reused.
+        let _ = ctx.db.update_instance_fields(ctx.instance_name, &updates);
+        if let Some(expected_identity) = pid_identity.as_deref()
+            && crate::sys::process::identity(pid).as_deref() == Some(expected_identity)
+        {
+            let _ = crate::sys::process::kill_group(pid);
+        }
         crate::log::log_error(
             "launcher",
             "background.persist_pid",

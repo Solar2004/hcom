@@ -256,12 +256,22 @@ impl HcomDb {
     ) -> Result<()> {
         let pid_identity = crate::sys::process::identity(pid)
             .ok_or_else(|| anyhow::anyhow!("process {pid} has no observable identity"))?;
+        self.update_instance_pid_with_identity_and_fields(name, pid, &pid_identity, updates)
+    }
 
+    /// Atomically persist an already-observed PID incarnation with related fields.
+    pub fn update_instance_pid_with_identity_and_fields(
+        &self,
+        name: &str,
+        pid: u32,
+        pid_identity: &str,
+        updates: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
         self.conn
             .execute_batch("SAVEPOINT hcom_update_instance_pid_with_fields")?;
         let result = (|| -> Result<()> {
             self.update_instance_fields(name, updates)?;
-            self.update_instance_pid_with_identity(name, pid, &pid_identity)
+            self.update_instance_pid_with_identity(name, pid, pid_identity)
         })();
 
         if let Err(error) = result {

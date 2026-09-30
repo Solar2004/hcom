@@ -780,6 +780,7 @@ pub fn cleanup_stale_instances(
             // or records an unrelated recycled process.
             if data.status != ST_INACTIVE
                 && data.status != ST_LAUNCHING
+                && !crate::instances::is_launching_placeholder(data)
                 && data.origin_device_id.is_none()
                 && let Some(pid) = data.pid.and_then(|pid| u32::try_from(pid).ok())
                 && let Ok(Some(expected_identity)) = db.get_instance_pid_identity(&data.name)
@@ -871,9 +872,17 @@ pub fn cleanup_stale_instances(
                 continue;
             }
 
-            if crate::hooks::common::stop_instance(db, &data.name, "system", reason)
-                == crate::hooks::common::StopOutcome::Stopped
+            let stop_outcome = if reason != "exit_cleanup"
+                && let Some(pid) = data.pid.and_then(|pid| u32::try_from(pid).ok())
+                && let Ok(Some(identity)) = db.get_instance_pid_identity(&data.name)
             {
+                crate::hooks::common::stop_instance_if_pid_identity(
+                    db, &data.name, "system", reason, pid, &identity,
+                )
+            } else {
+                crate::hooks::common::stop_instance(db, &data.name, "system", reason)
+            };
+            if stop_outcome == crate::hooks::common::StopOutcome::Stopped {
                 deleted += 1;
             }
         }
@@ -1020,6 +1029,35 @@ mod tests {
 
         assert_eq!(deleted, 1);
         assert!(!instance_exists(&db, "recycled"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_cleanup_spares_launch_placeholder_with_dead_provisional_pid() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, status, status_context, status_time, created_at, pid, launch_context)
+                 VALUES ('launching', 'codex', 'pending', 'new', ?, ?, ?, ?)",
+                rusqlite::params![
+                    now,
+                    now as f64,
+                    DEAD_PID,
+                    r#"{"pid_identity":"provisional-launcher"}"#
+                ],
+            )
+            .unwrap();
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 0);
+        assert!(
+            instance_exists(&db, "launching"),
+            "startup cleanup must not retire a launch placeholder before PTY binding"
+        );
         cleanup(path);
     }
 
