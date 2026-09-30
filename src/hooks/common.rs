@@ -1412,8 +1412,7 @@ fn stop_instance_inner(
             instance_data.created_at,
             instance_data.session_id.as_deref(),
             instance_data.agent_id.as_deref(),
-            expected_pid,
-            expected_identity,
+            (expected_pid, expected_identity),
             &event_data,
         )
     } else {

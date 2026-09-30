@@ -511,8 +511,7 @@ impl HcomDb {
         created_at: f64,
         session_id: Option<&str>,
         agent_id: Option<&str>,
-        pid: u32,
-        pid_identity: &str,
+        pid_guard: (u32, &str),
         event_data: &serde_json::Value,
     ) -> Result<bool> {
         self.finalize_instance_stop_inner(
@@ -520,7 +519,7 @@ impl HcomDb {
             created_at,
             session_id,
             agent_id,
-            Some((pid, pid_identity)),
+            Some(pid_guard),
             event_data,
         )
     }
@@ -1383,8 +1382,7 @@ mod tests {
                 1.0,
                 None,
                 None,
-                pid,
-                &original_identity,
+                (pid, &original_identity),
                 &event,
             )
             .unwrap()
