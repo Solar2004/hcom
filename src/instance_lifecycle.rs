@@ -773,7 +773,7 @@ fn reap_if_process_gone(db: &HcomDb, data: &crate::db::InstanceRow) -> Option<bo
         return None;
     }
     let pid = data.pid.and_then(|pid| u32::try_from(pid).ok())?;
-    let expected_identity = db.get_instance_pid_identity(&data.name).ok()??;
+    let expected_identity = data.pid_identity()?;
     let current_identity = crate::sys::process::identity(pid);
     let original_process_gone = match current_identity.as_deref() {
         Some(current) => current != expected_identity,
@@ -930,7 +930,7 @@ pub fn cleanup_stale_instances(
 
             let stop_outcome = if reason != "exit_cleanup"
                 && let Some(pid) = data.pid.and_then(|pid| u32::try_from(pid).ok())
-                && let Ok(Some(identity)) = db.get_instance_pid_identity(&data.name)
+                && let Some(identity) = data.pid_identity()
             {
                 crate::hooks::common::stop_instance_if_pid_identity(
                     db, &data.name, "system", reason, pid, &identity,
@@ -1212,21 +1212,26 @@ mod tests {
         let _guard = wake_test_guard();
         let (db, path) = setup_test_db();
         let pid = std::process::id();
+        let row = |name: &str| db.get_instance_full(name).unwrap().unwrap();
 
         insert_stale_active(&db, "mine", 0, 0, pid as i64);
         db.update_instance_pid("mine", pid).unwrap();
-        assert!(!db.instance_pid_reused("mine", pid));
+        assert!(!row("mine").pid_reused(pid));
 
         insert_with_identity(&db, "reused", pid, "previous-boot-process");
-        assert!(db.instance_pid_reused("reused", pid));
+        let reused = row("reused");
+        assert!(reused.pid_reused(pid));
+        // Decided from the snapshot: deleting the row doesn't change it.
+        db.delete_instance("reused").unwrap();
+        assert!(reused.pid_reused(pid));
 
         // Gone is not reused: its group/pane may still need cleanup.
         insert_with_identity(&db, "gone", DEAD_PID as u32, "exited-process");
-        assert!(!db.instance_pid_reused("gone", DEAD_PID as u32));
+        assert!(!row("gone").pid_reused(DEAD_PID as u32));
 
         // No stored identity: can't tell, behave as before identities existed.
         insert_stale_active(&db, "legacy", 0, 0, pid as i64);
-        assert!(!db.instance_pid_reused("legacy", pid));
+        assert!(!row("legacy").pid_reused(pid));
         cleanup(path);
     }
 
@@ -1265,9 +1270,24 @@ mod tests {
 
         crate::hooks::common::stop_instance(&db, "runner", "test", "killed");
 
+        // The orphaned child is reaped by PID 1; where that is slow (minimal
+        // containers) a terminated child lingers as a zombie, which kill(0)
+        // still reports. Count a zombie as gone.
+        let running = |pid: u32| {
+            crate::sys::process::is_alive(pid)
+                && std::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output()
+                    .map(|o| {
+                        !String::from_utf8_lossy(&o.stdout)
+                            .trim_start()
+                            .starts_with('Z')
+                    })
+                    .unwrap_or(true)
+        };
         let mut child_gone = false;
         for _ in 0..30 {
-            if !crate::sys::process::is_alive(child_pid) {
+            if !running(child_pid) {
                 child_gone = true;
                 break;
             }

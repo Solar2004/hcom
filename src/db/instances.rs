@@ -138,6 +138,28 @@ pub(super) const INSTANCE_COLUMNS: &str =
      terminal_preset_requested, terminal_preset_effective,
      idle_since, pid, launch_context";
 
+impl InstanceRow {
+    /// Process identity recorded with this snapshot's PID, if any.
+    pub fn pid_identity(&self) -> Option<String> {
+        let ctx: serde_json::Value = serde_json::from_str(self.launch_context.as_deref()?).ok()?;
+        ctx.get("pid_identity")?.as_str().map(str::to_string)
+    }
+
+    /// Whether a *different* live process now holds `pid` (the identity in
+    /// this snapshot no longer matches), so it must not be signalled on this
+    /// instance's behalf. Checked against the snapshot, not a fresh read, so
+    /// a concurrent delete of the row can't turn a reused PID into "unknown".
+    /// A PID that is simply gone is not "reused": its process group can
+    /// outlive the leader, and a PID isn't recycled while that group exists,
+    /// so group signals and pane cleanup stay safe there. Rows without a
+    /// stored identity can't tell and report `false`, as before identities.
+    pub fn pid_reused(&self, pid: u32) -> bool {
+        self.pid_identity().is_some_and(|expected| {
+            crate::sys::process::identity(pid).is_some_and(|current| current != expected)
+        })
+    }
+}
+
 /// Observe a live PID's process incarnation for storage.
 ///
 /// Returns `Ok(None)` when the process is running but the platform can't report
@@ -316,22 +338,6 @@ impl HcomDb {
             self.update_instance_fields(name, updates)?;
             self.update_instance_pid_with_identity(name, pid, pid_identity)
         })
-    }
-
-    /// Whether a *different* live process now holds this instance's PID
-    /// (stored identity mismatch), so it must not be signalled on the
-    /// instance's behalf. A PID that is simply gone is not "reused": its
-    /// process group can outlive the leader, and a PID isn't recycled while
-    /// that group exists, so group signals and pane cleanup stay safe there.
-    /// Rows without a stored identity can't tell and report `false`, as
-    /// before identities existed.
-    pub fn instance_pid_reused(&self, name: &str, pid: u32) -> bool {
-        match self.get_instance_pid_identity(name) {
-            Ok(Some(expected)) => {
-                crate::sys::process::identity(pid).is_some_and(|current| current != expected)
-            }
-            _ => false,
-        }
     }
 
     /// Stored process incarnation for an instance PID.

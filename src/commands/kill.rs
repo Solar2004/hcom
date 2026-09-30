@@ -724,7 +724,7 @@ fn kill_instance(
     // The PID now belongs to an unrelated process (reboot, crash): don't
     // signal it or resolve a pane through it. A merely dead PID falls through
     // so its group and pane are still cleaned up.
-    if db.instance_pid_reused(name, pid) {
+    if instance.pid_reused(pid) {
         log_info(
             "kill",
             "lifecycle.kill_pid_reused",

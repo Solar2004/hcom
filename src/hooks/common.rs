@@ -1203,7 +1203,7 @@ fn stop_instance_inner(
     // children it left behind.
     if pid_guard.is_none()
         && let Some(pid_val) = pid
-        && !db.instance_pid_reused(instance_name, pid_val as u32)
+        && !instance_data.pid_reused(pid_val as u32)
     {
         let pid_u32 = pid_val as u32;
         if is_headless {
