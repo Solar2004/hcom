@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::db::HcomDb;
 
@@ -21,7 +21,7 @@ pub struct TermArgs {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
-use crate::instances::resolve_display_name;
+use crate::identity::resolve_display_name;
 use crate::paths::hcom_dir;
 use crate::shared::CommandContext;
 
@@ -30,7 +30,11 @@ fn flag_path() -> PathBuf {
     hcom_dir().join(".tmp").join("pty_debug_on")
 }
 
-/// Look up inject port for an instance from notify_endpoints table.
+/// Look up inject port for an instance.
+///
+/// The inject port is a bidirectional RPC server (input bytes / `\x00SCREEN\n`
+/// query) — it shares the `notify_endpoints` table with wake endpoints but
+/// uses a different protocol. See `crate::notify::WakeKind` for the wake kinds.
 fn get_inject_port(db: &HcomDb, instance_name: &str) -> Option<i32> {
     db.conn()
         .query_row(
@@ -41,7 +45,11 @@ fn get_inject_port(db: &HcomDb, instance_name: &str) -> Option<i32> {
         .ok()
 }
 
-/// Get all instances that have inject ports registered.
+/// Get all instances that have an inject port registered.
+///
+/// Returns `(instance_name, inject_port)` pairs. An inject port means the
+/// instance is running a PTY screen-query RPC server (registered by the PTY
+/// manager); having one is the queryable-via-`hcom term` signal.
 fn get_pty_instances(db: &HcomDb) -> Vec<(String, i32)> {
     let mut stmt = match db
         .conn()
@@ -59,6 +67,21 @@ fn get_pty_instances(db: &HcomDb) -> Vec<(String, i32)> {
     .unwrap_or_default()
 }
 
+/// Why `name` has no screen to read or inject into.
+fn no_terminal_error(db: &HcomDb, name: &str) -> String {
+    match db.get_instance_full(name) {
+        Ok(Some(inst)) if inst.background != 0 => {
+            format!("'{name}' is headless, so it has no terminal screen")
+        }
+        // The row can exist before the PTY registers its port, in any status,
+        // so this can't distinguish "still starting" from "not hcom-launched".
+        Ok(Some(_)) => format!(
+            "'{name}' has no terminal registered yet: it is still starting, or it runs outside an hcom-managed terminal (not launched via 'hcom <tool>')"
+        ),
+        _ => crate::identity::describe_missing_agent(db, name),
+    }
+}
+
 /// Send data on a single TCP connection.
 fn inject_raw(port: i32, data: &[u8]) -> Result<(), String> {
     let mut stream =
@@ -74,14 +97,14 @@ pub fn inject_text_remote_result(
     text: &str,
     enter: bool,
 ) -> Result<String, String> {
-    let port = get_inject_port(db, name).ok_or_else(|| format!("No inject port for '{name}'."))?;
+    let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
 
     if !text.is_empty() {
         inject_raw(port, text.as_bytes())?;
     }
     if enter {
         if !text.is_empty() {
-            std::thread::sleep(Duration::from_millis(100));
+            wait_for_text_rendered(port, text);
         }
         inject_raw(port, b"\r")?;
     }
@@ -92,6 +115,26 @@ pub fn inject_text_remote_result(
         (true, _) => format!("Injected enter to {}", name),
     };
     Ok(label)
+}
+
+/// Poll the screen until the injected text exclusively fills the input box
+/// before returning, so Enter is sent once the TUI has actually rendered it
+/// rather than after a guessed delay. Tools with no input-box parser (e.g.
+/// the OpenCode-family plugin-delivery tools) always report `input_text:
+/// null`, so this can never observe a match for them and simply falls
+/// through once the deadline passes — same best-effort behavior as before.
+const TEXT_RENDER_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn wait_for_text_rendered(port: i32, text: &str) {
+    let deadline = Instant::now() + TEXT_RENDER_TIMEOUT;
+    while Instant::now() < deadline {
+        if let Some(screen) = query_screen(port)
+            && screen.get("input_text").and_then(|v| v.as_str()) == Some(text)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
 }
 
 /// Inject text into PTY via inject port (CLI wrapper).
@@ -130,12 +173,7 @@ pub fn read_instance_screen(
     raw_json: bool,
     clean: bool,
 ) -> Result<String, String> {
-    let port = get_inject_port(db, name).ok_or_else(|| {
-        format!(
-            "No inject port for '{}'. Instance not running or not PTY-managed.",
-            name
-        )
-    })?;
+    let port = get_inject_port(db, name).ok_or_else(|| no_terminal_error(db, name))?;
     let result = query_screen(port)
         .ok_or_else(|| format!("No response from '{}' (port {}).", name, port))?;
     if raw_json {
@@ -297,7 +335,7 @@ fn handle_screen(db: &HcomDb, argv: &[String]) -> i32 {
         let port = match get_inject_port(db, name) {
             Some(p) => p,
             None => {
-                println!("No inject port for '{name}'. Instance not running or not PTY-managed.");
+                eprintln!("Error: {}", no_terminal_error(db, name));
                 return 1;
             }
         };
@@ -352,16 +390,7 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
     let sub = argv.first().map(|s| s.as_str());
 
     if sub == Some("--help") || sub == Some("-h") {
-        println!(
-            "hcom term - Terminal admin: screen query, text injection, debug logging\n\n\
-             Usage:\n  \
-             hcom term                  Query all PTY screens\n  \
-             hcom term <name>           Query specific instance screen\n  \
-             hcom term <name> --json    JSON output\n  \
-             hcom term <name> --clean   Plain text, no header or line numbers\n  \
-             hcom term inject <name> [text] [--enter]   Inject text/enter\n  \
-             hcom term debug on|off|logs                 PTY debug logging"
-        );
+        crate::commands::help::print_command_help("term");
         return 0;
     }
 

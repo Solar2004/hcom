@@ -16,22 +16,32 @@
 //! 9. Cleanup: relay off, daemon stop, remove temp dirs
 //!
 //! Requires:
-//! - hcom installed
+//! - cargo-built hcom test binary
 //! - Network access to public MQTT brokers
-//! - tmux installed
-//! - claude installed and previously launched in /tmp (so the permission
-//!   prompt is already approved — a fresh cwd blocks the TUI from drawing)
+//! - pinned claude installed; model calls are routed to a localhost mock
 //!
 //! Run:
 //!     cargo test -p hcom --test test_relay_roundtrip -- --ignored --nocapture
+//!
+//! The harness uses platform-specific daemon cleanup where needed, but the
+//! relay contract itself runs unchanged on Unix and Windows.
+
+mod support;
 
 use std::cell::RefCell;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use support::claude_mock::{
+    ClaudeStartupAnswers, ClaudeStartupGate, MODEL, claude_startup_gate, claude_text,
+    claude_tool_use, latest_user_turn, trust_accept_selected,
+};
+use support::mock_http::{MockHttp, RecordedRequest, Reply};
+use support::pins;
 
 // ── Logging ────────────────────────────────────────────────────────────
 
@@ -101,24 +111,50 @@ impl Drop for TestLog {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+fn hcom_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_hcom"))
+}
+
+/// The hcom test binary as a Git-Bash-safe, forward-slash, single-quoted
+/// path, for embedding in a Bash tool command string. Claude's Bash tool runs
+/// under Git Bash on Windows, whose PATH does not reliably carry this test
+/// binary's directory through relay-worker → ConPTY-child → Bash-tool
+/// process inheritance — reference the exact binary rather than relying on
+/// bare `hcom` resolving via PATH. Mirrors `support::Hcom::bash_hcom_command`.
+fn bash_hcom_command() -> String {
+    let path = hcom_bin().to_string_lossy().replace('\\', "/");
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
 fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
-    let mut command = Command::new("hcom");
+    let bin = hcom_bin();
+    let mut command = Command::new(&bin);
     command
         .args(shell_words::split(cmd).unwrap())
         .env("HCOM_DIR", hcom_dir)
         .env("HCOM_DEV_ROOT", env!("CARGO_MANIFEST_DIR"))
-        // Pin the default terminal to detached tmux. Not every RPC carries
-        // an explicit `terminal` param (resume doesn't, for example), and
-        // without this override the daemon falls back to env-detecting the
-        // outer terminal — which in a typical dev loop (running tests from
-        // kitty) produces a visible "kitty-split" popup. Matches what
-        // test_pty_delivery.rs does for the same reason.
-        .env("HCOM_TERMINAL", "tmux")
-        // Keep claude cheap for the whole test: Haiku, every launch and
-        // every resume. merge_tool_args in launcher.rs picks this up and
-        // folds it into the final claude argv, so the resume path (which
-        // doesn't take `--model` as a trailing arg cleanly) still honors it.
-        .env("HCOM_CLAUDE_ARGS", "--model haiku");
+        // Keep the relay test on the same deterministic localhost Claude mock
+        // path as real_tool_claude.rs. merge_tool_args folds this into launch
+        // and resume. Remote launch uses --headless, so no terminal emulator
+        // (tmux/kitty/etc.) is required in CI.
+        .env(
+            "HCOM_CLAUDE_ARGS",
+            format!(
+                "--model {MODEL} --permission-mode dontAsk --allowedTools Write,Bash --setting-sources user"
+            ),
+        );
+
+    let mut path_entries = Vec::new();
+    if let Some(parent) = bin.parent() {
+        path_entries.push(parent.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(path_entries).expect("construct hcom test PATH");
+    command.env("PATH", path);
+
+    apply_env_passthrough(&mut command, hcom_dir);
 
     // Hermetic: strip identity/tag so launched instances keep their base
     // name (e.g. "nano", not "review-d-nano" when the outer agent is tagged
@@ -159,6 +195,8 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
         "GHOSTTY_RESOURCES_DIR",
         "ITERM_SESSION_ID",
         "ALACRITTY_WINDOW_ID",
+        "PTYXIS_PROFILE",
+        "PTYXIS_VERSION",
         "GNOME_TERMINAL_SCREEN",
         "KONSOLE_DBUS_WINDOW",
         "TERMINATOR_UUID",
@@ -172,7 +210,83 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
         command.env_remove(var);
     }
 
-    command.output().expect("failed to execute hcom")
+    run_command_with_timeout(command, cmd, Duration::from_secs(90))
+}
+
+/// Capture through files rather than `Command::output()` pipes. On Windows a
+/// detached relay worker can inherit the parent's anonymous pipe handles even
+/// though its own stdio is null, preventing `output()` from ever observing EOF
+/// after the short-lived CLI parent exits.
+fn run_command_with_timeout(mut command: Command, label: &str, timeout: Duration) -> Output {
+    let stdout_file = tempfile::tempfile().expect("create hcom stdout capture");
+    let stderr_file = tempfile::tempfile().expect("create hcom stderr capture");
+    command
+        .stdout(Stdio::from(
+            stdout_file.try_clone().expect("clone stdout capture"),
+        ))
+        .stderr(Stdio::from(
+            stderr_file.try_clone().expect("clone stderr capture"),
+        ));
+
+    let mut child = command.spawn().expect("failed to execute hcom");
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = read_capture(&stdout_file);
+                let stderr = read_capture(&stderr_file);
+                panic!(
+                    "hcom command timed out after {timeout:?}: {label}\n\
+                     -- stdout --\n{}\n-- stderr --\n{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => panic!("failed waiting for hcom command `{label}`: {error}"),
+        }
+    };
+
+    Output {
+        status,
+        stdout: read_capture(&stdout_file),
+        stderr: read_capture(&stderr_file),
+    }
+}
+
+fn read_capture(file: &std::fs::File) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = file.try_clone().expect("clone command capture for reading");
+    file.seek(SeekFrom::Start(0))
+        .expect("rewind command capture");
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).expect("read command capture");
+    bytes
+}
+
+fn apply_env_passthrough(command: &mut Command, hcom_dir: &str) {
+    let env_path = Path::new(hcom_dir).join("env");
+    let Ok(content) = fs::read_to_string(env_path) else {
+        return;
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || key.starts_with("HCOM_") {
+            continue;
+        }
+        command.env(key, value.trim());
+    }
 }
 
 fn check(label: &str, cmd: &str, hcom_dir: &str) -> String {
@@ -250,8 +364,68 @@ fn parse_names(output: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn tool_installed(tool: &str) -> bool {
-    Command::new(tool).arg("--version").output().is_ok()
+/// Build a command for `tool` resolved against the real process `PATH`,
+/// following npm's Windows `.cmd`/`.bat` shims that `CreateProcess` cannot
+/// execute directly (mirrors `support::Hcom::external_cmd`, which resolves
+/// against an isolated PATH instead of the real environment).
+fn external_tool_command(tool: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let resolved = std::env::split_paths(&path_var)
+            .flat_map(|dir| {
+                [".COM", ".EXE", ".BAT", ".CMD", ""]
+                    .map(move |ext| dir.join(format!("{tool}{ext}")))
+            })
+            .find(|candidate| candidate.is_file());
+        match resolved {
+            Some(path)
+                if matches!(
+                    path.extension().and_then(std::ffi::OsStr::to_str),
+                    Some(ext) if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+                ) =>
+            {
+                let mut command = Command::new("cmd.exe");
+                command.args(["/d", "/c"]).arg(path);
+                command
+            }
+            Some(path) => Command::new(path),
+            None => Command::new(tool),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(tool)
+    }
+}
+
+fn assert_tool_pinned(tool: &str, expected_version: &str, install_hint: &str) {
+    let output = external_tool_command(tool)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "Phase 7 requires {tool} {expected_version}, but `{tool} --version` failed: {e}. Install with: {install_hint}"
+            )
+        });
+    assert!(
+        output.status.success(),
+        "Phase 7 requires {tool} {expected_version}; `{tool} --version` failed\nstdout: {}\nstderr: {}\nInstall with: {install_hint}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let version = if output.stdout.is_empty() {
+        String::from_utf8_lossy(&output.stderr)
+    } else {
+        String::from_utf8_lossy(&output.stdout)
+    };
+    assert!(
+        version
+            .split_whitespace()
+            .any(|token| token.trim_start_matches('v') == expected_version),
+        "Phase 7 requires {tool} {expected_version}, found `{}`. Install with: {install_hint}",
+        version.trim()
+    );
 }
 
 fn list_instances(hcom_dir: &str) -> Vec<serde_json::Value> {
@@ -307,10 +481,49 @@ fn poll_rpc_result_on_device(hcom_dir: &str, action: &str) -> serde_json::Value 
     )
 }
 
-/// Claude's input prompt marker — present whenever the TUI is rendered,
-/// independent of the dontAsk / accept-edits mode that hides the
-/// "? for shortcuts" status bar.
-const CLAUDE_PROMPT_MARKER: &str = "❯";
+/// True if `text` has Claude's input prompt marker at the start of a rendered
+/// screen line, present whenever the TUI is rendered, independent of the
+/// dontAsk / accept-edits mode that hides the "? for shortcuts" status bar.
+/// Requiring the marker to lead the line (not just appear anywhere) keeps this
+/// from matching an unrelated `>` in tips, diffs, or other screen content.
+fn screen_has_claude_prompt(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = strip_term_line_number_prefix(line).trim_start();
+        trimmed.starts_with('❯') || trimmed.starts_with('>')
+    })
+}
+
+/// Strip `hcom term`'s "  <N>: " row-index prefix (see `src/commands/term.rs`
+/// `format!("  {i:3}: {text}")`), if present, so line-start checks work on
+/// both `--json` line arrays (no prefix) and the default rendered output
+/// (prefixed).
+fn strip_term_line_number_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if digits_end > 0 && trimmed[digits_end..].starts_with(": ") {
+        &trimmed[digits_end + 2..]
+    } else {
+        line
+    }
+}
+
+#[test]
+fn screen_has_claude_prompt_matches_styled_and_ascii_markers() {
+    assert!(screen_has_claude_prompt("❯ \n──────"));
+    assert!(screen_has_claude_prompt("> \n──────"));
+    assert!(screen_has_claude_prompt("  15: > \n  16: ──────"));
+}
+
+#[test]
+fn screen_has_claude_prompt_ignores_unrelated_greater_than() {
+    // A `>` appearing mid-line (a tip, a diff, redirected output) is not the
+    // input prompt and must not produce a false positive.
+    assert!(!screen_has_claude_prompt("Tip: pipe output > file.txt"));
+    assert!(!screen_has_claude_prompt("  12: some text > more text"));
+    assert!(!screen_has_claude_prompt("no prompt here at all"));
+}
 
 fn get_screen_local_json(hcom_dir: &str, name: &str) -> Option<serde_json::Value> {
     let out = hcom_with_dir(&format!("term {name} --json"), hcom_dir);
@@ -412,7 +625,7 @@ fn wait_for_screen_drawn(hcom_dir: &str, name: &str, timeout: Duration) -> serde
     poll_until(
         || {
             let s = get_screen_local_json(hcom_dir, name)?;
-            let has_prompt = screen_lines_joined(&s).contains(CLAUDE_PROMPT_MARKER);
+            let has_prompt = screen_has_claude_prompt(&screen_lines_joined(&s));
             let prompt_empty = s["prompt_empty"].as_bool() == Some(true);
             if has_prompt && prompt_empty {
                 Some(s)
@@ -424,6 +637,51 @@ fn wait_for_screen_drawn(hcom_dir: &str, name: &str, timeout: Duration) -> serde
         timeout,
         Duration::from_secs(1),
     )
+}
+
+fn drive_claude_startup(hcom_dir: &str, name: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut last_screen = String::new();
+    let mut answers = ClaudeStartupAnswers::default();
+    while Instant::now() < deadline {
+        let json_out = hcom_with_dir(&format!("term {name} --json"), hcom_dir);
+        let screen_out = hcom_with_dir(&format!("term {name}"), hcom_dir);
+        last_screen = String::from_utf8_lossy(&screen_out.stdout).to_string();
+        let gate = claude_startup_gate(&last_screen);
+        if screen_out.status.success()
+            && String::from_utf8_lossy(&json_out.stdout).contains("\"prompt_empty\":true")
+            && gate.is_none()
+        {
+            return;
+        }
+        // Same as ClaudeCase::drive_startup: the trust dialog preselects
+        // "No, exit", so move onto the accepting option before any Enter.
+        if gate == Some(ClaudeStartupGate::Trust) && !trust_accept_selected(&last_screen) {
+            let down = hcom_with_dir(&format!("term inject {name} \u{1b}[B"), hcom_dir);
+            assert!(
+                down.status.success(),
+                "drive startup trust-option move failed\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&down.stdout),
+                String::from_utf8_lossy(&down.stderr)
+            );
+            thread::sleep(Duration::from_millis(800));
+            continue;
+        }
+        if gate.is_some_and(|gate| answers.answer_once(gate)) {
+            // A successful inject delivered Enter to the PTY. Do not repeat it
+            // while a stale frame still shows the gate: the next Enter could
+            // land in Claude's ready prompt.
+            let inject = hcom_with_dir(&format!("term inject {name} --enter"), hcom_dir);
+            assert!(
+                inject.status.success(),
+                "drive startup inject failed\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&inject.stdout),
+                String::from_utf8_lossy(&inject.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(800));
+    }
+    panic!("Claude did not reach input prompt within {timeout:?}; last screen:\n{last_screen}");
 }
 
 /// Returns the highest event id currently visible on a device, for use as
@@ -441,16 +699,20 @@ fn last_event_id(hcom_dir: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn try_remote_launch_claude_tmux(
+fn try_remote_launch_claude_headless(
     hcom_dir: &str,
     target_device: &str,
 ) -> Result<(String, String), String> {
     // Model pinning comes via HCOM_CLAUDE_ARGS set in hcom_with_dir.
-    // --dir is required for remote launches; use /tmp as cwd — it always
-    // exists on both sides of the local-machine test and claude has already
-    // been trusted there (a never-seen-before cwd triggers a permission
-    // prompt that blocks the TUI from drawing).
-    let cmd = format!("1 claude --device {target_device} --terminal tmux --dir /tmp --go");
+    // --dir is required for remote launches; use the platform temp directory,
+    // which exists on both sides of this local-machine test. --headless keeps the
+    // launched Claude on hcom's detached PTY runner, preserving term screen /
+    // inject coverage without requiring tmux or another terminal emulator.
+    let launch_dir = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+    let cmd = format!(
+        "1 claude --device {target_device} --headless --dir {} --go",
+        shell_words::quote(&launch_dir)
+    );
     let out = hcom_with_dir(&cmd, hcom_dir);
     if !out.status.success() {
         return Err(format!(
@@ -468,12 +730,100 @@ fn try_remote_launch_claude_tmux(
     Ok((launched, stdout))
 }
 
-/// Device A has no *local* instances (the one we launched is on Device B
-/// and appears as an origin_device_id-tagged mirror row). The relay
-/// worker's auto-exit watchdog checks every 30s and shuts the worker down
-/// after 2 consecutive empty checks — so Device A's worker dies ~60s
-/// after Phase 7, right before we need it for the long Phase 10 / 14
-/// polling. Re-arm it before each long-running RPC on Device A.
+fn remote_term_screen_stdout(hcom_dir: &str, remote_name: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_stdout = String::new();
+    let mut last_stderr = String::new();
+    while Instant::now() < deadline {
+        ensure_relay_worker(hcom_dir);
+        let out = hcom_with_dir(&format!("term {remote_name}"), hcom_dir);
+        last_stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        last_stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        if out.status.success()
+            && !last_stdout.contains("Remote term screen failed")
+            && screen_has_claude_prompt(&last_stdout)
+        {
+            return last_stdout;
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    panic!(
+        "remote term_screen did not return prompt marker within 60s\nlast stdout: {last_stdout}\nlast stderr: {last_stderr}"
+    );
+}
+
+fn write_claude_mock_env(hcom_dir: &Path, base_url: &str) {
+    let claude_home = hcom_dir.join("claude-home");
+    fs::create_dir_all(&claude_home).expect("create isolated Claude config dir");
+    let env = [
+        ("ANTHROPIC_BASE_URL", base_url.to_string()),
+        (
+            "ANTHROPIC_AUTH_TOKEN",
+            "hcom-relay-test-dummy-token".to_string(),
+        ),
+        (
+            "CLAUDE_CONFIG_DIR",
+            claude_home.to_string_lossy().to_string(),
+        ),
+        ("DISABLE_LOGIN_COMMAND", "1".to_string()),
+        ("DISABLE_UPDATES", "1".to_string()),
+        ("DISABLE_TELEMETRY", "1".to_string()),
+        ("DISABLE_GROWTHBOOK", "1".to_string()),
+        ("DISABLE_ERROR_REPORTING", "1".to_string()),
+        ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string()),
+        (
+            "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
+            "1".to_string(),
+        ),
+        ("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "1".to_string()),
+        ("CLAUDE_CODE_DISABLE_THINKING", "1".to_string()),
+        ("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1".to_string()),
+        ("DISABLE_PROMPT_CACHING", "1".to_string()),
+        ("ENABLE_TOOL_SEARCH", "false".to_string()),
+        ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1".to_string()),
+    ];
+    let body = env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect::<String>();
+    fs::write(hcom_dir.join("env"), body).expect("write Claude mock env passthrough");
+}
+
+fn relay_claude_mock_response(req: &RecordedRequest) -> Reply {
+    const TOOL_RELAY_PONG: &str = "toolu_relay_pong_send";
+
+    if req.method.eq_ignore_ascii_case("HEAD") {
+        return Reply::Empty(200);
+    }
+    if req.path.contains("count_tokens") {
+        return Reply::Json(serde_json::json!({"input_tokens": 1}).to_string());
+    }
+    if !req.path.contains("/v1/messages") {
+        return Reply::Status(404);
+    }
+    let (tool_result, text) = latest_user_turn(&req.body).unwrap_or_default();
+    if tool_result.as_deref() == Some(TOOL_RELAY_PONG) {
+        return Reply::Sse(claude_text("msg_relay_pong_done", "PONG sent"));
+    }
+    if text.contains("Reply with exactly the single word PONG") {
+        return Reply::Sse(claude_tool_use(
+            "msg_relay_pong_tool",
+            TOOL_RELAY_PONG,
+            "Bash",
+            &serde_json::json!({
+                "command": format!("{} send @bigboss --intent inform -- PONG", bash_hcom_command()),
+                "description": "send the relay roundtrip PONG response",
+            }),
+        ));
+    }
+    Reply::Sse(claude_text("msg_relay_roundtrip", "OK"))
+}
+
+/// `hcom relay on` is idempotent — a no-op if the worker is already running.
+/// The worker's auto-exit watchdog only fires when relay is *not* enabled in
+/// config (see `auto_exit_watchdog` in src/relay/worker.rs); both test
+/// devices enable relay in Phases 1/3, so this call is cheap insurance
+/// before an RPC rather than a fix for a known auto-exit race.
 fn ensure_relay_worker(hcom_dir: &str) {
     let out = hcom_with_dir("relay on", hcom_dir);
     if !out.status.success() {
@@ -485,10 +835,142 @@ fn ensure_relay_worker(hcom_dir: &str) {
     thread::sleep(Duration::from_millis(500));
 }
 
+/// Diagnostic snapshot for a Phase 10 timeout (either step): both devices'
+/// relay status, Device B's live screen and recent events, and the last few
+/// requests the Claude mock actually received. A bare "timed out" panic gives
+/// no way to tell a relay-delivery problem from a stuck turn from a Bash tool
+/// call failing outright — this makes a CI failure here diagnosable without
+/// another round-trip.
+fn phase10_diagnostics(
+    path_a: &str,
+    path_b: &str,
+    launched_name: &str,
+    claude_mock: &MockHttp,
+) -> String {
+    let device_b_screen = get_screen_local_json(path_b, launched_name)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "<no screen>".to_string());
+    let device_b_events = hcom_with_dir("events --last 20", path_b);
+    let relay_status_a = hcom_with_dir("relay status", path_a);
+    let relay_status_b = hcom_with_dir("relay status", path_b);
+    let recent_mock_requests: String = claude_mock
+        .requests()
+        .iter()
+        .rev()
+        .take(3)
+        .map(|r| format!("  {} {}\n  body: {}\n", r.method, r.path, r.body))
+        .collect();
+    format!(
+        "Device A relay status:\n{}\n\
+         Device B relay status:\n{}\n\
+         Device B screen: {device_b_screen}\n\
+         Device B recent events:\n{}\n\
+         Last mock requests (newest first):\n{recent_mock_requests}",
+        String::from_utf8_lossy(&relay_status_a.stdout),
+        String::from_utf8_lossy(&relay_status_b.stdout),
+        String::from_utf8_lossy(&device_b_events.stdout),
+    )
+}
+
+/// Tail of a device's hcom.log — this is where the relay-worker's own
+/// crash would surface, since `main()` installs a panic hook that logs
+/// panics via `log::log_error` instead of letting them hit stderr (the
+/// worker's stdout/stderr are redirected to null so it survives the
+/// parent terminal closing; see `do_spawn` in src/relay/worker.rs).
+fn tail_hcom_log(hcom_dir: &str, lines: usize) -> String {
+    let log_path = Path::new(hcom_dir)
+        .join(".tmp")
+        .join("logs")
+        .join("hcom.log");
+    match fs::read_to_string(&log_path) {
+        Ok(content) => {
+            let all: Vec<&str> = content.lines().collect();
+            let start = all.len().saturating_sub(lines);
+            all[start..].join("\n")
+        }
+        Err(e) => format!("<unavailable: {} ({e})>", log_path.display()),
+    }
+}
+
+/// Bounded, non-panicking `hcom relay status` for the panic-hook path.
+/// Deliberately doesn't reuse `hcom_with_dir`/`run_command_with_timeout`:
+/// those panic on spawn failure, wait failure, or a 90s timeout, and a panic
+/// raised from inside a panic hook aborts the whole process (`rtabort!`,
+/// uncatchable by `catch_unwind`) instead of just failing this test — see
+/// `install_diagnostic_panic_hook`. Every failure mode here folds into the
+/// returned string instead, and the bound is a short 10s since this only
+/// ever needs a cheap local status read, not a network round trip.
+fn safe_relay_status(hcom_dir: &str) -> String {
+    let mut command = Command::new(hcom_bin());
+    command
+        .args(["relay", "status"])
+        .env("HCOM_DIR", hcom_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return format!("<spawn failed: {e}>"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "<timed out after 10s>".to_string();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(e) => return format!("<wait failed: {e}>"),
+        }
+    }
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    format!("{stdout}{stderr}")
+}
+
+/// Installs a process-wide panic hook that dumps both devices' relay
+/// status and hcom.log tail before the default hook runs. Any phase's
+/// `check()`/`poll_until()`/`assert!` can panic — a bare "timed out" or
+/// "command failed" panic gives no way to tell whether a device's own
+/// relay-worker died out from under it (the Phase 13 Windows flake this
+/// was added for: the worker was alive through Phase 12, then
+/// `is_relay_worker_running()` reported false a few seconds later with
+/// no visible cause). Chains to the previous hook so normal panic output
+/// is unchanged; this only adds extra stderr before that.
+///
+/// The hook body must never itself panic (see `safe_relay_status`'s doc for
+/// why), which is also why it uses `tail_hcom_log`'s plain `Result`-based
+/// file read rather than anything that could panic on a missing/unreadable
+/// log.
+fn install_diagnostic_panic_hook(path_a: String, path_b: String) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        eprintln!("\n----- relay diagnostics on panic -----");
+        for (label, dir) in [("A", &path_a), ("B", &path_b)] {
+            eprintln!("Device {label} relay status:\n{}", safe_relay_status(dir));
+            eprintln!(
+                "Device {label} hcom.log (last 60 lines):\n{}",
+                tail_hcom_log(dir, 60)
+            );
+        }
+        eprintln!("----- end relay diagnostics -----\n");
+    }));
+}
+
 /// Kill orphan debug relay-worker processes from previous failed test runs.
 /// Without this, a stale daemon can hold MQTT connections and interfere with
 /// new test runs (the test creates isolated HCOM_DIRs but can't find orphan
 /// PIDs once the old temp dir is deleted).
+#[cfg(unix)]
 fn kill_orphan_debug_daemons() {
     let Ok(output) = std::process::Command::new("pgrep")
         .args(["-f", "target/debug/hcom relay-worker"])
@@ -506,25 +988,19 @@ fn kill_orphan_debug_daemons() {
     }
 }
 
+#[cfg(windows)]
+fn kill_orphan_debug_daemons() {
+    // Windows has no built-in command-line process matcher equivalent to
+    // pgrep. Each run uses unique HCOM_DIRs and its PID-file-owned daemons are
+    // still cleaned by RelayGuard below.
+}
+
 fn kill_daemon(hcom_dir: &str) {
     let pid_path = Path::new(hcom_dir).join(".tmp").join("relay.pid");
-    if let Ok(content) = fs::read_to_string(&pid_path) {
-        if let Ok(pid) = content.trim().parse::<i32>() {
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            // Wait up to 3s
-            for _ in 0..30 {
-                thread::sleep(Duration::from_millis(100));
-                if unsafe { libc::kill(pid, 0) } != 0 {
-                    return;
-                }
-            }
-            // Still alive — SIGKILL
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
+    if let Ok(content) = fs::read_to_string(&pid_path)
+        && let Ok(pid) = content.trim().parse::<i64>()
+    {
+        support::terminate_process_group(pid);
     }
 }
 
@@ -583,6 +1059,13 @@ fn test_relay_roundtrip() {
     let path_a = dir_a_path.to_string_lossy().to_string();
     let path_b = dir_b_path.to_string_lossy().to_string();
 
+    install_diagnostic_panic_hook(path_a.clone(), path_b.clone());
+
+    let claude_mock =
+        MockHttp::start(relay_claude_mock_response).expect("start localhost Claude mock provider");
+    let mock_base_url = format!("http://127.0.0.1:{}", claude_mock.port());
+    write_claude_mock_env(&dir_b_path, &mock_base_url);
+
     let log = TestLog::new();
 
     logln!(log, "{}", "=".repeat(60));
@@ -614,7 +1097,7 @@ fn test_relay_roundtrip() {
             None
         },
         "Device A relay connected",
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         Duration::from_secs(1),
     );
     logln!(log, "  OK: Device A connected to broker");
@@ -679,7 +1162,7 @@ fn test_relay_roundtrip() {
             None
         },
         "Device B relay connected",
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         Duration::from_secs(1),
     );
     logln!(log, "  OK: Device B connected to broker");
@@ -707,22 +1190,22 @@ fn test_relay_roundtrip() {
                 if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
                     let mut data = ev["data"].clone();
                     // data may be string-encoded JSON
-                    if let Some(s) = data.as_str() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                            data = parsed;
-                        }
+                    if let Some(s) = data.as_str()
+                        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        data = parsed;
                     }
-                    if let Some(text) = data["text"].as_str() {
-                        if text.contains(&marker) {
-                            return Some((ev, data));
-                        }
+                    if let Some(text) = data["text"].as_str()
+                        && text.contains(&marker)
+                    {
+                        return Some((ev, data));
                     }
                 }
             }
             None
         },
         &format!("Device B sees '{marker}'"),
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         Duration::from_secs(2),
     );
     logln!(log, "  OK: Event received: type={}", ev["type"]);
@@ -843,10 +1326,10 @@ fn test_relay_roundtrip() {
             for line in stdout.lines() {
                 if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line.trim()) {
                     let mut data = ev["data"].clone();
-                    if let Some(s) = data.as_str() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                            data = parsed;
-                        }
+                    if let Some(s) = data.as_str()
+                        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        data = parsed;
                     }
                     if data["text"]
                         .as_str()
@@ -888,24 +1371,21 @@ fn test_relay_roundtrip() {
     // ── Phase 7: Device A remotely launches on Device B ──────────
     logln!(log, "\n[Phase 7] Device A: remote launch on Device B...");
 
-    assert!(
-        tool_installed("claude"),
-        "Phase 7 requires claude to be installed"
-    );
-    assert!(
-        tool_installed("tmux"),
-        "Phase 7 requires tmux to be installed"
+    assert_tool_pinned(
+        "claude",
+        pins::pinned_version("@anthropic-ai/claude-code"),
+        pins::INSTALL_HINT,
     );
 
     let baseline_event_b = last_event_id(&path_b);
-    let (launched_name, launch_output) = try_remote_launch_claude_tmux(&path_a, &short_b)
+    let (launched_name, launch_output) = try_remote_launch_claude_headless(&path_a, &short_b)
         .unwrap_or_else(|e| {
             panic!("Phase 7: remote launch failed: {e}");
         });
     logln!(log, "{}", launch_output.trim_end());
     logln!(
         log,
-        "  OK: Remote launch succeeded with claude/tmux: {launched_name}"
+        "  OK: Remote launch succeeded with claude/headless: {launched_name}"
     );
     guard.register_local_b(launched_name.clone());
     let launched_tool = "claude".to_string();
@@ -935,7 +1415,7 @@ fn test_relay_roundtrip() {
 
     // Wait for the launched claude on Device B to actually be usable.
     // Without this, the rest of the phases race the tool's boot and see
-    // "No inject port for ..." errors that silently get swallowed by weak
+    // "no terminal registered yet" errors that silently get swallowed by weak
     // assertions. The lifecycle ready event is the canonical signal —
     // screen["ready"] is unreliable when the user has dontAsk mode on, but
     // the life event fires from hooks regardless.
@@ -943,6 +1423,7 @@ fn test_relay_roundtrip() {
         log,
         "  Waiting for claude lifecycle ready event on Device B..."
     );
+    drive_claude_startup(&path_b, &launched_name, Duration::from_secs(90));
     let _ready_event_id = wait_for_ready_event(
         &path_b,
         &launched_name,
@@ -957,7 +1438,7 @@ fn test_relay_roundtrip() {
     assert_eq!(initial_screen["prompt_empty"].as_bool(), Some(true));
     logln!(
         log,
-        "  OK: claude TUI drawn (prompt marker '{CLAUDE_PROMPT_MARKER}' present, prompt empty)"
+        "  OK: claude TUI drawn (prompt marker present, prompt empty)"
     );
 
     // ── Phase 8: term_screen on live instance ─────────────────────
@@ -967,22 +1448,9 @@ fn test_relay_roundtrip() {
     );
 
     // Plain-text remote call: should print the formatted screen (containing
-    // the claude ready banner). Fails closed if the RPC errored.
-    let term_screen_out = hcom_with_dir(&format!("term {remote_name}"), &path_a);
-    let term_screen_stdout = String::from_utf8_lossy(&term_screen_out.stdout).to_string();
-    assert!(
-        term_screen_out.status.success(),
-        "remote term_screen CLI exited non-zero\nstdout: {term_screen_stdout}\nstderr: {}",
-        String::from_utf8_lossy(&term_screen_out.stderr)
-    );
-    assert!(
-        !term_screen_stdout.contains("Remote term screen failed"),
-        "remote term_screen reported failure:\n{term_screen_stdout}"
-    );
-    assert!(
-        term_screen_stdout.contains(CLAUDE_PROMPT_MARKER),
-        "remote term_screen stdout missing claude prompt marker '{CLAUDE_PROMPT_MARKER}':\n{term_screen_stdout}"
-    );
+    // the Claude ready banner). It is read-only over a public broker, so retry
+    // transient publish/response misses instead of making the whole test flaky.
+    remote_term_screen_stdout(&path_a, &remote_name);
     logln!(
         log,
         "  OK: remote term_screen stdout contains claude prompt marker"
@@ -1001,7 +1469,7 @@ fn test_relay_roundtrip() {
     );
     let rpc_content = rpc_screen["result"]["content"].as_str().unwrap_or("");
     assert!(
-        rpc_content.contains(CLAUDE_PROMPT_MARKER),
+        screen_has_claude_prompt(rpc_content),
         "term_screen rpc_result.content missing claude prompt marker: {rpc_content}"
     );
     logln!(
@@ -1080,7 +1548,12 @@ fn test_relay_roundtrip() {
     // real message separately via `hcom send`, so this enter only flushes
     // the marker and doesn't step on the test.
     let clear_out = hcom_with_dir(&format!("term inject {remote_name} --enter"), &path_a);
-    assert!(clear_out.status.success());
+    assert!(
+        clear_out.status.success(),
+        "remote term inject (enter) failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&clear_out.stdout),
+        String::from_utf8_lossy(&clear_out.stderr)
+    );
     let rpc_inject_enter = poll_rpc_result_on_device(&path_b, "term_inject");
     assert_eq!(
         rpc_inject_enter["ok"].as_bool(),
@@ -1102,22 +1575,51 @@ fn test_relay_roundtrip() {
         Duration::from_secs(15),
         Duration::from_millis(500),
     );
+    // Clearing the input line only proves that Claude accepted the submitted
+    // marker. ConPTY can report that frame before the turn finishes, while
+    // delivery is still gated. Wait for the stable idle prompt before sending
+    // the Phase 10 message.
+    wait_for_screen_drawn(&path_b, &launched_name, Duration::from_secs(60));
+    poll_until(
+        || {
+            let instance = find_instance_by_base(&path_b, &launched_name)?;
+            (instance["status"].as_str() == Some("listening")).then_some(())
+        },
+        "Claude returned to listening after marker turn",
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+    );
     logln!(
         log,
-        "  OK: marker consumed from input after enter; both inject RPCs ok=true"
+        "  OK: marker turn finished and prompt returned idle; both inject RPCs ok=true"
     );
 
-    // ── Phase 10: real send+reply, then remote transcript ────────
+    // ── Phase 10: real send+reply round-trip via relay ───────────
     logln!(
         log,
-        "\n[Phase 10] Device A: send real question and verify reply via transcript..."
+        "\n[Phase 10] Device A: send real question and verify reply event via relay..."
     );
 
     let question = "Reply with exactly the single word PONG then stop.";
+
+    // Watermark Device A's events so we only count relayed replies that
+    // arrive AFTER the question goes out.
+    let pre_send_event_a = last_event_id(&path_a);
+    // Same for Device B's own status events: without this, a stale
+    // delivery→listening cycle already sitting in the last-20 window (e.g.
+    // Phase 9's inject turn) could satisfy the Step 1 scan below by
+    // coincidence rather than by actually observing this message's turn.
+    let pre_send_event_b = last_event_id(&path_b);
+
+    // Send from bigboss (`-b`) rather than a synthetic `--from` label.
+    // `--from <name>` is a CLI-only sender stamp with no return route on
+    // the receiving device — the receiver sees `name:DEVICE` but can't
+    // address it back, so the reply dead-ends locally. bigboss is the
+    // one universally-addressable target; the agent's system prompt
+    // ("Prioritize @bigboss") makes the reply land cleanly, and bigboss
+    // messages relay back like any other event.
     let send_out = hcom_with_dir(
-        &format!(
-            "send @{launched_name}:{short_b} --from relaytest --intent request -- \"{question}\""
-        ),
+        &format!("send -b @{launched_name}:{short_b} --intent request -- \"{question}\""),
         &path_a,
     );
     assert!(
@@ -1125,35 +1627,48 @@ fn test_relay_roundtrip() {
         "hcom send failed: {}",
         String::from_utf8_lossy(&send_out.stderr)
     );
-    logln!(log, "  OK: sent question to @{launched_name}:{short_b}");
+    logln!(
+        log,
+        "  OK: sent question from bigboss to @{launched_name}:{short_b}"
+    );
 
-    // Wait for the instance to process the message: status goes active
-    // (while claude is thinking) then back to listening. We can't rely on
-    // a reply message event — claude's hcom-send back to the sender fails
-    // when the sender lives on another device (@short_id isn't a known
-    // local agent on Device B). Instead we wait for the status round-trip
-    // and then inspect the transcript, which the task brief specifically
-    // allows as the OR path.
     poll_until(
         || {
-            let out = hcom_with_dir(
-                &format!("events --type status --agent {launched_name} --last 20"),
-                &path_b,
-            );
-            if !out.status.success() {
-                return None;
-            }
-            let mut saw_delivery = false;
-            let mut saw_listening_after = false;
+            let out = hcom_with_dir("events --type message --last 20", &path_b);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.contains(question).then_some(())
+        },
+        "Device B received targeted Phase 10 message",
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+    );
+    logln!(log, "  OK: Device B received targeted Phase 10 message");
+
+    // Step 1: Device B's claude received and processed (status round-trip).
+    let step1_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let out = hcom_with_dir(
+            &format!("events --type status --agent {launched_name} --last 20"),
+            &path_b,
+        );
+        let mut saw_delivery = false;
+        let mut saw_listening_after = false;
+        if out.status.success() {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 let ev: serde_json::Value = match serde_json::from_str(line.trim()) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // Events are returned oldest-first; ignore anything at or
+                // before the pre-send watermark so a stale delivery→listening
+                // cycle already in the last-20 window can't false-match.
+                if ev["id"].as_i64().unwrap_or(0) <= pre_send_event_b {
+                    continue;
+                }
                 let data = &ev["data"];
                 let ctx = data["context"].as_str().unwrap_or("");
                 let status = data["status"].as_str().unwrap_or("");
-                if ctx.starts_with("deliver:relaytest") {
+                if ctx.starts_with("deliver:bigboss") {
                     saw_delivery = true;
                     continue;
                 }
@@ -1161,67 +1676,88 @@ fn test_relay_roundtrip() {
                     saw_listening_after = true;
                 }
             }
-            if saw_delivery && saw_listening_after {
-                Some(())
-            } else {
-                None
-            }
-        },
-        &format!("{launched_name} processed message (delivery → listening)"),
-        Duration::from_secs(120),
-        Duration::from_secs(2),
-    );
+        }
+        if saw_delivery && saw_listening_after {
+            break;
+        }
+        if Instant::now() >= step1_deadline {
+            panic!(
+                "Timeout (120s): {launched_name} processed message (delivery → listening)\n{}",
+                phase10_diagnostics(&path_a, &path_b, &launched_name, &claude_mock)
+            );
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
     logln!(
         log,
         "  OK: {launched_name} processed the message and returned to listening"
     );
 
-    // Device A's worker has likely auto-exited during the long wait above
-    // (watchdog exits after ~60s with no local instances). Re-arm before
-    // the transcript RPC.
+    // Device A's worker auto-exits only when relay is *not* enabled in its
+    // config (see `auto_exit_watchdog` in src/relay/worker.rs) — both devices
+    // enabled relay in Phases 1/3, so this is just cheap insurance, not a
+    // known race fix.
     ensure_relay_worker(&path_a);
 
-    // Remote transcript: must contain PONG. Claude's response is in the
-    // session JSONL, rendered by render_instance_transcript. We also verify
-    // the incoming question landed via the deliver event above.
-    let mut last_seen_len = 0usize;
-    let tx_content: String = poll_until(
-        || {
-            let transcript_out = hcom_with_dir(
-                &format!("transcript {remote_name} --last 5 --full"),
-                &path_a,
+    // Step 2: the real round-trip — claude's PONG reply must reach
+    // Device A as a relayed message event with `from = nara:TAMA`.
+    // This proves the event actually traversed the relay, not just that
+    // claude wrote something locally on Device B.
+    let expected_from = format!("{launched_name}:{short_b}");
+    let mut last_log_count = 0usize;
+    let pong_deadline = Instant::now() + Duration::from_secs(90);
+    let pong_event = loop {
+        let out = hcom_with_dir("events --type message --last 50", &path_a);
+        let mut found = None;
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut new_count = 0usize;
+            for line in stdout.lines() {
+                let ev: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let id = ev["id"].as_i64().unwrap_or(0);
+                if id <= pre_send_event_a {
+                    continue;
+                }
+                new_count += 1;
+                let mut data = ev["data"].clone();
+                if let Some(s) = data.as_str()
+                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
+                {
+                    data = parsed;
+                }
+                let from = data["from"].as_str().unwrap_or("");
+                let text = data["text"].as_str().unwrap_or("");
+                if from == expected_from && text.to_uppercase().contains("PONG") {
+                    found = Some(ev);
+                    break;
+                }
+            }
+            if found.is_none() && new_count != last_log_count {
+                last_log_count = new_count;
+                eprintln!(
+                    "    {new_count} new message events on A, none from {expected_from} with PONG yet"
+                );
+            }
+        }
+        if let Some(ev) = found {
+            break ev;
+        }
+        if Instant::now() >= pong_deadline {
+            panic!(
+                "Timeout (90s): Device A receives PONG reply event from {expected_from}\n{}",
+                phase10_diagnostics(&path_a, &path_b, &launched_name, &claude_mock)
             );
-            if !transcript_out.status.success() {
-                return None;
-            }
-            let rpc = poll_rpc_result_on_device(&path_b, "transcript");
-            if rpc["ok"].as_bool() != Some(true) {
-                return None;
-            }
-            let content = rpc["result"]["content"].as_str().unwrap_or("").to_string();
-            if content.to_uppercase().contains("PONG") {
-                return Some(content);
-            }
-            if content.len() != last_seen_len {
-                last_seen_len = content.len();
-                eprintln!("    transcript now {} bytes, no PONG yet", content.len());
-            }
-            None
-        },
-        "remote transcript contains PONG",
-        Duration::from_secs(60),
-        Duration::from_secs(2),
-    );
+        }
+        thread::sleep(Duration::from_secs(2));
+    };
     logln!(
         log,
-        "  OK: remote transcript contains PONG reply ({} bytes). \
-         Incoming question already verified via deliver:relaytest status event.",
-        tx_content.len()
+        "  OK: Device A received PONG reply event (id={}, from={expected_from})",
+        pong_event["id"].as_i64().unwrap_or(0)
     );
-    // The original question came from Device A via relay; it's recorded as
-    // a delivered message event on Device B (verified by the deliver:relaytest
-    // context assertion in the status round-trip above). Claude's session
-    // JSONL reflects the assistant reply; combined, both sides are proven.
 
     // ── Phase 11: config_get on live instance ─────────────────────
     logln!(
@@ -1310,19 +1846,14 @@ fn test_relay_roundtrip() {
 
     // Double-check directly against Device B's SQLite DB.
     let db_path_b = Path::new(&path_b).join("hcom.db");
-    let sql_out = Command::new("sqlite3")
-        .arg(&db_path_b)
-        .arg(format!(
-            "SELECT tag FROM instances WHERE name='{launched_name}'"
-        ))
-        .output()
-        .expect("failed to run sqlite3");
-    assert!(
-        sql_out.status.success(),
-        "sqlite3 failed: {}",
-        String::from_utf8_lossy(&sql_out.stderr)
-    );
-    let sql_tag = String::from_utf8_lossy(&sql_out.stdout).trim().to_string();
+    let db = rusqlite::Connection::open(&db_path_b).expect("open Device B database");
+    let sql_tag: String = db
+        .query_row(
+            "SELECT tag FROM instances WHERE name = ?1",
+            rusqlite::params![launched_name],
+            |row| row.get(0),
+        )
+        .expect("read Device B instance tag");
     assert_eq!(
         sql_tag, "test-relay-tag",
         "Device B DB tag column != test-relay-tag: {sql_tag:?}"
@@ -1336,8 +1867,8 @@ fn test_relay_roundtrip() {
     let kill_output = check("A", &format!("kill {remote_name}"), &path_a);
     logln!(log, "{}", kill_output.trim_end());
     assert!(
-        kill_output.contains("Sent SIGTERM")
-            || kill_output.contains("already terminated")
+        kill_output.contains("Sent SIGTERM to '")
+            || kill_output.contains("had already exited")
             || kill_output.contains("already_dead"),
         "Unexpected remote kill output:\n{kill_output}"
     );
@@ -1365,12 +1896,24 @@ fn test_relay_roundtrip() {
         "  OK: Device A removed mirrored remote instance after kill"
     );
 
-    // After the kill, a remote term_screen must fail (no inject port).
-    let post_kill_term = hcom_with_dir(&format!("term {remote_name}"), &path_a);
-    let post_kill_stdout = String::from_utf8_lossy(&post_kill_term.stdout).to_string();
-    assert!(
-        post_kill_stdout.contains("Remote term screen failed") || !post_kill_term.status.success(),
-        "term_screen should fail after kill, got stdout:\n{post_kill_stdout}"
+    // After the kill, a remote term_screen must eventually fail (no inject
+    // port). The killed instance's DB row clears as soon as its tracked child
+    // process dies, but the PTY manager process behind the inject port can
+    // legitimately outlive that by a couple of seconds — its reader thread
+    // joins the ConPTY pipe with a bounded 2s timeout before tearing itself
+    // down (see `join_with_timeout` in `src/pty/win.rs`) — so poll rather
+    // than asserting on the very first check.
+    poll_until(
+        || {
+            let post_kill_term = hcom_with_dir(&format!("term {remote_name}"), &path_a);
+            let post_kill_stdout = String::from_utf8_lossy(&post_kill_term.stdout).to_string();
+            (post_kill_stdout.contains("Remote term screen failed")
+                || !post_kill_term.status.success())
+            .then_some(())
+        },
+        "term_screen should fail after kill",
+        Duration::from_secs(10),
+        Duration::from_millis(300),
     );
     logln!(log, "  OK: term_screen after kill fails as expected");
 
@@ -1400,8 +1943,8 @@ fn test_relay_roundtrip() {
 
     // Register any spawned instances for cleanup BEFORE the poll/assertions,
     // using whatever names the CLI already printed. Resume can spawn a real
-    // Claude agent in a detached tmux session — if a later poll or assertion
-    // panics, the guard's Drop still needs to close those panes.
+    // Claude agent in a detached headless PTY — if a later poll or assertion
+    // panics, the guard's Drop still needs to kill that process group.
     for n in parse_names(&resume_stdout) {
         guard.register_local_b(n);
     }
@@ -1469,69 +2012,59 @@ fn test_relay_roundtrip() {
     );
     guard.register_local_b(resumed_full_name.clone());
 
+    drive_claude_startup(&path_b, &resumed_full_name, Duration::from_secs(90));
     let _resume_ready_id = wait_for_ready_event_any(
         &path_b,
         &[&resumed_full_name, &resumed_name],
         baseline_event_b,
         Duration::from_secs(90),
     );
-    let resumed_screen =
-        wait_for_screen_drawn(&path_b, &resumed_full_name, Duration::from_secs(30));
+    wait_for_screen_drawn(&path_b, &resumed_full_name, Duration::from_secs(30));
     logln!(
         log,
         "  OK: resumed instance PTY ready (life event + TUI drawn)"
     );
 
-    // After a bootstrapped resume, claude either sees the [hcom:name]
-    // marker injected into its first response/screen, OR the life event
-    // log records a "bootstrap" action. Either way counts as proof the
-    // resume actually rebooted claude, not just flipped a DB row.
-    let screen_lines = screen_lines_joined(&resumed_screen);
-    let screen_has_marker = screen_lines.contains("[hcom:");
+    // Evidence the resume actually rebooted claude into hcom, not just
+    // flipped a DB row: the life event log records a "bootstrap" action.
     let events_have_bootstrap = {
         let out = hcom_with_dir(
             &format!("events --agent {resumed_full_name} --last 40"),
             &path_b,
         );
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        stdout.contains("bootstrap") || stdout.contains("[hcom:")
+        String::from_utf8_lossy(&out.stdout).contains("bootstrap")
     };
-    // Claude --resume reuses the existing session JSONL, so the original
-    // [hcom:name] marker may already sit deep in claude's history rather
-    // than being redrawn on screen. Pull a large transcript window and
-    // look for it there.
-    let transcript_has_marker = {
-        ensure_relay_worker(&path_a);
-        let out = hcom_with_dir(
-            &format!("transcript {resumed_name}:{short_b} --last 50 --full"),
-            &path_a,
-        );
-        if out.status.success() {
-            let rpc = poll_rpc_result_on_device(&path_b, "transcript");
-            rpc["result"]["content"]
-                .as_str()
-                .map(|s| s.contains("[hcom:"))
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    };
-    // Last-resort evidence: hcom's hooks flip hooks_bound=true on first
-    // daemon contact after a resume. If this is true, the rebind actually
-    // happened even if the textual marker ended up somewhere we don't
-    // scan.
+    // Fallback evidence: hcom's hooks flip hooks_bound=true on first
+    // daemon contact after a resume.
     let hooks_bound = find_instance_by_base(&path_b, &resumed_name)
         .and_then(|inst| inst["hooks_bound"].as_bool())
         .unwrap_or(false);
     assert!(
-        screen_has_marker || events_have_bootstrap || transcript_has_marker || hooks_bound,
+        events_have_bootstrap || hooks_bound,
         "no evidence of hcom rebind on resumed {resumed_full_name} \
-         (screen_marker={screen_has_marker}, events={events_have_bootstrap}, \
-          transcript_marker={transcript_has_marker}, hooks_bound={hooks_bound})"
+         (events={events_have_bootstrap}, hooks_bound={hooks_bound})"
     );
     logln!(
         log,
-        "  OK: resumed instance is rebound to hcom (screen={screen_has_marker}, events={events_have_bootstrap}, transcript={transcript_has_marker}, hooks_bound={hooks_bound})"
+        "  OK: resumed instance is rebound to hcom (events={events_have_bootstrap}, hooks_bound={hooks_bound})"
+    );
+
+    let unexpected = claude_mock.unexpected();
+    assert!(
+        unexpected.is_empty(),
+        "Claude mock received {} unexpected request(s):\n{}",
+        unexpected.len(),
+        unexpected
+            .iter()
+            .map(|req| format!("{} {}\n{}", req.method, req.path, req.body))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    );
+    let transport_errors = claude_mock.transport_errors();
+    assert!(
+        transport_errors.is_empty(),
+        "Claude mock hit transport errors:\n{}",
+        transport_errors.join("\n")
     );
 
     // Cleanup handled by guard Drop

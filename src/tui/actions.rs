@@ -96,17 +96,17 @@ impl App {
         self.data = new_data;
 
         // Sync popup enabled state from DB (source of truth after config.toml change)
-        if let Some(popup) = self.ui.relay_popup.as_mut() {
-            if !popup.toggling {
-                popup.enabled = self.data.relay_enabled;
-            }
+        if let Some(popup) = self.ui.relay_popup.as_mut()
+            && !popup.toggling
+        {
+            popup.enabled = self.data.relay_enabled;
         }
 
         // Restore cursor by name
-        if let Some(ref name) = saved_cursor_name {
-            if let Some(pos) = self.data.agents.iter().position(|a| &a.name == name) {
-                self.ui.cursor = pos;
-            }
+        if let Some(ref name) = saved_cursor_name
+            && let Some(pos) = self.data.agents.iter().position(|a| &a.name == name)
+        {
+            self.ui.cursor = pos;
         }
 
         // Clamp cursor
@@ -148,12 +148,25 @@ impl App {
                 }
                 other => self.ui.flash = Some(rpc_error_flash("Kill failed", other)),
             },
-            RpcOp::ForkAgent { name } => match result.result {
+            RpcOp::ForkAgent { name, silent } => match result.result {
                 Ok(resp) if resp.ok() => {
-                    self.ui.flash = Some(Flash::new(format!("Forked {}", name), Theme::flash_ok()));
+                    if !silent {
+                        self.ui.flash =
+                            Some(Flash::new(format!("Forked {}", name), Theme::flash_ok()));
+                    }
                     self.reload_data_force();
                 }
                 other => self.ui.flash = Some(rpc_error_flash("Fork failed", other)),
+            },
+            RpcOp::ResumeAgent { name, silent } => match result.result {
+                Ok(resp) if resp.ok() => {
+                    if !silent {
+                        self.ui.flash =
+                            Some(Flash::new(format!("Resumed {}", name), Theme::flash_ok()));
+                    }
+                    self.reload_data_force();
+                }
+                other => self.ui.flash = Some(rpc_error_flash("Resume failed", other)),
             },
             RpcOp::KillPid { pid } => match result.result {
                 Ok(resp) if resp.ok() => {
@@ -270,8 +283,12 @@ impl App {
                 self.ui.flash = Some(Flash::new(label, Theme::flash_info()));
             }
             ConfirmAction::ForkAgents(ref names) => {
+                let silent = names.len() > 1;
                 for name in names {
-                    if let Err(e) = self.enqueue_rpc(RpcOp::ForkAgent { name: name.clone() }) {
+                    if let Err(e) = self.enqueue_rpc(RpcOp::ForkAgent {
+                        name: name.clone(),
+                        silent,
+                    }) {
                         self.ui.flash = Some(Flash::new(
                             format!("Fork failed: {}", e),
                             Theme::flash_err(),
@@ -279,10 +296,31 @@ impl App {
                         return;
                     }
                 }
-                let label = if names.len() == 1 {
-                    format!("Forking {}", names[0])
-                } else {
+                let label = if silent {
                     format!("Forking {} agents", names.len())
+                } else {
+                    format!("Forking {}", names[0])
+                };
+                self.ui.flash = Some(Flash::new(label, Theme::flash_info()));
+            }
+            ConfirmAction::ResumeAgents(ref names) => {
+                let silent = names.len() > 1;
+                for name in names {
+                    if let Err(e) = self.enqueue_rpc(RpcOp::ResumeAgent {
+                        name: name.clone(),
+                        silent,
+                    }) {
+                        self.ui.flash = Some(Flash::new(
+                            format!("Resume failed: {}", e),
+                            Theme::flash_err(),
+                        ));
+                        return;
+                    }
+                }
+                let label = if names.len() == 1 {
+                    format!("Resuming {}", names[0])
+                } else {
+                    format!("Resuming {} agents", names.len())
                 };
                 self.ui.flash = Some(Flash::new(label, Theme::flash_info()));
             }

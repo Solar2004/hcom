@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::core::filters::{
-    EventFilterArgs, FILE_WRITE_CONTEXTS, build_sql_from_flags, resolve_filter_names,
-};
+use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
 use crate::core::launch_status::wait_for_launch;
 use crate::db::HcomDb;
+use crate::db::subscriptions::{
+    SubCreateOutcome, build_and_insert_sql_subscription, create_filter_subscription,
+};
 use crate::shared::CommandContext;
 
 /// Parsed arguments for `hcom events`.
@@ -137,17 +138,17 @@ pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -
             }
             "status" => {
                 // Truncate detail unless --cmd or --file filter active
-                if !filters.contains_key("cmd") && !filters.contains_key("file") {
-                    if let Some(detail) = obj.get("detail").and_then(|v| v.as_str()) {
-                        if detail.len() > 60 {
-                            let end = (0..=60)
-                                .rev()
-                                .find(|&i| detail.is_char_boundary(i))
-                                .unwrap_or(0);
-                            let truncated = format!("{}...", &detail[..end]);
-                            obj.insert("detail".into(), json!(truncated));
-                        }
-                    }
+                if !filters.contains_key("cmd")
+                    && !filters.contains_key("file")
+                    && let Some(detail) = obj.get("detail").and_then(|v| v.as_str())
+                    && detail.len() > 60
+                {
+                    let end = (0..=60)
+                        .rev()
+                        .find(|&i| detail.is_char_boundary(i))
+                        .unwrap_or(0);
+                    let truncated = format!("{}...", &detail[..end]);
+                    obj.insert("detail".into(), json!(truncated));
                 }
                 obj.remove("position");
             }
@@ -256,7 +257,25 @@ fn events_sub_list(db: &HcomDb) -> i32 {
         return 0;
     }
 
-    println!("{:<10} {:<12} {:<10} FILTER", "ID", "FOR", "MODE");
+    let id_width = subs
+        .iter()
+        .filter_map(|sub| sub.get("id").and_then(|v| v.as_str()))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(2)
+        .max(10);
+    let caller_width = subs
+        .iter()
+        .filter_map(|sub| sub.get("caller").and_then(|v| v.as_str()))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(3)
+        .max(12);
+
+    println!(
+        "{:<id_width$} {:<caller_width$} {:<10} FILTER",
+        "ID", "FOR", "MODE"
+    );
     for sub in &subs {
         let id = sub.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
@@ -303,9 +322,12 @@ fn events_sub_list(db: &HcomDb) -> i32 {
             }
         };
 
-        println!("{id:<10} {caller:<12} {mode:<10} {filter_display}");
+        println!("{id:<id_width$} {caller:<caller_width$} {mode:<10} {filter_display}");
         if let Some(on_hit) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
-            println!("{:<10} {:<12} {:<10} on-hit: {on_hit:?}", "", "", "");
+            println!(
+                "{:<id_width$} {:<caller_width$} {:<10} on-hit: {on_hit:?}",
+                "", "", ""
+            );
         }
     }
 
@@ -327,215 +349,36 @@ fn events_sub_filter(
     once: bool,
     on_hit: Option<&str>,
 ) -> i32 {
-    create_filter_subscription(db, filters, sql_parts, caller, once, false, on_hit)
-}
-
-/// Determine sender_kind for a sub caller at creation time.
-/// Stored on the sub so on-hit provenance stays stable across caller lifecycle.
-fn resolve_caller_kind(db: &HcomDb, caller: &str) -> &'static str {
-    let exists: bool = db
-        .conn()
-        .query_row(
-            "SELECT 1 FROM instances WHERE name = ?",
-            rusqlite::params![caller],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if exists { "instance" } else { "external" }
-}
-
-fn collision_self_relevance_sql(caller: &str) -> String {
-    let caller_escaped = caller.replace('\'', "''");
-    format!(
-        "(events_v.instance = '{caller_escaped}' OR EXISTS (SELECT 1 FROM events_v e2 WHERE e2.type = 'status' AND e2.status_context IN {ctx} AND e2.status_detail = events_v.status_detail AND e2.instance = '{caller_escaped}' AND ABS(strftime('%s', events_v.timestamp) - strftime('%s', e2.timestamp)) < 30))",
-        ctx = FILE_WRITE_CONTEXTS
-    )
-}
-
-/// Outcome of a subscription insert attempt.
-pub(crate) enum SubCreateOutcome {
-    Created { id: String, final_sql: String },
-    AlreadyExists { id: String },
-}
-
-/// Build and insert a filter-based subscription row into `kv`.
-/// No printing — callers format output as appropriate.
-pub(crate) fn build_and_insert_filter_subscription(
-    db: &HcomDb,
-    filters: &HashMap<String, Vec<String>>,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    on_hit: Option<&str>,
-) -> Result<SubCreateOutcome, String> {
-    // Build SQL from filters
-    let mut sql = match build_sql_from_flags(filters) {
-        Ok(s) if !s.is_empty() => s,
-        Ok(_) => return Err("No valid filters provided".to_string()),
-        Err(e) => return Err(format!("Filter error: {e}")),
-    };
-
-    // Validate and combine user-provided SQL parts
-    if !sql_parts.is_empty() {
-        let manual_sql = sql_parts.join(" ").replace("\\!", "!");
-        if let Err(e) = db.conn().execute(
-            &format!("SELECT 1 FROM events_v WHERE ({manual_sql}) LIMIT 0"),
-            [],
-        ) {
-            return Err(format!("Invalid SQL: {e}"));
+    let outcome = match create_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
         }
-        sql = format!("({sql}) AND ({manual_sql})");
-    }
-
-    // Collision self-relevance filtering
-    if filters.contains_key("collision") {
-        let self_relevance = collision_self_relevance_sql(caller);
-        sql = format!("({sql}) AND {self_relevance}");
-    }
-
-    // Generate subscription ID from SHA256 hash
-    let id_source = format!(
-        "{}:{}:{}:{}:{}",
-        caller,
-        serde_json::to_string(filters).unwrap_or_default(),
-        sql,
-        once,
-        on_hit.unwrap_or(""),
-    );
-    let hash = sha256_hash(&id_source);
-    let sub_id = format!("sub-{}", &hash[..8]);
-    let sub_key = format!("events_sub:{sub_id}");
-
-    // Check duplicate
-    if db.kv_get(&sub_key).ok().flatten().is_some() {
-        return Ok(SubCreateOutcome::AlreadyExists { id: sub_id });
-    }
-
-    let now = crate::shared::time::now_epoch_f64();
-    let last_id = db.get_last_event_id();
-
-    let mut sub_data = json!({
-        "id": sub_id,
-        "caller": caller,
-        "filters": filters,
-        "sql": sql,
-        "created": now,
-        "last_id": last_id,
-        "once": once,
-    });
-    if let Some(text) = on_hit {
-        sub_data["on_hit_text"] = json!(text);
-        // Capture caller_kind at creation so on-hit provenance stays stable
-        // even if the caller instance stops before the sub fires.
-        sub_data["caller_kind"] = json!(resolve_caller_kind(db, caller));
-    }
-
-    let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-
-    Ok(SubCreateOutcome::Created {
-        id: sub_id,
-        final_sql: sql,
-    })
-}
-
-/// Core subscription creation logic. When `silent` is true, suppresses all stdout output.
-/// Used by both the CLI `events sub` command and `auto_subscribe_defaults`.
-pub(crate) fn create_filter_subscription(
-    db: &HcomDb,
-    filters: &HashMap<String, Vec<String>>,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    silent: bool,
-    on_hit: Option<&str>,
-) -> i32 {
-    let outcome =
-        match build_and_insert_filter_subscription(db, filters, sql_parts, caller, once, on_hit) {
-            Ok(o) => o,
-            Err(e) => {
-                if !silent {
-                    eprintln!("Error: {e}");
-                }
-                return 1;
-            }
-        };
+    };
 
     match outcome {
         SubCreateOutcome::AlreadyExists { id } => {
-            if !silent {
-                println!("Subscription {id} already exists");
-            }
+            println!("Subscription {id} already exists");
         }
         SubCreateOutcome::Created { id, final_sql } => {
-            if !silent {
-                println!("Subscription {id} created");
+            println!("Subscription {id} created");
 
-                if let Ok(count) = db.conn().query_row(
-                    &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
-                    [],
-                    |row| row.get::<_, i64>(0),
-                ) {
-                    if count > 0 {
-                        println!("  historical matches: {count} events");
-                        println!("  You will be notified on the next matching event(s)");
-                    }
-                }
-
-                maybe_show_tip(db, caller, "sub:created");
+            if let Ok(count) = db.conn().query_row(
+                &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
+                [],
+                |row| row.get::<_, i64>(0),
+            ) && count > 0
+            {
+                println!("  historical matches: {count} events");
+                println!("  You will be notified on the next matching event(s)");
             }
+
+            maybe_show_tip(db, caller, "sub:created");
         }
     }
 
     0
-}
-
-/// Build and insert a raw-SQL subscription row into `kv`. No printing.
-pub(crate) fn build_and_insert_sql_subscription(
-    db: &HcomDb,
-    sql_parts: &[String],
-    caller: &str,
-    once: bool,
-    on_hit: Option<&str>,
-) -> Result<SubCreateOutcome, String> {
-    let sql = sql_parts.join(" ").replace("\\!", "!");
-
-    if let Err(e) = db
-        .conn()
-        .execute(&format!("SELECT 1 FROM events_v WHERE ({sql}) LIMIT 0"), [])
-    {
-        return Err(format!("Invalid SQL: {e}"));
-    }
-
-    let hash = sha256_hash(&format!("{caller}{sql}{once}{}", on_hit.unwrap_or("")));
-    let sub_id = format!("sub-{}", &hash[..8]);
-    let sub_key = format!("events_sub:{sub_id}");
-
-    if db.kv_get(&sub_key).ok().flatten().is_some() {
-        return Ok(SubCreateOutcome::AlreadyExists { id: sub_id });
-    }
-
-    let now = crate::shared::time::now_epoch_f64();
-    let last_id = db.get_last_event_id();
-
-    let mut sub_data = json!({
-        "id": sub_id,
-        "sql": sql,
-        "caller": caller,
-        "once": once,
-        "last_id": last_id,
-        "created": now,
-    });
-    if let Some(text) = on_hit {
-        sub_data["on_hit_text"] = json!(text);
-        sub_data["caller_kind"] = json!(resolve_caller_kind(db, caller));
-    }
-
-    let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-
-    Ok(SubCreateOutcome::Created {
-        id: sub_id,
-        final_sql: sql,
-    })
 }
 
 /// Create a raw SQL subscription.
@@ -578,8 +421,8 @@ fn events_sub_sql(
             // Show latest match as example
             if let Ok(mut stmt) = db.conn().prepare(
                 &format!("SELECT timestamp, type, instance FROM events_v WHERE ({sql}) ORDER BY id DESC LIMIT 1")
-            ) {
-                if let Ok(row) = stmt.query_row([], |row| {
+            )
+                && let Ok(row) = stmt.query_row([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -589,7 +432,6 @@ fn events_sub_sql(
                     let ts = if row.0.len() > 19 { &row.0[..19] } else { &row.0 };
                     println!("  latest match: [{}] {} @ {}", row.1, row.2, ts);
                 }
-            }
             println!("  You will be notified on the next matching event(s)");
         } else {
             println!("  historical matches: 0 (filter will apply to future events only)");
@@ -623,7 +465,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
 
     let once = args.once;
     let target_instance = args.for_agent.as_deref().map(|name| {
-        crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
+        crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string())
     });
     let sql_parts: Vec<String> = args.rest.clone();
 
@@ -662,7 +504,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
     } else if let Some(name) = caller_name {
         name.to_string()
     } else {
-        match crate::identity::resolve_identity(db, None, None, None, None, None, None) {
+        match crate::identity::resolve_identity(db, None, None, None, None, None) {
             Ok(id) => id.name,
             Err(_) => {
                 eprintln!("Error: Cannot create subscription without identity.");
@@ -701,7 +543,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
              \x20 --type TYPE                       message | status | life\n\
              \x20 --status VAL                      listening | active | blocked\n\
              \x20 --context PATTERN                 tool:Bash | deliver:X (supports * wildcard)\n\
-             \x20 --action VAL                      created | started | ready | stopped | batch_launched\n\
+             \x20 --action VAL                      created | started | ready | stopped | batch_launched | launch_failed | launch_blocked\n\
              \x20 --cmd PATTERN                     Shell command (contains, ^prefix, =exact)\n\
              \x20 --file PATH                       File write (*.py for glob, file.py for contains)\n\
              \x20 --collision                        Two agents edit same file within 30s\n\
@@ -747,6 +589,30 @@ fn cmd_events_unsub(db: &HcomDb, args: &EventsUnsubArgs) -> i32 {
     let _ = db.kv_set(&key, None);
     println!("Removed {sub_id}");
     0
+}
+
+/// An `--agent` typo otherwise looks exactly like "no events yet".
+fn warn_unknown_agent_filters(db: &HcomDb, filters: &crate::core::filters::FilterMap) {
+    let Some(names) = filters.get("instance") else {
+        return;
+    };
+    for name in names {
+        let seen = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM events WHERE instance = ? LIMIT 1",
+                rusqlite::params![name],
+                |_| Ok(()),
+            )
+            .is_ok()
+            || db.get_instance_full(name).ok().flatten().is_some();
+        if !seen {
+            eprintln!(
+                "Warning: {}",
+                crate::identity::describe_missing_agent(db, name)
+            );
+        }
+    }
 }
 
 /// Install a subscription on a remote device via SUB_CREATE RPC.
@@ -929,6 +795,14 @@ fn cmd_events_unsub_remote(db: &HcomDb, device: &str, sub_id: &str) -> i32 {
 }
 
 /// Handle `hcom events launch [batch_id] [--timeout N]`.
+///
+/// Exit codes:
+/// - `0` — batch reached `ready`
+/// - `1` — batch reported `error` or no launches were found (`no_launches`)
+/// - `2` — wait timed out (`timeout`) or batch is `blocked` on user attention
+///
+/// Callers that just want "did it succeed" should check `== 0`. Callers that
+/// distinguish "still in progress" from "broken" should branch on `2` vs `1`.
 fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option<&str>) -> i32 {
     let timeout = args.timeout;
 
@@ -937,7 +811,7 @@ fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option
     // Resolve launcher
     let launcher = instance_name.map(|s| s.to_string()).or_else(|| {
         if crate::shared::is_inside_ai_tool() {
-            crate::identity::resolve_identity(db, None, None, None, None, None, None)
+            crate::identity::resolve_identity(db, None, None, None, None, None)
                 .ok()
                 .map(|id| id.name)
         } else {
@@ -952,10 +826,10 @@ fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option
         serde_json::to_string(&result_json).unwrap_or_default()
     );
 
-    if result_json.get("status").and_then(|v| v.as_str()) == Some("ready") {
-        0
-    } else {
-        1
+    match result_json.get("status").and_then(|v| v.as_str()) {
+        Some("ready") => 0,
+        Some("timeout") | Some("blocked") => 2,
+        _ => 1,
     }
 }
 
@@ -981,42 +855,41 @@ fn events_wait(
     let lookback_query = format!(
         "SELECT * FROM events_v WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
     );
-    if let Ok(mut stmt) = db.conn().prepare(&lookback_query) {
-        if let Ok(mut rows) = stmt.query(rusqlite::params![lookback_ts]) {
-            if let Ok(Some(row)) = rows.next() {
-                if let Ok(event) = parse_event_row(row) {
-                    let output = if full_output {
-                        event.clone()
-                    } else {
-                        streamline_event(&event, filters)
-                    };
-                    println!("{}", serde_json::to_string(&output).unwrap_or_default());
-                    return 0;
-                }
-            }
-        }
+    if let Ok(mut stmt) = db.conn().prepare(&lookback_query)
+        && let Ok(mut rows) = stmt.query(rusqlite::params![lookback_ts])
+        && let Ok(Some(row)) = rows.next()
+        && let Ok(event) = parse_event_row(row)
+    {
+        let output = if full_output {
+            event.clone()
+        } else {
+            streamline_event(&event, filters)
+        };
+        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+        return 0;
     }
 
     // Setup TCP notify server for instant wake — only useful when we can
-    // register a port for `notify_all_instances` to poke. Anonymous waits
-    // (no instance_name) skip the listener and fall through to a short poll.
+    // register an `events_wait` wake endpoint for `crate::notify::wake_all`
+    // to poke. Anonymous waits (no instance_name) skip the listener and
+    // fall through to a short poll.
     let mut notify_server: Option<TcpListener> = None;
     let mut notify_port: Option<u16> = None;
-    if let Some(name) = instance_name {
-        if let Ok(server) = TcpListener::bind("127.0.0.1:0") {
-            if let Ok(addr) = server.local_addr() {
-                let port = addr.port();
-                server.set_nonblocking(true).ok();
-                if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
-                    notify_server = Some(server);
-                    notify_port = Some(port);
-                }
-            }
+    if let Some(name) = instance_name
+        && let Ok(server) = TcpListener::bind("127.0.0.1:0")
+        && let Ok(addr) = server.local_addr()
+    {
+        let port = addr.port();
+        server.set_nonblocking(true).ok();
+        if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
+            notify_server = Some(server);
+            notify_port = Some(port);
         }
     }
 
     let start = Instant::now();
     let mut last_id = db.get_last_event_id();
+    let mut unread_preview_shown = false;
 
     let result = loop {
         if start.elapsed() >= Duration::from_secs(wait_timeout) {
@@ -1058,14 +931,16 @@ fn events_wait(
             break 0;
         }
 
-        // Check for unread messages (interrupt wait) — use <hcom> XML tag format
-        if let Some(name) = instance_name {
+        // Check for unread messages (optional preview notification) — use <hcom> XML tag format
+        if let Some(name) = instance_name
+            && !unread_preview_shown
+        {
             let messages = db.get_unread_messages(name);
             if !messages.is_empty() {
                 // Format as <hcom> XML tag
                 let preview = build_message_preview(db, name);
                 println!("{preview}");
-                break 0;
+                unread_preview_shown = true;
             }
         }
 
@@ -1120,15 +995,6 @@ fn parse_event_row(row: &rusqlite::Row) -> Result<Value, rusqlite::Error> {
     }))
 }
 
-/// SHA-256 hex hash
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Build <hcom> XML message preview for unread notification.
 fn build_message_preview(db: &HcomDb, instance_name: &str) -> String {
     let messages = db.get_unread_messages(instance_name);
@@ -1137,10 +1003,10 @@ fn build_message_preview(db: &HcomDb, instance_name: &str) -> String {
     }
 
     // Build simple "sender → you" format
-    let display_name = crate::instances::get_display_name(db, instance_name);
+    let display_name = crate::identity::get_display_name(db, instance_name);
     let senders: Vec<String> = messages
         .iter()
-        .map(|m| crate::instances::get_display_name(db, &m.from))
+        .map(|m| crate::identity::get_display_name(db, &m.from))
         .collect();
 
     // Deduplicate senders preserving order
@@ -1210,6 +1076,11 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     // Convert clap filter args to FilterMap
     let mut filters = args.filters.to_filter_map();
     resolve_filter_names(&mut filters, db);
+    // --all also searches archives, where an agent may exist only historically;
+    // --wait may legitimately target an agent that hasn't started yet.
+    if !args.remote_fetch && !search_all && wait_timeout.is_none() {
+        warn_unknown_agent_filters(db, &filters);
+    }
 
     // Remote one-shot fetch
     if args.remote_fetch {
@@ -1338,51 +1209,50 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 
         // Search archives
         let archive_dir = crate::paths::hcom_dir().join("archive");
-        if archive_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&archive_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let db_path = path.join("hcom.db");
-                    if !db_path.exists() {
-                        continue;
-                    }
-                    let archive_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("archive");
+        if archive_dir.exists()
+            && let Ok(entries) = std::fs::read_dir(&archive_dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let db_path = path.join("hcom.db");
+                if !db_path.exists() {
+                    continue;
+                }
+                let archive_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("archive");
 
-                    if let Ok(archive_db) = HcomDb::open_raw(&db_path) {
-                        // Build archive query with same filters
-                        let archive_filter = filter_query.clone();
-                        let query = format!(
-                            "SELECT * FROM events_v WHERE 1=1{archive_filter} ORDER BY id DESC LIMIT {last_n}"
-                        );
-                        if let Ok(mut stmt) = archive_db.conn().prepare(&query) {
-                            if let Ok(rows) = stmt.query_map([], |row| {
-                                let id: i64 = row.get("id")?;
-                                let ts: String = row.get("timestamp")?;
-                                let etype: String = row.get("type")?;
-                                let instance: String = row.get("instance")?;
-                                let data_str: String = row.get("data")?;
-                                Ok((id, ts, etype, instance, data_str))
-                            }) {
-                                for row in rows.flatten() {
-                                    let (id, ts, etype, instance, data_str) = row;
-                                    let data: Value =
-                                        serde_json::from_str(&data_str).unwrap_or(json!({}));
-                                    all_events.push(json!({
-                                        "id": id,
-                                        "ts": ts,
-                                        "type": etype,
-                                        "instance": instance,
-                                        "data": data,
-                                        "source": archive_name,
-                                    }));
-                                }
-                            }
+                if let Ok(archive_db) = HcomDb::open_raw(&db_path) {
+                    // Build archive query with same filters
+                    let archive_filter = filter_query.clone();
+                    let query = format!(
+                        "SELECT * FROM events_v WHERE 1=1{archive_filter} ORDER BY id DESC LIMIT {last_n}"
+                    );
+                    if let Ok(mut stmt) = archive_db.conn().prepare(&query)
+                        && let Ok(rows) = stmt.query_map([], |row| {
+                            let id: i64 = row.get("id")?;
+                            let ts: String = row.get("timestamp")?;
+                            let etype: String = row.get("type")?;
+                            let instance: String = row.get("instance")?;
+                            let data_str: String = row.get("data")?;
+                            Ok((id, ts, etype, instance, data_str))
+                        })
+                    {
+                        for row in rows.flatten() {
+                            let (id, ts, etype, instance, data_str) = row;
+                            let data: Value = serde_json::from_str(&data_str).unwrap_or(json!({}));
+                            all_events.push(json!({
+                                "id": id,
+                                "ts": ts,
+                                "type": etype,
+                                "instance": instance,
+                                "data": data,
+                                "source": archive_name,
+                            }));
                         }
                     }
                 }
@@ -1390,11 +1260,17 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
         }
     }
 
-    // Sort by timestamp and limit
-    all_events.sort_by(|a, b| {
-        let ts_a = a.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        let ts_b = b.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        ts_a.cmp(ts_b)
+    // Chronological by timestamp (relay-pulled events keep their original
+    // time, so insertion order isn't chronological). Timestamps have second
+    // resolution; break ties by id to keep same-second events in write order.
+    all_events.sort_by_cached_key(|v| {
+        (
+            v.get("ts")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            v.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+        )
     });
 
     if all_events.len() > last_n {
@@ -1546,27 +1422,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sha256_hash() {
-        let h1 = sha256_hash("test input");
-        let h2 = sha256_hash("test input");
-        let h3 = sha256_hash("different input");
-        assert_eq!(h1, h2); // deterministic
-        assert_ne!(h1, h3); // different inputs
-        assert_eq!(h1.len(), 64); // full SHA-256 hex
-        // Verify known SHA-256 hash
-        assert_eq!(&h1[..8], "9dfe6f15");
-    }
-
-    #[test]
-    fn test_collision_self_relevance_matches_filter_constants() {
-        let sql = collision_self_relevance_sql("luna");
-        assert!(sql.contains(FILE_WRITE_CONTEXTS));
-        assert!(sql.contains("< 30"));
-        assert!(!sql.contains("tool:edit_file"));
-        assert!(!sql.contains("< 20"));
-    }
-
-    #[test]
     fn test_events_args_wait_with_value() {
         use clap::Parser;
         let args = EventsArgs::try_parse_from(["events", "--wait", "30", "--full"]).unwrap();
@@ -1645,5 +1500,258 @@ mod tests {
             }
             _ => panic!("Expected Launch subcommand"),
         }
+    }
+
+    const UNRELATED_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+    struct WaiterFixture {
+        _temp: tempfile::TempDir,
+        db_path: std::path::PathBuf,
+        writer: HcomDb,
+    }
+
+    impl WaiterFixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let db_path = temp.path().join("events_wait_test.db");
+            let writer = HcomDb::open_raw(&db_path).unwrap();
+            writer.init_db().unwrap();
+            Self {
+                _temp: temp,
+                db_path,
+                writer,
+            }
+        }
+
+        fn open_reader(&self) -> HcomDb {
+            HcomDb::open_raw(&self.db_path).unwrap()
+        }
+
+        fn register_instance(&self, name: &str) {
+            self.writer
+                .conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, status, created_at, last_event_id) VALUES (?1, 'test', 'active', 1000.0, 0)",
+                    rusqlite::params![name],
+                )
+                .unwrap();
+        }
+
+        fn wait_for_notify_endpoint(&self, name: &str) -> bool {
+            for _ in 0..100 {
+                if self.writer.has_notify_endpoint_kind(name, "events_wait") {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        fn send_message(&self, from: &str, text: &str) {
+            let msg_data = json!({
+                "from": from,
+                "text": text,
+                "scope": "broadcast",
+            });
+            self.writer
+                .log_event_with_ts("message", from, &msg_data, None)
+                .unwrap();
+        }
+
+        fn send_status(&self, instance: &str, status: &str, detail: &str) {
+            let status_data = json!({
+                "status": status,
+                "detail": detail,
+            });
+            self.writer
+                .log_event_with_ts("status", instance, &status_data, None)
+                .unwrap();
+        }
+
+        fn wake(&self, instance: &str) {
+            crate::notify::wake(
+                &self.writer,
+                instance,
+                &[crate::notify::WakeKind::EventsWait],
+            );
+        }
+    }
+
+    struct WaiterWorker {
+        handle: std::thread::JoinHandle<i32>,
+        rx: std::sync::mpsc::Receiver<i32>,
+    }
+
+    impl WaiterWorker {
+        fn spawn(
+            reader: HcomDb,
+            filter_query: &'static str,
+            timeout_secs: u64,
+            instance: &'static str,
+        ) -> Self {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let code = events_wait(
+                    &reader,
+                    filter_query,
+                    timeout_secs,
+                    false,
+                    &HashMap::new(),
+                    Some(instance),
+                );
+                let _ = tx.send(code);
+                code
+            });
+            Self { handle, rx }
+        }
+
+        fn probe(&self, timeout: Duration) -> Result<i32, std::sync::mpsc::RecvTimeoutError> {
+            self.rx.recv_timeout(timeout)
+        }
+
+        fn join(self) -> i32 {
+            self.handle.join().unwrap_or(-1)
+        }
+    }
+
+    #[test]
+    fn test_events_wait_unrelated_unread_arriving_after_readiness() {
+        let f = WaiterFixture::new();
+        f.register_instance("waiter_arriving");
+        let initial_cursor = f.writer.get_cursor("waiter_arriving");
+
+        let worker = WaiterWorker::spawn(
+            f.open_reader(),
+            " AND (type = 'status')",
+            5,
+            "waiter_arriving",
+        );
+        let ready = f.wait_for_notify_endpoint("waiter_arriving");
+
+        f.send_message("sender", "unrelated arriving message");
+        f.wake("waiter_arriving");
+
+        let probe = worker.probe(UNRELATED_PROBE_TIMEOUT);
+        if probe.is_err() {
+            f.send_status("waiter_arriving", "active", "matched");
+            f.wake("waiter_arriving");
+        }
+        let code = worker.join();
+        let endpoint_cleaned = !f
+            .writer
+            .has_notify_endpoint_kind("waiter_arriving", "events_wait");
+        let cursor_after = f.writer.get_cursor("waiter_arriving");
+
+        assert_eq!(cursor_after, initial_cursor);
+        assert!(
+            endpoint_cleaned,
+            "notify endpoint must be cleaned up on exit"
+        );
+        assert!(
+            ready && probe.is_err() && code == 0,
+            "waiter must remain pending on unrelated unread: ready={ready}, probe={probe:?}, code={code}"
+        );
+    }
+
+    #[test]
+    fn test_events_wait_preexisting_unrelated_unread_does_not_satisfy_filter() {
+        let f = WaiterFixture::new();
+        f.register_instance("waiter_pre");
+        f.send_message("sender", "preexisting unread message");
+        let initial_cursor = f.writer.get_cursor("waiter_pre");
+
+        let worker =
+            WaiterWorker::spawn(f.open_reader(), " AND (type = 'status')", 1, "waiter_pre");
+
+        let probe = worker.probe(UNRELATED_PROBE_TIMEOUT);
+        let code = worker.join();
+        let endpoint_cleaned = !f
+            .writer
+            .has_notify_endpoint_kind("waiter_pre", "events_wait");
+        let cursor_after = f.writer.get_cursor("waiter_pre");
+
+        assert_eq!(cursor_after, initial_cursor);
+        assert!(
+            endpoint_cleaned,
+            "notify endpoint must be cleaned up on exit"
+        );
+        assert!(
+            probe.is_err() && code == 1,
+            "events_wait must not break with 0 on preexisting unread message: probe={probe:?}, code={code}"
+        );
+    }
+
+    #[test]
+    fn test_events_wait_matching_status_after_readiness_exits_zero() {
+        let f = WaiterFixture::new();
+        f.register_instance("waiter_matching");
+        let initial_cursor = f.writer.get_cursor("waiter_matching");
+
+        let worker = WaiterWorker::spawn(
+            f.open_reader(),
+            " AND (type = 'status')",
+            5,
+            "waiter_matching",
+        );
+        let ready = f.wait_for_notify_endpoint("waiter_matching");
+
+        f.send_status("waiter_matching", "active", "ready");
+        f.wake("waiter_matching");
+
+        let code = worker.join();
+        let endpoint_cleaned = !f
+            .writer
+            .has_notify_endpoint_kind("waiter_matching", "events_wait");
+        let cursor_after = f.writer.get_cursor("waiter_matching");
+
+        assert!(ready, "endpoint must be registered");
+        assert!(
+            endpoint_cleaned,
+            "notify endpoint must be cleaned up on exit"
+        );
+        assert_eq!(cursor_after, initial_cursor);
+        assert_eq!(code, 0, "matching status event must wake and exit 0");
+    }
+
+    #[test]
+    fn test_events_wait_timeout_returns_one() {
+        let f = WaiterFixture::new();
+        f.register_instance("timeout_agent");
+        let filters = HashMap::new();
+        let reader = f.open_reader();
+        let code = events_wait(
+            &reader,
+            " AND (type = 'nonexistent')",
+            1,
+            false,
+            &filters,
+            Some("timeout_agent"),
+        );
+        assert_eq!(code, 1);
+        assert!(
+            !f.writer
+                .has_notify_endpoint_kind("timeout_agent", "events_wait")
+        );
+    }
+
+    #[test]
+    fn test_events_wait_invalid_sql_returns_two() {
+        let f = WaiterFixture::new();
+        f.register_instance("sql_agent");
+        let filters = HashMap::new();
+        let reader = f.open_reader();
+        let code = events_wait(
+            &reader,
+            " AND (invalid sql %%%)",
+            1,
+            false,
+            &filters,
+            Some("sql_agent"),
+        );
+        assert_eq!(code, 2);
+        assert!(
+            !f.writer
+                .has_notify_endpoint_kind("sql_agent", "events_wait")
+        );
     }
 }

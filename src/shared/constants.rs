@@ -43,39 +43,8 @@ pub fn extract_mentions(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Stable subscription ID for automatic thread membership rows.
-pub fn thread_membership_sub_id(thread: &str, member: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(format!("thread-member:{thread}:{member}").as_bytes());
-    let hash = hasher.finalize();
-    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-    format!("sub-{}", &hex[..8])
-}
-
-/// Binding marker for vanilla sessions: [hcom:<name>].
-pub static BIND_MARKER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[hcom:([a-z0-9_]+)\]").unwrap());
-
-/// Tools available for launch.
-pub const RELEASED_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode"];
-
-/// Tools that support background/headless mode.
-pub const RELEASED_BACKGROUND: &[&str] = &["claude"];
-
-/// Tool detection markers — set by AI tools, cleared to prevent inheritance.
-pub const TOOL_MARKER_VARS: &[&str] = &[
-    "CLAUDECODE",
-    "GEMINI_CLI",
-    "GEMINI_SYSTEM_MD",
-    "CODEX_SANDBOX",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-    "CODEX_MANAGED_BY_NPM",
-    "CODEX_MANAGED_BY_BUN",
-    "CODEX_THREAD_ID",
-    "OPENCODE",
-];
+// Released-tool lists moved to `crate::integration_spec` —
+// see `released_tool_names()` / `released_background_tool_names()`.
 
 /// HCOM identity vars — set per-instance, cleared to prevent parent identity leakage.
 pub const HCOM_IDENTITY_VARS: &[&str] = &[
@@ -120,8 +89,61 @@ pub fn status_icon(status: &str) -> &'static str {
     }
 }
 
-/// Adhoc instance icon (neutral — not claiming alive or dead).
-pub const ADHOC_ICON: &str = "\u{25e6}"; // ◦
+// Adhoc instance icon lives on `IntegrationSpec.adhoc_icon` for Tool::Adhoc.
+
+/// Terminal-title behavior, from config `terminal.title_mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleMode {
+    /// hcom leaves the title alone: the wrapped tool's own title passes through
+    /// untouched and hcom writes nothing.
+    Off,
+    /// hcom's status label only: `{icon} name [tool]` (the original behavior).
+    Label,
+    /// hcom status + the tool's live title: `{icon} name - {tool title}`.
+    Combined,
+}
+
+/// Valid `terminal.title_mode` config values (for validation + help).
+pub const VALID_TITLE_MODES: &[&str] = &["combined", "label", "off"];
+
+impl TitleMode {
+    /// Parse a config value; unknown/empty falls back to the default (`Combined`).
+    pub fn from_config(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "label" => Self::Label,
+            _ => Self::Combined,
+        }
+    }
+}
+
+/// Build the canonical pane-title label hcom writes into OSC 1/2 and pushes
+/// to host terminal label APIs (e.g. herdr's `pane.rename`).
+///
+/// Format: `"{icon} {display} [{tool}]"` (e.g. `"◉ luna [claude]"`).
+/// Returns an empty string when `display` or `tool` is empty so callers can
+/// short-circuit before doing terminal IO.
+pub fn format_pane_title(status: &str, display: &str, tool: &str) -> String {
+    if display.is_empty() || tool.is_empty() {
+        return String::new();
+    }
+    format!("{} {} [{}]", status_icon(status), display, tool)
+}
+
+/// Build the `TitleMode::Combined` label: `"{icon} {display}"`, with the wrapped
+/// tool's live title appended after ` - ` when present. Drops the `[tool]` tag
+/// (the passthrough title already identifies the tool's activity). Returns an
+/// empty string when `display` is empty so callers can short-circuit.
+pub fn format_pane_title_combined(status: &str, display: &str, child: Option<&str>) -> String {
+    if display.is_empty() {
+        return String::new();
+    }
+    let base = format!("{} {}", status_icon(status), display);
+    match child {
+        Some(c) if !c.is_empty() => format!("{base} - {c}"),
+        _ => base,
+    }
+}
 
 /// Status foreground ANSI color.
 pub fn status_fg(status: &str) -> &'static str {
@@ -193,17 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_marker() {
-        let caps = BIND_MARKER_RE.captures("[hcom:luna]");
-        assert_eq!(caps.unwrap()[1].to_string(), "luna");
-    }
-
-    #[test]
-    fn test_bind_marker_no_legacy() {
-        assert!(BIND_MARKER_RE.captures("[HCOM:BIND:test_name]").is_none());
-    }
-
-    #[test]
     fn test_status_icons() {
         assert_eq!(status_icon(ST_ACTIVE), "▶");
         assert_eq!(status_icon(ST_LISTENING), "◉");
@@ -211,15 +222,6 @@ mod tests {
         assert_eq!(status_icon(ST_LAUNCHING), "◎");
         assert_eq!(status_icon(ST_ERROR), "✗");
         assert_eq!(status_icon(ST_INACTIVE), "○");
-    }
-
-    #[test]
-    fn test_released_tools() {
-        assert!(RELEASED_TOOLS.contains(&"claude"));
-        assert!(RELEASED_TOOLS.contains(&"gemini"));
-        assert!(RELEASED_TOOLS.contains(&"codex"));
-        assert!(RELEASED_TOOLS.contains(&"opencode"));
-        assert_eq!(RELEASED_TOOLS.len(), 4);
     }
 
     #[test]

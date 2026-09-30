@@ -123,9 +123,11 @@ pub fn log_with_fields(
         Err(_) => return,
     };
 
-    // Append to file (atomic for ≤4KB on APFS/ext4)
+    // One write per line: O_APPEND keeps a single small write whole, but
+    // `writeln!` issues the line and its newline separately, which
+    // interleaves with other processes (`…}{…` lines).
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{}", log_line);
+        let _ = file.write_all(format!("{log_line}\n").as_bytes());
     }
 }
 
@@ -143,17 +145,17 @@ pub fn log_warn(subsystem: &str, event: &str, message: &str) {
 /// Splits "TypeName: detail" into error_type + error_msg.
 pub fn log_error(subsystem: &str, event: &str, message: &str) {
     // Split "ErrorType: message" into structured fields
-    if let Some((error_type, error_msg)) = message.split_once(": ") {
-        if !error_type.contains(' ') {
-            log_with_fields(
-                "ERROR",
-                subsystem,
-                event,
-                message,
-                &[("error_type", error_type), ("error_msg", error_msg)],
-            );
-            return;
-        }
+    if let Some((error_type, error_msg)) = message.split_once(": ")
+        && !error_type.contains(' ')
+    {
+        log_with_fields(
+            "ERROR",
+            subsystem,
+            event,
+            message,
+            &[("error_type", error_type), ("error_msg", error_msg)],
+        );
+        return;
     }
     log("ERROR", subsystem, event, message);
 }
@@ -395,10 +397,10 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let mut results: Vec<serde_json::Value> = Vec::new();
         for line in content.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("level").and_then(|l| l.as_str()) == Some("ERROR") {
-                    results.push(v);
-                }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                && v.get("level").and_then(|l| l.as_str()) == Some("ERROR")
+            {
+                results.push(v);
             }
         }
         assert_eq!(results.len(), 1);

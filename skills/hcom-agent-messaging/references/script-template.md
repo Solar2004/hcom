@@ -14,7 +14,7 @@ hcom run my-script "task description"
 
 description: line 2 comment (after shebang) is shown in `hcom run` listing.
 
-user scripts shadow bundled scripts (confess, debate, fatcow) with the same name.
+user scripts shadow bundled scripts (confess, debate, fatcow, onidle) with the same name.
 
 ## full template with commentary
 
@@ -89,7 +89,7 @@ done
 |------------|-----|
 | `--go` on every launch/kill | prevents script from hanging on confirmation prompt |
 | `--headless` on every launch | runs agent in background (no terminal window needed) |
-| `--tag X` on every launch | enables `@X-` prefix routing (more reliable than raw names) |
+| `--tag X` on every launch | enables `@X-` group routing (message every agent in the group at once) |
 | `--thread` on every send/wait | isolates messages per workflow run |
 | `--intent` on every send | tells recipient whether to respond |
 | `trap cleanup ERR INT TERM` | ensures orphan agents are killed on script failure or signal |

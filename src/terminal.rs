@@ -10,16 +10,17 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::paths;
-use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
+use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::platform;
-use crate::shared::terminal_presets::TERMINAL_ENV_MAP;
+use crate::shared::terminal_presets::{ArgvTemplate, TERMINAL_ENV_MAP};
+use crate::shared::tool_detection::tool_marker_vars;
 
 /// Result of kill_process().
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,38 @@ pub enum KillResult {
     Sent,
     AlreadyDead,
     PermissionDenied,
+}
+
+const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneCloseResult {
+    pub closed: bool,
+    pub retry_command: Option<String>,
+}
+
+fn format_close_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| {
+            #[cfg(windows)]
+            {
+                if !arg.is_empty()
+                    && arg
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "/_-.=:,@\\".contains(c))
+                {
+                    arg.clone()
+                } else {
+                    ps_quote(arg)
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                crate::tools::args_common::shell_quote(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Terminal info resolved for an instance.
@@ -53,22 +86,44 @@ pub enum LaunchResult {
 
 /// macOS app bundle fallback commands for cross-platform terminals.
 /// Used when CLI binary isn't in PATH but .app bundle is installed.
-const MACOS_APP_FALLBACKS: &[(&str, &str)] = &[
-    ("kitty-window", "open -n -a kitty.app --args {script}"),
+const MACOS_APP_FALLBACKS: &[(&str, ArgvTemplate)] = &[
+    (
+        "kitty-window",
+        &["open", "-n", "-a", "kitty.app", "--args", "{script}"],
+    ),
     (
         "wezterm-window",
-        "open -n -a WezTerm.app --args start -- bash {script}",
+        &[
+            "open",
+            "-n",
+            "-a",
+            "WezTerm.app",
+            "--args",
+            "start",
+            "--",
+            "bash",
+            "{script}",
+        ],
     ),
     (
         "alacritty",
-        "open -n -a Alacritty.app --args -e bash {script}",
+        &[
+            "open",
+            "-n",
+            "-a",
+            "Alacritty.app",
+            "--args",
+            "-e",
+            "bash",
+            "{script}",
+        ],
     ),
 ];
 
 /// Terminal context vars stripped from the env before spawning a terminal launcher subprocess.
 /// Prevents outer terminal identity from leaking into newly-launched terminal panes.
 /// Must stay in sync with every env var read by detect_terminal_from_env().
-const TERMINAL_CONTEXT_VARS: &[&str] = &[
+pub(crate) const TERMINAL_CONTEXT_VARS: &[&str] = &[
     // Multiplexers
     "CMUX_WORKSPACE_ID",
     "CMUX_SURFACE_ID",
@@ -84,15 +139,35 @@ const TERMINAL_CONTEXT_VARS: &[&str] = &[
     "GHOSTTY_RESOURCES_DIR",
     "ITERM_SESSION_ID",
     "ALACRITTY_WINDOW_ID",
+    "PTYXIS_PROFILE",
+    "PTYXIS_VERSION",
     "GNOME_TERMINAL_SCREEN",
     "KONSOLE_DBUS_WINDOW",
     "TERMINATOR_UUID",
     "TILIX_ID",
     "WT_SESSION",
+    // HERDR_* not stripped: the herdr preset's CLI (`herdr tab create` /
+    // `herdr pane run ...`) resolves its server socket from $HERDR_SOCKET_PATH;
+    // the delivery loop also reuses it for `pane.rename` / `pane.report_agent`.
+    // Other presets pass the socket via CLI flag (e.g. `kitty @ --to
+    // {kitty_listen}`) and don't need their identity vars to survive in the
+    // launcher env.
     // Generic terminal identity
     "TERM_PROGRAM",
     "TERM_SESSION_ID",
+];
+
+/// Terminal color/capability vars should come from the terminal/PTY that hosts
+/// the child. Forwarding a parent's `TERM=dumb`, test-harness `NO_COLOR`, or
+/// stale truecolor state into a new kitty pane can make otherwise-capable tools
+/// render in black and white.
+pub(crate) const TERMINAL_COLOR_VARS: &[&str] = &[
+    "TERM",
     "COLORTERM",
+    "NO_COLOR",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "FORCE_COLOR",
 ];
 
 /// Detect terminal preset from inherited environment variables.
@@ -111,18 +186,17 @@ pub fn detect_terminal_from_env() -> Option<String> {
     }
     // TOML-defined presets with pane_id_env
     let toml_path = crate::paths::config_toml_path();
-    if let Some(presets_val) = crate::config::load_toml_presets(&toml_path) {
-        if let Some(table) = presets_val.as_table() {
-            for (name, val) in table {
-                if let Some(env_var) = val.get("pane_id_env").and_then(|v| v.as_str()) {
-                    if std::env::var(env_var)
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                        .is_some()
-                    {
-                        return Some(name.clone());
-                    }
-                }
+    if let Some(presets_val) = crate::config::load_toml_presets(&toml_path)
+        && let Some(table) = presets_val.as_table()
+    {
+        for (name, val) in table {
+            if let Some(env_var) = val.get("pane_id_env").and_then(|v| v.as_str())
+                && std::env::var(env_var)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .is_some()
+            {
+                return Some(name.clone());
             }
         }
     }
@@ -164,28 +238,30 @@ fn find_macos_app(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Replace `open -a <app>` app names with absolute `.app` bundle paths.
+/// Replace `open -a <app>` app names with absolute `.app` bundle paths, in place
+/// on an argv vector.
 ///
 /// This is only safe for app-launch commands where `open` passes argv via
 /// `--args`. Plain file-open forms like `open -a Terminal {script}` must keep
 /// `-a`, otherwise `open` treats the app bundle and script as regular paths and
-/// falls back to file association for the script.
-fn rewrite_open_command_with_app_path(template: &str, app_path: &Path) -> Result<String> {
-    let mut parts = shell_split(template)?;
-    for idx in 0..parts.len().saturating_sub(1) {
-        let flag = &parts[idx];
+/// falls back to file association for the script. No-ops if no `--args` tail is
+/// present or no app flag is found.
+fn rewrite_open_argv_with_app_path(argv: &mut Vec<String>, app_path: &Path) {
+    for idx in 0..argv.len().saturating_sub(1) {
+        let flag = &argv[idx];
         let takes_app_arg = flag == "-a"
             || (flag.starts_with('-')
                 && !flag.starts_with("--")
                 && flag.chars().skip(1).any(|c| c == 'a'));
         if takes_app_arg {
-            let has_args_tail = parts.iter().skip(idx + 2).any(|part| part == "--args");
+            let has_args_tail = argv.iter().skip(idx + 2).any(|part| part == "--args");
             if !has_args_tail {
-                return Ok(template.to_string());
+                return;
             }
+            let app_path_str = app_path.to_string_lossy().to_string();
             if flag == "-a" {
-                parts.remove(idx);
-                parts[idx] = app_path.to_string_lossy().to_string();
+                argv.remove(idx);
+                argv[idx] = app_path_str;
             } else {
                 let mut rewritten_flag = String::from("-");
                 for ch in flag.chars().skip(1) {
@@ -194,31 +270,25 @@ fn rewrite_open_command_with_app_path(template: &str, app_path: &Path) -> Result
                     }
                 }
                 if rewritten_flag == "-" {
-                    parts.remove(idx);
-                    parts[idx] = app_path.to_string_lossy().to_string();
+                    argv.remove(idx);
+                    argv[idx] = app_path_str;
                 } else {
-                    parts[idx] = rewritten_flag;
-                    parts[idx + 1] = app_path.to_string_lossy().to_string();
+                    argv[idx] = rewritten_flag;
+                    argv[idx + 1] = app_path_str;
                 }
             }
-            return Ok(parts
-                .iter()
-                .map(|p| shell_quote(p))
-                .collect::<Vec<_>>()
-                .join(" "));
+            return;
         }
     }
-    Ok(template.to_string())
 }
 
-fn rewrite_macos_open_app_command(template: &str, app_name: &str) -> String {
+fn rewrite_macos_open_app_argv(argv: &mut Vec<String>, app_name: &str) {
     if !cfg!(target_os = "macos") {
-        return template.to_string();
+        return;
     }
-    let Some(app_path) = find_macos_app(app_name) else {
-        return template.to_string();
-    };
-    rewrite_open_command_with_app_path(template, &app_path).unwrap_or_else(|_| template.to_string())
+    if let Some(app_path) = find_macos_app(app_name) {
+        rewrite_open_argv_with_app_path(argv, &app_path);
+    }
 }
 
 fn should_use_command_extension(background: bool, terminal_mode: &str) -> bool {
@@ -232,12 +302,12 @@ fn find_kitten_binary() -> Option<String> {
     if let Some(path) = which_bin("kitten") {
         return Some(path);
     }
-    if cfg!(target_os = "macos") {
-        if let Some(app) = find_macos_app("kitty") {
-            let full = app.join("Contents/MacOS/kitten");
-            if full.exists() {
-                return Some(full.to_string_lossy().to_string());
-            }
+    if cfg!(target_os = "macos")
+        && let Some(app) = find_macos_app("kitty")
+    {
+        let full = app.join("Contents/MacOS/kitten");
+        if full.exists() {
+            return Some(full.to_string_lossy().to_string());
         }
     }
     None
@@ -263,13 +333,8 @@ pub fn find_kitty_socket() -> String {
     candidates.sort_by(|a, b| b.cmp(a)); // Reverse sort (newest first)
 
     for sock_path in &candidates {
-        // Check if it's a socket
-        if let Ok(meta) = fs::metadata(sock_path) {
-            use std::os::unix::fs::FileTypeExt;
-            if !meta.file_type().is_socket() {
-                continue;
-            }
-        } else {
+        // Skip anything that isn't a Unix-domain socket
+        if !crate::sys::fs::is_socket(sock_path) {
             continue;
         }
 
@@ -277,10 +342,9 @@ pub fn find_kitty_socket() -> String {
         if let Ok(output) = Command::new(&kitten)
             .args(["@", "--to", &socket_uri, "ls"])
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                return socket_uri;
-            }
+            return socket_uri;
         }
     }
     String::new()
@@ -304,10 +368,20 @@ fn normalize_terminal_mode_for_launch(
     let mut kitty_socket = String::new();
 
     if opens_new_window {
-        if terminal_mode == "default" {
-            if let Some(detected) = detect_terminal_from_env() {
-                terminal_mode = detected;
-            }
+        if terminal_mode == "default"
+            && let Some(detected) = detect_terminal_from_env()
+            // Ptyxis is commonly installed as a Flatpak. Such shells export
+            // PTYXIS_VERSION even when no host-side `ptyxis` launcher exists,
+            // so environment detection alone is not enough to launch a new
+            // window. Keep `default` in that case and use the normal Linux
+            // fallback selection below. A configured `ptyxis.binary` override
+            // (for example, a wrapper around `flatpak run`) is honored.
+            && (detected != "ptyxis"
+                || crate::config::get_merged_preset("ptyxis")
+                    .and_then(|preset| preset.binary)
+                    .is_some_and(|binary| which_bin(&binary).is_some()))
+        {
+            terminal_mode = detected;
         }
         if terminal_mode == "kitty" {
             if std::env::var("KITTY_WINDOW_ID")
@@ -383,36 +457,150 @@ pub fn wezterm_reachable() -> bool {
         .unwrap_or(false)
 }
 
+/// Candidate file names to probe for `name` in a PATH directory. On Windows an
+/// extension-less name is expanded with PATHEXT (`.exe`, `.cmd`, …); elsewhere
+/// the name is used verbatim.
+pub(crate) fn which_candidates(dir: &Path, name: &str) -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        if Path::new(name).extension().is_some() {
+            return vec![dir.join(name)];
+        }
+        let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        let mut out: Vec<std::path::PathBuf> = exts
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|ext| dir.join(format!("{name}{ext}")))
+            .collect();
+        out.push(dir.join(name));
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        vec![dir.join(name)]
+    }
+}
+
+/// Per-user bin dirs searched after PATH, in order.
+///
+/// Tool-specific dirs are where each official installer puts its binary.
+/// `~/.local/bin` is the default for Codex, Copilot, agy, OMP, Cursor, Pi and
+/// Claude's native installer; `~/.bun/bin` is where `bun install -g` links
+/// npm-published CLIs (pi, omp, opencode, gemini, ...).
+fn fallback_bin_dirs(home: &Path, name: &str) -> Vec<std::path::PathBuf> {
+    const LOCAL: &[&str] = &[".local", "bin"];
+    const BUN: &[&str] = &[".bun", "bin"];
+    let dirs: &[&[&str]] = match name {
+        // Native installer (~/.local/bin) before the legacy ~/.claude/bin copy.
+        "claude" => &[&[".claude", "local"], LOCAL, &[".claude", "bin"], BUN],
+        "opencode" => &[&[".opencode", "bin"], LOCAL, BUN],
+        "kilo" => &[&[".kilo", "bin"], LOCAL, BUN],
+        "grok" => &[&[".grok", "bin"], LOCAL, BUN],
+        "kimi" => &[&[".kimi-code", "bin"], LOCAL, BUN],
+        "pi" => &[&[".pi", "agent", "bin"], LOCAL, BUN],
+        _ => &[LOCAL, BUN],
+    };
+    dirs.iter()
+        .map(|parts| {
+            parts
+                .iter()
+                .fold(home.to_path_buf(), |p, part| p.join(part))
+        })
+        .collect()
+}
+
+fn which_in_fallback_dirs(home: &Path, name: &str) -> Option<String> {
+    fallback_bin_dirs(home, name)
+        .iter()
+        .flat_map(|dir| which_candidates(dir, name))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().to_string())
+}
+
 /// Simple `which` implementation — find binary in PATH.
 pub fn which_bin(name: &str) -> Option<String> {
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in path_var.split(':') {
-        let candidate = Path::new(dir).join(name);
-        if candidate.exists() && candidate.is_file() {
-            return Some(candidate.to_string_lossy().to_string());
-        }
-    }
-
-    // Fallback: well-known install locations not always in PATH
-    if let Ok(home) = std::env::var("HOME") {
-        let home = Path::new(&home);
-        let fallbacks: &[std::path::PathBuf] = match name {
-            "claude" => &[
-                home.join(".claude").join("local").join("claude"),
-                home.join(".local").join("bin").join("claude"),
-                home.join(".claude").join("bin").join("claude"),
-            ],
-            "opencode" => &[home.join(".opencode").join("bin").join("opencode")],
-            _ => &[],
-        };
-        for fallback in fallbacks {
-            if fallback.exists() && fallback.is_file() {
-                return Some(fallback.to_string_lossy().to_string());
+    // `split_paths` uses the platform separator (`;` on Windows, `:` elsewhere),
+    // which also avoids splitting Windows drive letters like `C:`. PATH being
+    // entirely unset (rather than merely lacking `name`) still falls through
+    // to the well-known-location fallbacks below.
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for candidate in which_candidates(&dir, name) {
+                if candidate.is_file() {
+                    return Some(candidate.to_string_lossy().to_string());
+                }
             }
         }
     }
 
+    // Fallback: install locations that are often missing from PATH (GUI or
+    // hook-spawned shells, or the user never added them).
+    if let Some(found) = dirs::home_dir().and_then(|home| which_in_fallback_dirs(&home, name)) {
+        return Some(found);
+    }
+
+    #[cfg(windows)]
+    if name.eq_ignore_ascii_case("agy")
+        && let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
+    {
+        let fallback = Path::new(&local_app_data)
+            .join("agy")
+            .join("bin")
+            .join("agy.exe");
+        if fallback.is_file() {
+            return Some(fallback.to_string_lossy().into_owned());
+        }
+    }
+
     None
+}
+
+/// Build a command for a PATH-resolved executable, including Windows npm
+/// `.cmd`/`.bat` shims that CreateProcess cannot execute directly.
+pub fn executable_command(name: &str) -> Command {
+    let resolved = which_bin(name).unwrap_or_else(|| name.to_string());
+    #[cfg(windows)]
+    if Path::new(&resolved)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+    {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/d", "/c"]).arg(resolved);
+        return command;
+    }
+    Command::new(resolved)
+}
+
+/// Bypass npm's Windows `codex.cmd` shim when launching the interactive tool.
+///
+/// The shim expands `%*` through cmd.exe, which corrupts quote-bearing config
+/// values such as the multiline `developer_instructions` bootstrap. Invoking
+/// the package's Node entrypoint directly preserves Rust's argv boundaries.
+#[cfg(windows)]
+pub fn resolve_windows_tool_launcher(tool: &str, resolved: &str) -> Option<(String, Vec<String>)> {
+    if tool != "codex"
+        || !Path::new(resolved)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd"))
+    {
+        return None;
+    }
+    let prefix = Path::new(resolved).parent()?;
+    let entrypoint = prefix.join("node_modules/@openai/codex/bin/codex.js");
+    if !entrypoint.is_file() {
+        return None;
+    }
+    let node = which_bin("node")?;
+    Some((node, vec![entrypoint.to_string_lossy().into_owned()]))
+}
+
+/// Resolve the `bash` command to run on Unix, preferring a `PATH` match and
+/// falling back to `/bin/bash`. Shared by the background and run-here launch
+/// paths so they can't drift on which `bash` gets invoked.
+fn resolve_bash_command() -> String {
+    which_bin("bash").unwrap_or_else(|| "/bin/bash".to_string())
 }
 
 /// Check if a file has a node shebang (#!/usr/bin/env node or similar).
@@ -434,6 +622,61 @@ const TERMUX_CODEX_WRAPPER_PATH: &str = "/data/data/com.termux/files/usr/bin/cod
 const TERMUX_CODEX_INNER_WRAPPER_PATH: &str =
     "/data/data/com.termux/files/usr/lib/node_modules/@mmmbuto/codex-cli-termux/bin/codex";
 const TERMUX_SH_PATH: &str = "/data/data/com.termux/files/usr/bin/sh";
+const TERMUX_PREFIX: &str = "/data/data/com.termux/files/usr";
+
+/// Whether the host Termux installation is visible from this process.
+///
+/// This is intentionally broader than `is_native_termux_runtime()`: PRoot
+/// exposes host Termux paths and environment variables inside the distro.
+fn termux_host_visible() -> bool {
+    platform::is_termux()
+}
+
+fn native_termux_prefix() -> bool {
+    std::env::var("PREFIX")
+        .ok()
+        .is_some_and(|prefix| Path::new(&prefix) == Path::new(TERMUX_PREFIX))
+}
+
+fn proc_self_root_is_root() -> bool {
+    fs::read_link("/proc/self/root").is_ok_and(|root| root == Path::new("/"))
+}
+
+fn is_native_termux_runtime_from(
+    is_android_target: bool,
+    host_visible: bool,
+    has_native_prefix: bool,
+    self_root_is_root: bool,
+) -> bool {
+    is_android_target && host_visible && has_native_prefix && self_root_is_root
+}
+
+/// Whether this process can safely dispatch scripts into native Termux.
+fn is_native_termux_runtime() -> bool {
+    is_native_termux_runtime_from(
+        cfg!(target_os = "android"),
+        termux_host_visible(),
+        native_termux_prefix(),
+        proc_self_root_is_root(),
+    )
+}
+
+fn proot_termux_launch_error() -> &'static str {
+    "Cannot open a native Termux window from this PRoot runtime:\n\
+     the generated command uses PRoot paths and Linux/glibc binaries that cannot run\n\
+     in host Termux.\n\n\
+     Use one of:\n\
+       hcom <tool> --headless\n\
+       hcom <tool> --terminal tmux"
+}
+
+fn validate_termux_dispatch_status(status: std::process::ExitStatus) -> Result<()> {
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("Termux RUN_COMMAND dispatch failed: {status}")
+    }
+}
 
 /// Resolve Termux-only tool launch quirks.
 ///
@@ -445,7 +688,7 @@ pub fn resolve_termux_tool_launcher(
     tool_name: &str,
     resolved: &str,
 ) -> Option<(String, Vec<String>)> {
-    if !platform::is_termux() {
+    if !is_native_termux_runtime() {
         return None;
     }
 
@@ -482,33 +725,142 @@ fn resolve_binary_path(binary: &str, app_name: Option<&str>, preset_name: &str) 
     }
 }
 
-/// Resolve preset name to command template string.
+/// True if `tok` names a bash-family interpreter — its file stem is `bash`
+/// (case-insensitive), covering `bash`, `bash.exe`, `/bin/bash`, and
+/// `C:\...\bash.exe`.
+#[cfg(any(windows, test))]
+fn is_bash_interp(tok: &str) -> bool {
+    std::path::Path::new(tok)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("bash"))
+}
+
+/// Detect an unrunnable non-adjacent bash-family `{script}` custom template: a
+/// bash-family interpreter token (`bash`, `bash.exe`, `/bin/bash`, …) with a
+/// LATER (non-adjacent) `{script}`, so the generated `.ps1` would be handed to
+/// bash and can't be rewritten by a simple splice — e.g. `bash -c {script}`,
+/// `bash -x {script}`, `bash.exe -i {script}`. Returns the offending
+/// interpreter token. Adjacent `<interp> {script}` is handled by
+/// `shellify_bash_script_pair` and is NOT flagged.
+#[cfg(any(windows, test))]
+fn unsupported_bash_script_interp(argv: &[String]) -> Option<String> {
+    let interp = argv.iter().position(|a| is_bash_interp(a))?;
+    let script = argv.iter().position(|a| a.contains("{script}"))?;
+    if script <= interp + 1 {
+        return None;
+    }
+    Some(argv[interp].clone())
+}
+
+/// Rewrite an adjacent bash-family `{script}` executor pair to PowerShell in a
+/// custom (non-preset) command argv, so the generated `.ps1` runs on Windows
+/// without requiring Git Bash on PATH. Matches an adjacent `<interp>` +
+/// `{script}` pair anywhere in the argv — not just at argv[0] — where
+/// `<interp>` is any bash-family token (`bash`, `bash.exe`, `/bin/bash`, …).
+/// A bash-family token with a NON-adjacent `{script}` (e.g. `bash -c {script}`)
+/// can't be rewritten by a simple splice — it is rejected with a clear error
+/// instead of silently launching a broken command (see
+/// `unsupported_bash_script_interp`).
+///
+/// Off Windows this is a passthrough (the generated script is a bash script).
+#[cfg(not(windows))]
+fn windows_shellify_custom_argv(argv: Vec<String>) -> Result<Vec<String>> {
+    Ok(argv)
+}
+
+#[cfg(windows)]
+fn windows_shellify_custom_argv(argv: Vec<String>) -> Result<Vec<String>> {
+    if let Some(interp) = unsupported_bash_script_interp(&argv) {
+        bail!(
+            "custom terminal command runs `{interp}` with a non-adjacent `{{script}}` and \
+             cannot run the generated PowerShell script on Windows; use `{interp} {{script}}` \
+             (adjacent, no flags) or a native command"
+        );
+    }
+    Ok(shellify_bash_script_pair(argv))
+}
+
+/// Replace an adjacent bash-family + `{script}` pair with the PowerShell `.ps1`
+/// launcher. Platform-agnostic so it can be unit-tested on any host; the
+/// `windows_shellify_custom_argv` wrapper only applies it on Windows.
+#[cfg(any(windows, test))]
+fn shellify_bash_script_pair(mut argv: Vec<String>) -> Vec<String> {
+    if let Some(i) = argv
+        .windows(2)
+        .position(|w| is_bash_interp(&w[0]) && w[1] == "{script}")
+    {
+        argv.splice(
+            i..i + 1,
+            [
+                "powershell".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-NoExit".to_string(),
+                "-File".to_string(),
+            ],
+        );
+    }
+    argv
+}
+
+/// Resolve preset name to an open-command argv template (placeholders intact).
 ///
 /// On macOS, if CLI binary isn't in PATH but .app bundle exists,
-/// uses a hardcoded fallback or substitutes the full binary path.
-pub fn resolve_terminal_preset(preset_name: &str) -> Option<String> {
+/// uses a hardcoded fallback or substitutes the full binary path. The returned
+/// argv still contains placeholders like `{script}`; substitute via
+/// `substitute_open_argv`.
+pub fn resolve_terminal_open_argv(preset_name: &str) -> Option<Vec<String>> {
     let merged = crate::config::get_merged_preset(preset_name)?;
-    let mut open_cmd = merged.open;
+    let mut open_argv = merged.open_argv(cfg!(windows));
     let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
 
-    if let Some(ref binary) = merged.binary {
-        if which_bin(binary).is_none() && cfg!(target_os = "macos") {
-            // New-window presets have hardcoded fallbacks using `open -a`
-            for &(name, fallback) in MACOS_APP_FALLBACKS {
-                if name == preset_name && find_macos_app(app_name).is_some() {
-                    return Some(rewrite_macos_open_app_command(fallback, app_name));
-                }
+    if let Some(ref binary) = merged.binary
+        && which_bin(binary).is_none()
+        && cfg!(target_os = "macos")
+    {
+        // New-window presets have hardcoded fallbacks using `open -a`
+        for &(name, fallback) in MACOS_APP_FALLBACKS {
+            if name == preset_name && find_macos_app(app_name).is_some() {
+                let mut argv: Vec<String> = fallback.iter().map(|s| s.to_string()).collect();
+                rewrite_macos_open_app_argv(&mut argv, app_name);
+                return Some(argv);
             }
-            // Tab/split presets: substitute leading binary with full path
-            if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name) {
-                if open_cmd.starts_with(binary.as_str()) {
-                    open_cmd = format!("{}{}", full_path, &open_cmd[binary.len()..]);
-                }
-            }
+        }
+        // Tab/split presets: substitute leading binary element with full path
+        if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name)
+            && open_argv.first().map(String::as_str) == Some(binary.as_str())
+        {
+            open_argv[0] = full_path;
         }
     }
 
-    Some(rewrite_macos_open_app_command(&open_cmd, app_name))
+    rewrite_macos_open_app_argv(&mut open_argv, app_name);
+    Some(open_argv)
+}
+
+/// Inject `--to <socket>` (after the `@`) for kitten commands launched outside
+/// kitty. Splices as separate argv elements — no shell quoting.
+///
+/// Matches `argv[0]`'s file_stem (not an exact string) because
+/// `resolve_terminal_open_argv` may have already rewritten `argv[0]` to
+/// kitten's absolute macOS app-bundle path when `kitten` isn't on PATH — a
+/// literal "kitten" check would miss that and silently skip the splice,
+/// leaving kitten without a socket to reach (it then falls back to
+/// controlling-tty discovery, which fails outright in tty-less contexts).
+fn splice_kitten_to_socket(argv: &mut Vec<String>, kitty_socket: &str) {
+    let is_kitten_cmd = argv
+        .first()
+        .and_then(|a| Path::new(a).file_stem())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("kitten"));
+    if !kitty_socket.is_empty()
+        && !kitty_socket.starts_with("fd:")
+        && is_kitten_cmd
+        && argv.get(1).map(String::as_str) == Some("@")
+        && !argv.iter().any(|a| a == "--to")
+    {
+        argv.splice(2..2, ["--to".to_string(), kitty_socket.to_string()]);
+    }
 }
 
 /// Get terminal presets for current platform with availability status.
@@ -542,19 +894,19 @@ pub fn get_available_presets() -> Vec<(String, bool)> {
 
     // Add TOML-defined presets not already in built-ins
     let toml_path = crate::paths::config_toml_path();
-    if let Some(presets_val) = crate::config::load_toml_presets(&toml_path) {
-        if let Some(table) = presets_val.as_table() {
-            for (name, preset_val) in table {
-                if seen.contains(name) {
-                    continue;
-                }
-                let available = preset_val
-                    .get("binary")
-                    .and_then(|v| v.as_str())
-                    .map(|b| which_bin(b).is_some())
-                    .unwrap_or(true);
-                result.push((name.clone(), available));
+    if let Some(presets_val) = crate::config::load_toml_presets(&toml_path)
+        && let Some(table) = presets_val.as_table()
+    {
+        for (name, preset_val) in table {
+            if seen.contains(name) {
+                continue;
             }
+            let available = preset_val
+                .get("binary")
+                .and_then(|v| v.as_str())
+                .map(|b| which_bin(b).is_some())
+                .unwrap_or(true);
+            result.push((name.clone(), available));
         }
     }
 
@@ -581,6 +933,12 @@ pub fn build_env_string(env_vars: &HashMap<String, String>, format_type: &str) -
             .map(|(k, v)| format!("export {}={};", k, shell_quote(v)))
             .collect::<Vec<_>>()
             .join(" ")
+    } else if format_type == "powershell" {
+        valid
+            .iter()
+            .map(|(k, v)| format!("$env:{} = {}", k, ps_quote(v)))
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
         valid
             .iter()
@@ -605,6 +963,17 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Resolve a human-readable tool name for the launch script title/banner
+/// from the internal tool id (e.g. "cursor", "kilo"). Falls back to "hcom"
+/// when there's no tool id (plain `hcom` TUI launches) or it doesn't
+/// resolve to a known tool.
+fn launch_display_name(tool_id: Option<&str>) -> &'static str {
+    tool_id
+        .and_then(|id| id.parse::<crate::tool::Tool>().ok())
+        .map(|t| t.spec().label)
+        .unwrap_or("hcom")
+}
+
 /// Create a bash script for terminal launch.
 ///
 /// Scripts provide uniform execution across all platforms/terminals.
@@ -614,23 +983,10 @@ pub fn create_bash_script(
     cwd: Option<&str>,
     command_str: &str,
     background: bool,
-    tool_name: Option<&str>,
+    tool_id: Option<&str>,
     opens_new_window: bool,
 ) -> Result<()> {
-    let tool_name = tool_name.unwrap_or_else(|| {
-        let cmd_lower = command_str.to_lowercase();
-        if cmd_lower.contains("opencode") {
-            "OpenCode"
-        } else if cmd_lower.contains("gemini") {
-            "Gemini"
-        } else if cmd_lower.contains("codex") {
-            "Codex"
-        } else if cmd_lower.contains("claude") {
-            "Claude Code"
-        } else {
-            "hcom"
-        }
-    });
+    let tool_name = launch_display_name(tool_id);
 
     let mut f = fs::File::create(script_file).context("Failed to create script file")?;
 
@@ -639,19 +995,19 @@ pub fn create_bash_script(
     writeln!(f, "echo \"Starting {}...\"", tool_name)?;
 
     // Unset tool markers and identity vars to prevent inheritance
-    writeln!(f, "unset {}", TOOL_MARKER_VARS.join(" "))?;
+    writeln!(f, "unset {}", tool_marker_vars().join(" "))?;
     writeln!(f, "unset {}", HCOM_IDENTITY_VARS.join(" "))?;
 
     // Discover paths for minimal environments (kitty splits, etc.)
     let mut paths_to_add: Vec<String> = Vec::new();
 
     fn add_path(paths: &mut Vec<String>, binary_path: Option<String>) {
-        if let Some(bp) = binary_path {
-            if let Some(dir) = Path::new(&bp).parent() {
-                let dir_str = dir.to_string_lossy().to_string();
-                if !paths.contains(&dir_str) {
-                    paths.push(dir_str);
-                }
+        if let Some(bp) = binary_path
+            && let Some(dir) = Path::new(&bp).parent()
+        {
+            let dir_str = dir.to_string_lossy().to_string();
+            if !paths.contains(&dir_str) {
+                paths.push(dir_str);
             }
         }
     }
@@ -687,35 +1043,44 @@ pub fn create_bash_script(
     // On Termux, npm-installed tools have shebangs like #!/usr/bin/env node which
     // fail (no /usr/bin/env). Detect node shebangs and rewrite to: node /path/to/tool args
     let mut final_command = command_str.to_string();
-    if !tool_cmd.is_empty() {
-        if let Some(tool_path) = which_bin(tool_cmd) {
-            if let Some((launcher, prefix_args)) =
-                resolve_termux_tool_launcher(tool_cmd, &tool_path)
-            {
-                let mut replacement_parts = vec![shell_quote(&launcher)];
-                replacement_parts.extend(prefix_args.iter().map(|arg| shell_quote(arg)));
-                final_command = final_command.replacen(
-                    &format!("{} ", tool_cmd),
-                    &format!("{} ", replacement_parts.join(" ")),
-                    1,
-                );
-            } else {
-                final_command = final_command.replacen(
-                    &format!("{} ", tool_cmd),
-                    &format!("{} ", shell_quote(&tool_path)),
-                    1,
-                );
-            }
+    if !tool_cmd.is_empty()
+        && let Some(tool_path) = which_bin(tool_cmd)
+    {
+        if let Some((launcher, prefix_args)) = resolve_termux_tool_launcher(tool_cmd, &tool_path) {
+            let mut replacement_parts = vec![shell_quote(&launcher)];
+            replacement_parts.extend(prefix_args.iter().map(|arg| shell_quote(arg)));
+            final_command = final_command.replacen(
+                &format!("{} ", tool_cmd),
+                &format!("{} ", replacement_parts.join(" ")),
+                1,
+            );
+        } else {
+            final_command = final_command.replacen(
+                &format!("{} ", tool_cmd),
+                &format!("{} ", shell_quote(&tool_path)),
+                1,
+            );
         }
     }
 
+    if background {
+        // Startup timeline marker for the background log; hcom.log carries the
+        // rest (startup.* events). macOS date has no sub-second format.
+        writeln!(
+            f,
+            "echo \"[hcom runner] starting PTY wrapper $(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+        )?;
+    }
     writeln!(f, "{}", final_command)?;
 
     if opens_new_window {
-        writeln!(
-            f,
-            "unset HCOM_PROCESS_ID HCOM_LAUNCHED HCOM_PTY_MODE HCOM_TAG HCOM_CODEX_SANDBOX_MODE"
-        )?;
+        // Clear hcom state from the interactive shell left open after the tool
+        // exits. Derive from HCOM_IDENTITY_VARS (so new identity/batch vars are
+        // covered automatically) plus the non-identity per-launch vars exported
+        // above that aren't in that list.
+        let mut leftover_vars: Vec<&str> = HCOM_IDENTITY_VARS.to_vec();
+        leftover_vars.extend(["HCOM_TAG", "HCOM_CODEX_SANDBOX_MODE"]);
+        writeln!(f, "unset {}", leftover_vars.join(" "))?;
         writeln!(f, "rm -f {}", shell_quote(&script_file.to_string_lossy()))?;
         writeln!(f, "exec bash -l")?;
     } else if !background {
@@ -725,7 +1090,175 @@ pub fn create_bash_script(
     }
 
     // Make executable
-    fs::set_permissions(script_file, fs::Permissions::from_mode(0o755))?;
+    crate::sys::fs::set_executable(script_file)?;
+
+    Ok(())
+}
+
+/// Flags for every PowerShell process hcom starts to run a generated script.
+///
+/// `-NoProfile` is the Windows counterpart of running the Unix launcher with
+/// plain `bash script.sh` — a non-interactive, non-login shell that reads no
+/// `.bashrc`/`.profile`. Without it, a user's PowerShell profile runs inside
+/// each agent launch: its banner output lands in the PTY stream the screen
+/// scraper reads, its PATH/location edits override what the generated script
+/// just set, and anything in it that waits on input blocks forever, because
+/// background launches attach stdin to NUL. It also skips profile and module
+/// analysis work on every launch.
+pub const POWERSHELL_SCRIPT_FLAGS: &[&str] = &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"];
+
+/// Quote a string as a PowerShell single-quoted literal (embedded `'` doubled).
+pub fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Build sorted `$env:K = 'V'` assignments, applying the same key validation
+/// as `build_env_string` so only well-formed names are emitted.
+fn ps_env_assignments(env_vars: &HashMap<String, String>) -> Vec<String> {
+    let mut valid: Vec<(&String, &String)> = env_vars
+        .iter()
+        .filter(|(k, _)| {
+            k.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+        .collect();
+    valid.sort_by_key(|(k, _)| k.to_string());
+    valid
+        .iter()
+        .map(|(k, v)| format!("$env:{} = {}", k, ps_quote(v)))
+        .collect()
+}
+
+/// Create a PowerShell launch script — the Windows-native equivalent of
+/// `create_bash_script`. Emits a `.ps1` that sets the window title, scrubs
+/// inherited tool/identity vars, prepends discovered tool directories to PATH,
+/// assigns the per-launch env, changes directory, then runs the tool command
+/// via the call operator. The window-open vs. run-once cleanup mirrors the
+/// bash version; the window is kept alive by launching with `powershell -NoExit`.
+pub fn create_powershell_script(
+    script_file: &Path,
+    env: &HashMap<String, String>,
+    cwd: Option<&str>,
+    command_str: &str,
+    background: bool,
+    tool_id: Option<&str>,
+    opens_new_window: bool,
+) -> Result<()> {
+    let tool_name = launch_display_name(tool_id);
+
+    let mut f = fs::File::create(script_file).context("Failed to create script file")?;
+    // Windows PowerShell 5.1 decodes BOM-less scripts using the active ANSI
+    // code page. Force UTF-8 so non-ASCII paths, prompts, and environment
+    // values survive on stock Windows PowerShell.
+    f.write_all(&[0xEF, 0xBB, 0xBF])?;
+
+    writeln!(
+        f,
+        "$Host.UI.RawUI.WindowTitle = \"hcom: starting {}...\"",
+        tool_name
+    )?;
+    writeln!(f, "Write-Host \"Starting {}...\"", tool_name)?;
+
+    // Scrub inherited tool markers and identity vars so the child can't inherit
+    // them (PowerShell ignores Env: entries that don't exist).
+    let scrub: Vec<String> = tool_marker_vars()
+        .iter()
+        .chain(HCOM_IDENTITY_VARS.iter())
+        .map(|v| format!("Env:{v}"))
+        .collect();
+    writeln!(
+        f,
+        "Remove-Item {} -ErrorAction SilentlyContinue",
+        scrub.join(",")
+    )?;
+
+    // Discover paths for minimal environments.
+    let mut paths_to_add: Vec<String> = Vec::new();
+
+    fn add_path(paths: &mut Vec<String>, binary_path: Option<String>) {
+        if let Some(bp) = binary_path
+            && let Some(dir) = Path::new(&bp).parent()
+        {
+            let dir_str = dir.to_string_lossy().to_string();
+            if !paths.contains(&dir_str) {
+                paths.push(dir_str);
+            }
+        }
+    }
+
+    add_path(&mut paths_to_add, which_bin("hcom"));
+    add_path(&mut paths_to_add, which_bin("python3"));
+    let cmd_stripped = command_str.trim_start();
+    let tool_cmd = cmd_stripped.split_whitespace().next().unwrap_or("");
+    add_path(&mut paths_to_add, which_bin(tool_cmd));
+    if tool_cmd == "claude" {
+        add_path(&mut paths_to_add, which_bin("node"));
+    }
+
+    if !paths_to_add.is_empty() {
+        // Windows PATH is `;`-separated.
+        let prefix = format!("{};", paths_to_add.join(";"));
+        writeln!(f, "$env:PATH = {} + $env:PATH", ps_quote(&prefix))?;
+    }
+
+    for line in ps_env_assignments(env) {
+        writeln!(f, "{line}")?;
+    }
+
+    if let Some(dir) = cwd {
+        writeln!(f, "Set-Location {}", ps_quote(dir))?;
+    }
+
+    // Resolve the tool to a full path and invoke it through the call operator so
+    // a quoted path runs as a command. If the tool isn't found, fall through to
+    // the bare command name (resolved via the PATH we just prepended).
+    let mut final_command = command_str.to_string();
+    if !tool_cmd.is_empty()
+        && let Some(tool_path) = which_bin(tool_cmd)
+    {
+        let replaced = final_command.replacen(
+            &format!("{tool_cmd} "),
+            &format!("& {} ", ps_quote(&tool_path)),
+            1,
+        );
+        final_command = if replaced != final_command {
+            replaced
+        } else {
+            // No arguments: the command is exactly the tool name (no trailing
+            // space to match), so replace the bare name directly.
+            final_command.replacen(tool_cmd, &format!("& {}", ps_quote(&tool_path)), 1)
+        };
+    }
+
+    writeln!(f, "{final_command}")?;
+
+    if opens_new_window {
+        // Clear hcom state from the interactive shell left open after the tool
+        // exits (window persists via `powershell -NoExit`).
+        let mut leftover_vars: Vec<&str> = HCOM_IDENTITY_VARS.to_vec();
+        leftover_vars.extend(["HCOM_TAG", "HCOM_CODEX_SANDBOX_MODE"]);
+        let leftover: Vec<String> = leftover_vars.iter().map(|v| format!("Env:{v}")).collect();
+        writeln!(
+            f,
+            "Remove-Item {} -ErrorAction SilentlyContinue",
+            leftover.join(",")
+        )?;
+        writeln!(
+            f,
+            "Remove-Item -Force -ErrorAction SilentlyContinue {}",
+            ps_quote(&script_file.to_string_lossy())
+        )?;
+    } else if !background {
+        writeln!(f, "$hcom_status = $LASTEXITCODE")?;
+        writeln!(
+            f,
+            "Remove-Item -Force -ErrorAction SilentlyContinue {}",
+            ps_quote(&script_file.to_string_lossy())
+        )?;
+        writeln!(f, "exit $hcom_status")?;
+    }
 
     Ok(())
 }
@@ -742,7 +1275,7 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let mut strip: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for v in TOOL_MARKER_VARS {
+    for v in tool_marker_vars() {
         strip.insert(v);
     }
     for v in HCOM_IDENTITY_VARS {
@@ -758,90 +1291,124 @@ where
         .collect()
 }
 
-/// Parse terminal command template safely to prevent shell injection.
-fn parse_terminal_command(
-    template: &str,
-    script_file: &str,
-    process_id: &str,
+/// Inputs to terminal command template substitution.
+///
+/// All fields are borrowed and may be empty; unknown placeholders are left
+/// in place by `substitute_open_argv` (no substitution panics).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct TerminalCommandContext<'a> {
+    pub script: &'a str,
+    pub process_id: &'a str,
+    pub cwd: &'a str,
+    pub instance_name: &'a str,
+    pub tool: &'a str,
+    /// Pre-formatted pane title (e.g. `◉ team-luna [claude]`). Falls back to
+    /// `instance_name` when None or empty.
+    pub pane_title: Option<&'a str>,
+}
+
+/// Substitute placeholders into an open-command argv template, per element.
+///
+/// Each element of `template` is one argument (no shell splitting). Placeholders
+/// are replaced inside each element with `String::replace`, so a Windows path
+/// like `C:\Users\x\s.ps1` substituted into the `{script}` element survives
+/// intact (no backslash mangling, no re-quoting). Requires at least one element
+/// to contain `{script}`.
+fn substitute_open_argv(
+    template: &[String],
+    ctx: TerminalCommandContext<'_>,
 ) -> Result<Vec<String>> {
-    if !template.contains("{script}") {
+    if !template.iter().any(|p| p.contains("{script}")) {
         bail!(
             "Custom terminal command must include {{script}} placeholder\n\
              Example: open -n -a kitty.app --args bash \"{{script}}\""
         );
     }
 
-    let parts = shell_split(template)?;
+    let pane_title = ctx
+        .pane_title
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ctx.instance_name);
 
-    let mut replaced = Vec::new();
-    let mut placeholder_found = false;
-    for mut part in parts {
-        if part.contains("{process_id}") {
-            part = part.replace("{process_id}", process_id);
-        }
-        if part.contains("{script}") {
-            part = part.replace("{script}", script_file);
-            placeholder_found = true;
-        }
-        replaced.push(part);
-    }
-
-    if !placeholder_found {
-        bail!("{{script}} placeholder not found after parsing");
-    }
+    let replaced: Vec<String> = template
+        .iter()
+        .map(|part| {
+            let mut part = part.clone();
+            for (placeholder, value) in [
+                ("{process_id}", ctx.process_id),
+                ("{cwd}", ctx.cwd),
+                ("{instance_name}", ctx.instance_name),
+                ("{tool}", ctx.tool),
+                ("{pane_title}", pane_title),
+                ("{script}", ctx.script),
+            ] {
+                if part.contains(placeholder) {
+                    part = part.replace(placeholder, value);
+                }
+            }
+            part
+        })
+        .collect();
 
     Ok(replaced)
 }
 
-/// Shell-split a string.
-fn shell_split(s: &str) -> Result<Vec<String>> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escape_next = false;
+/// Substitute placeholders into a close-command argv template, per element.
+///
+/// Mirrors the open path but for close placeholders. Returns `None` (caller
+/// treats as "skip the close") when a required placeholder appears in the
+/// template but the corresponding value is empty — preserving the previous
+/// `close_terminal_pane` skip semantics. `effective_pane_id` is the resolved
+/// pane id (caller falls back from `pane_id` to `terminal_id`).
+fn substitute_close_argv(
+    template: &[String],
+    pid: u32,
+    effective_pane_id: &str,
+    process_id: &str,
+    terminal_id: &str,
+) -> Option<Vec<String>> {
+    let needs = |ph: &str| template.iter().any(|p| p.contains(ph));
 
-    for ch in s.chars() {
-        if escape_next {
-            current.push(ch);
-            escape_next = false;
-            continue;
-        }
-        if ch == '\\' && !in_single {
-            escape_next = true;
-            continue;
-        }
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            continue;
-        }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            continue;
-        }
-        if ch.is_whitespace() && !in_single && !in_double {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
+    if needs("{pane_id}") && effective_pane_id.is_empty() {
+        return None;
+    }
+    if needs("{process_id}") && process_id.is_empty() {
+        return None;
+    }
+    if needs("{id}") && terminal_id.is_empty() {
+        return None;
+    }
+
+    let pid_str = pid.to_string();
+    let argv: Vec<String> = template
+        .iter()
+        .map(|part| {
+            let mut part = part.clone();
+            for (placeholder, value) in [
+                ("{pid}", pid_str.as_str()),
+                ("{pane_id}", effective_pane_id),
+                ("{process_id}", process_id),
+                ("{id}", terminal_id),
+            ] {
+                if part.contains(placeholder) {
+                    part = part.replace(placeholder, value);
+                }
             }
-            continue;
-        }
-        current.push(ch);
-    }
+            part
+        })
+        .collect();
 
-    if in_single || in_double {
-        bail!("Unmatched quote in command");
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    Ok(tokens)
+    Some(argv)
 }
 
-/// Get macOS Terminal.app launch command.
-fn get_macos_terminal_command() -> String {
-    rewrite_macos_open_app_command("open -a Terminal {script}", "Terminal")
+/// Get macOS Terminal.app launch argv ({script} substituted by the caller).
+fn get_macos_terminal_argv() -> Vec<String> {
+    let mut argv: Vec<String> = ["open", "-a", "Terminal", "{script}"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    rewrite_macos_open_app_argv(&mut argv, "Terminal");
+    argv
 }
 
 /// Escape a string for use inside a YAML double-quoted scalar.
@@ -892,10 +1459,10 @@ fn build_warp_launch_yaml(config_name: &str, cwd: &str, script: &str) -> String 
 /// `cd subdir` lands where a non-Warp launch would. HOME is a last resort
 /// if current_dir() fails.
 fn resolve_warp_cwd(cwd: Option<&str>, home: &Path) -> String {
-    if let Some(c) = cwd {
-        if Path::new(c).is_absolute() {
-            return c.to_string();
-        }
+    if let Some(c) = cwd
+        && Path::new(c).is_absolute()
+    {
+        return c.to_string();
     }
     std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -958,6 +1525,16 @@ fn write_warp_launch_config_at(
     Ok(yaml_path)
 }
 
+/// Human-readable name for the Windows default-terminal fallback, mirroring
+/// `windows_default_terminal_template`'s `has_wt` branch.
+fn windows_default_terminal_display_name(has_wt: bool) -> &'static str {
+    if has_wt {
+        "Windows Terminal"
+    } else {
+        "cmd.exe"
+    }
+}
+
 /// Return a human-readable name for the platform's built-in fallback terminal
 /// (used when `terminal = "default"` and no terminal is detected from env).
 pub fn get_default_fallback_terminal_name() -> &'static str {
@@ -975,6 +1552,8 @@ pub fn get_default_fallback_terminal_name() -> &'static str {
                 }
             } else if which_bin("gnome-terminal").is_some() {
                 "gnome-terminal"
+            } else if which_bin("ptyxis").is_some() {
+                "ptyxis"
             } else if which_bin("konsole").is_some() {
                 "konsole"
             } else if which_bin("xterm").is_some() {
@@ -983,6 +1562,7 @@ pub fn get_default_fallback_terminal_name() -> &'static str {
                 "none"
             }
         }
+        "Windows" => windows_default_terminal_display_name(which_bin("wt").is_some()),
         _ => "unknown",
     }
 }
@@ -993,6 +1573,10 @@ fn get_linux_terminal_argv() -> Option<Vec<String>> {
         (
             "gnome-terminal",
             &["gnome-terminal", "--", "bash", "{script}"] as &[&str],
+        ),
+        (
+            "ptyxis",
+            &["ptyxis", "--new-window", "--", "bash", "{script}"],
         ),
         ("konsole", &["konsole", "-e", "bash", "{script}"]),
         ("xterm", &["xterm", "-e", "bash", "{script}"]),
@@ -1025,6 +1609,48 @@ fn get_linux_terminal_argv() -> Option<Vec<String>> {
     None
 }
 
+/// Default Windows terminal launch argv template ({script} substituted by
+/// the caller). Host-testable: takes `has_wt` explicitly instead of probing.
+///
+/// Prefers Windows Terminal, which parses everything after `--` as a literal
+/// argv so a script path with spaces stays a single argument. Without it, opens
+/// a fresh console via cmd's `start` (the empty arg is start's window-title
+/// slot; `{script}` is bare — `Command`'s Windows argv quoting adds quotes
+/// only when needed). Either way the shell runs the generated `.ps1` with the
+/// execution policy bypassed and stays open (`-NoExit`) for the new window.
+fn windows_default_terminal_template(has_wt: bool) -> Vec<String> {
+    let to_vec = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    if has_wt {
+        return to_vec(&[
+            "wt",
+            "--",
+            "powershell",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-NoExit",
+            "-File",
+            "{script}",
+        ]);
+    }
+    to_vec(&[
+        "cmd",
+        "/c",
+        "start",
+        "",
+        "powershell",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-NoExit",
+        "-File",
+        "{script}",
+    ])
+}
+
+/// Default Windows terminal launch argv ({script} substituted by the caller).
+fn get_windows_terminal_argv() -> Vec<String> {
+    windows_default_terminal_template(which_bin("wt").is_some())
+}
+
 /// Spawn terminal process, detached when inside AI tools.
 ///
 /// Returns (success, stdout_first_line) — stdout captured for {id} in close commands.
@@ -1045,6 +1671,7 @@ fn is_external_terminal_launcher(argv: &[String]) -> bool {
             | "ttab"
             | "wttab"
             | "gnome-terminal"
+            | "ptyxis"
             | "konsole"
             | "xterm"
             | "tilix"
@@ -1054,6 +1681,7 @@ fn is_external_terminal_launcher(argv: &[String]) -> bool {
             | "wt"
             | "wt.exe"
             | "mintty"
+            | "herdr"
     )
 }
 
@@ -1091,15 +1719,16 @@ pub fn is_zellij_preset(preset_name: &str) -> bool {
     if preset_name == "zellij" {
         return true;
     }
+    crate::config::get_merged_preset(preset_name).is_some_and(|p| is_zellij_merged(&p))
+}
 
-    crate::config::get_merged_preset(preset_name).is_some_and(|preset| {
-        preset.binary.as_deref() == Some("zellij")
-            || preset.open.starts_with("zellij ")
-            || preset
-                .close
-                .as_deref()
-                .is_some_and(|close| close.starts_with("zellij "))
-    })
+pub fn is_zellij_merged(preset: &crate::config::MergedPreset) -> bool {
+    let is_zellij_argv0 = |argv: &[String]| argv.first().map(String::as_str) == Some("zellij");
+    preset.binary.as_deref() == Some("zellij")
+        || is_zellij_argv0(&preset.open)
+        || preset.open_windows.as_deref().is_some_and(is_zellij_argv0)
+        || preset.close.as_deref().is_some_and(is_zellij_argv0)
+        || preset.close_windows.as_deref().is_some_and(is_zellij_argv0)
 }
 
 fn validate_terminal_launch_output(
@@ -1140,6 +1769,36 @@ fn validate_terminal_launch_output(
 fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool, String)> {
     let launcher_env = get_launcher_env();
     let env_vec: Vec<(String, String)> = launcher_env.into_iter().collect();
+
+    #[cfg(windows)]
+    if argv.first().is_some_and(|arg| {
+        Path::new(arg)
+            .file_stem()
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("wezterm"))
+    }) && argv.get(1).is_some_and(|arg| arg == "start")
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .map_err(|err| {
+                anyhow!(maybe_append_ai_tool_launch_hint(
+                    format!("Failed to spawn terminal process: {err}"),
+                    argv,
+                    inside_ai_tool,
+                ))
+            })?;
+        return Ok((true, String::new()));
+    }
 
     if inside_ai_tool {
         // Fully detach: don't let AI tool's PTY capture our output
@@ -1212,6 +1871,13 @@ fn write_terminal_id(env: &HashMap<String, String>, captured_id: &str) {
 
 fn normalize_captured_terminal_id(captured_id: &str) -> String {
     let captured_id = captured_id.trim();
+
+    // Herdr: parse JSON response and extract result.agent.pane_id
+    if let Some(pane_id) = parse_herdr_pane_id(captured_id) {
+        return pane_id;
+    }
+
+    // Waveterm: "run block created: block:abc123" -> "block:abc123"
     let Some((_, block_ref)) = captured_id.rsplit_once("block:") else {
         return captured_id.to_string();
     };
@@ -1223,12 +1889,129 @@ fn normalize_captured_terminal_id(captured_id: &str) -> String {
     }
 }
 
+/// Parse a herdr CLI JSON response and extract the launched pane's id.
+///
+/// Handles the envelopes hcom launches through:
+/// - `cli:tab:create` (the default herdr preset) → `result.root_pane.pane_id`
+/// - `cli:pane:split` → `result.root_pane.pane_id`
+/// - `cli:agent:start` (legacy) → `result.agent.pane_id`
+///
+/// Gated on the response `id` field so non-herdr terminal outputs that happen
+/// to be JSON don't accidentally match this shape.
+fn parse_herdr_pane_id(captured: &str) -> Option<String> {
+    let trimmed = captured.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let result = val.get("result")?;
+    let pane_id = match val.get("id").and_then(|v| v.as_str())? {
+        "cli:tab:create" | "cli:pane:split" => result.get("root_pane")?.get("pane_id")?,
+        "cli:agent:start" => result.get("agent")?.get("pane_id")?,
+        _ => return None,
+    };
+    pane_id
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Launch a herdr pane in two steps: `tab create` (whose stdout JSON carries
+/// the new pane id) then `pane run <pane_id> "bash <script>"` to start hcom's
+/// normal runner inside it. Returns `(success, captured_stdout)` where the
+/// captured stdout is the `tab create` envelope — `write_terminal_id` re-parses
+/// the pane id out of it exactly like every other terminal's captured id.
+fn launch_herdr_two_step(
+    create_template: &[String],
+    ctx: TerminalCommandContext<'_>,
+    inside_ai_tool: bool,
+) -> Result<(bool, String)> {
+    // Step 1: open the pane. `tab create` takes no script, so substitute
+    // placeholders directly — the generic `substitute_open_argv` requires a
+    // `{script}` slot this command intentionally lacks.
+    let create_argv = substitute_herdr_create_argv(create_template, &ctx);
+    let (created, captured) = spawn_terminal_process(&create_argv, inside_ai_tool)?;
+    let Some(pane_id) = parse_herdr_pane_id(captured.trim()) else {
+        // Couldn't open/parse a pane. Either `tab create` failed outright (no
+        // pane exists) or returned something unparseable; without a pane id
+        // there's nothing to close. Surface failure but keep the raw stdout so
+        // callers/logs can see what herdr returned.
+        return Ok((false, captured));
+    };
+
+    // Step 2: run hcom's generated runner script in the new pane. `pane run`
+    // sends the text and presses Enter, so `bash <script>` is the whole line.
+    // The script path is shell-quoted: herdr types it into the pane's shell,
+    // and hcom's launch dir lives under $HOME, which can contain spaces.
+    let run_argv = vec![
+        "herdr".to_string(),
+        "pane".to_string(),
+        "run".to_string(),
+        pane_id.clone(),
+        format!("bash {}", shell_quote(ctx.script)),
+    ];
+    // Don't `?`-propagate a step-2 failure directly: step 1 already opened the
+    // pane, so bailing here would orphan an empty pane that looks like a live
+    // agent in herdr's sidebar (issue #102, F3). Unlike the old single-command
+    // `agent start` preset — where a spawn failure left nothing behind — the
+    // two-step split has to clean up the half it created. Close it best-effort,
+    // then surface the original error.
+    let ran = match spawn_terminal_process(&run_argv, inside_ai_tool) {
+        Ok((ran, _)) => ran,
+        Err(run_err) => {
+            let close_argv = vec![
+                "herdr".to_string(),
+                "pane".to_string(),
+                "close".to_string(),
+                pane_id,
+            ];
+            let _ = spawn_terminal_process(&close_argv, inside_ai_tool);
+            return Err(run_err);
+        }
+    };
+
+    // Return the `tab create` stdout so `write_terminal_id` records the pane id.
+    Ok((created && ran, captured))
+}
+
+/// Substitute placeholders into herdr's `tab create` argv. Mirrors
+/// `substitute_open_argv` but without the mandatory `{script}` slot (herdr's
+/// `tab create` takes no script; the runner is sent separately via `pane run`).
+fn substitute_herdr_create_argv(
+    template: &[String],
+    ctx: &TerminalCommandContext<'_>,
+) -> Vec<String> {
+    let pane_title = ctx
+        .pane_title
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ctx.instance_name);
+    template
+        .iter()
+        .map(|part| {
+            let mut part = part.clone();
+            for (placeholder, value) in [
+                ("{process_id}", ctx.process_id),
+                ("{cwd}", ctx.cwd),
+                ("{instance_name}", ctx.instance_name),
+                ("{tool}", ctx.tool),
+                ("{pane_title}", pane_title),
+            ] {
+                if part.contains(placeholder) {
+                    part = part.replace(placeholder, value);
+                }
+            }
+            part
+        })
+        .collect()
+}
+
 /// Launch terminal with command.
 ///
 /// # Modes
 /// - `background=true`: Launch as background process, returns Background(log_file, pid)
 /// - `run_here=true`: Run in current terminal (blocking via execve)
 /// - Otherwise: New terminal window/tab/split
+#[allow(clippy::too_many_arguments)]
 pub fn launch_terminal(
     command: &str,
     env: &HashMap<String, String>,
@@ -1237,6 +2020,7 @@ pub fn launch_terminal(
     run_here: bool,
     terminal: Option<&str>,
     inside_ai_tool: bool,
+    tool_id: Option<&str>,
 ) -> Result<(LaunchResult, String)> {
     let config_and_instance_env = env.clone();
 
@@ -1261,7 +2045,9 @@ pub fn launch_terminal(
 
     // Determine script extension after terminal mode resolution so explicit
     // Terminal.app uses the macOS `.command` launcher just like auto-detect.
-    let extension = if should_use_command_extension(background, &terminal_mode) {
+    let extension = if cfg!(windows) {
+        ".ps1"
+    } else if should_use_command_extension(background, &terminal_mode) {
         ".command"
     } else {
         ".sh"
@@ -1281,16 +2067,28 @@ pub fn launch_terminal(
         fs::create_dir_all(parent).ok();
     }
 
-    // Create script
-    create_bash_script(
-        &script_file,
-        &final_env,
-        cwd,
-        command,
-        background,
-        None,
-        opens_new_window,
-    )?;
+    // Create script. Windows uses a native PowerShell script; Unix uses bash.
+    if cfg!(windows) {
+        create_powershell_script(
+            &script_file,
+            &final_env,
+            cwd,
+            command,
+            background,
+            tool_id,
+            opens_new_window,
+        )?;
+    } else {
+        create_bash_script(
+            &script_file,
+            &final_env,
+            cwd,
+            command,
+            background,
+            tool_id,
+            opens_new_window,
+        )?;
+    }
 
     // Background mode
     if background {
@@ -1301,25 +2099,23 @@ pub fn launch_terminal(
 
         let log_handle = fs::File::create(&log_file).context("Failed to create log file")?;
 
-        let mut cmd = Command::new("bash");
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args(POWERSHELL_SCRIPT_FLAGS);
+            c
+        } else {
+            Command::new(resolve_bash_command())
+        };
         cmd.arg(&script_file)
             .stdin(std::process::Stdio::null())
             .stdout(log_handle.try_clone()?)
             .stderr(log_handle);
 
-        // Detach child into its own session so it survives parent exit (no SIGHUP)
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
-                });
-            }
-        }
-
-        let child = cmd.spawn().context("Failed to launch background process")?;
+        // Detach child into its own session so it survives parent exit (no
+        // SIGHUP), without leaking a captured caller's stdout/stderr handles
+        // into the long-lived runner on Windows.
+        let child = crate::sys::process::spawn_detached(&mut cmd)
+            .context("Failed to launch background process")?;
 
         // Brief health check
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1347,32 +2143,39 @@ pub fn launch_terminal(
         if let Some(dir) = cwd {
             std::env::set_current_dir(dir).ok();
         }
-        // Use execve to replace this process entirely
-        use std::ffi::CString;
-        let bash_path = which_bin("bash").unwrap_or_else(|| "/bin/bash".to_string());
-        let bash = CString::new(bash_path).unwrap();
-        let arg0 = CString::new("bash").unwrap();
-        let arg1 = CString::new(script_file.to_string_lossy().as_ref()).unwrap();
-        let argv_ptrs: Vec<*const libc::c_char> =
-            vec![arg0.as_ptr(), arg1.as_ptr(), std::ptr::null()];
-        let env_cstrings: Vec<CString> = full_env
-            .iter()
-            .filter_map(|(k, v)| CString::new(format!("{}={}", k, v)).ok())
-            .collect();
-        let mut env_ptrs: Vec<*const libc::c_char> =
-            env_cstrings.iter().map(|c| c.as_ptr()).collect();
-        env_ptrs.push(std::ptr::null());
-        // execve replaces process; never returns on success
-        unsafe {
-            libc::execve(bash.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
-        }
-        bail!("execve failed: {}", std::io::Error::last_os_error());
+        // Replace this process entirely with the script's shell.
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("powershell");
+            c.args(POWERSHELL_SCRIPT_FLAGS);
+            c
+        } else {
+            Command::new(resolve_bash_command())
+        };
+        cmd.arg(script_file).env_clear().envs(&full_env);
+        let err = crate::sys::process::exec_replace(cmd);
+        bail!("exec failed: {}", err);
     }
 
     // New window / custom command mode
-    let custom_cmd: Option<String> = if terminal_mode == "default" {
+    let custom_cmd: Option<Vec<String>> = if terminal_mode == "default" {
         None
     } else if crate::config::get_merged_preset(&terminal_mode).is_some() {
+        // Built-in presets not available on this platform are rejected here too
+        // (not just at config-validation time) so HCOM_TERMINAL can't bypass the
+        // check. User-defined TOML presets declare no platform and are exempt.
+        if crate::config::is_known_terminal_preset_pub(&terminal_mode)
+            && !crate::config::is_user_defined_preset(&terminal_mode)
+            && !crate::config::terminal_preset_supported_on(
+                &terminal_mode,
+                platform::platform_name(),
+            )
+        {
+            bail!(
+                "terminal preset '{}' is not available on {}",
+                terminal_mode,
+                platform::platform_name()
+            );
+        }
         // Known preset — check kitty remote control requirements
         if terminal_mode == "kitty-tab" || terminal_mode == "kitty-split" {
             let listen_on = std::env::var("KITTY_LISTEN_ON")
@@ -1390,26 +2193,36 @@ pub fn launch_terminal(
                 );
             }
         }
-        let mut cmd = resolve_terminal_preset(&terminal_mode).unwrap_or_default();
-        // Inject --to for kitty commands launched outside kitty
-        if !kitty_socket.is_empty() && cmd.contains("kitten @") && !cmd.contains("--to") {
-            cmd = cmd.replace(
-                "kitten @",
-                &format!("kitten @ --to {}", shell_quote(&kitty_socket)),
+        let mut argv = resolve_terminal_open_argv(&terminal_mode).unwrap_or_default();
+        splice_kitten_to_socket(&mut argv, &kitty_socket);
+        // Target launcher's tab for splits: insert `--match window_id:<wid>`
+        // before the `--` separator.
+        if (terminal_mode == "kitty-tab" || terminal_mode == "kitty-split")
+            && let Ok(wid) = std::env::var("KITTY_WINDOW_ID")
+            && !wid.is_empty()
+            && let Some(sep) = argv.iter().position(|a| a == "--")
+        {
+            argv.splice(
+                sep..sep,
+                ["--match".to_string(), format!("window_id:{wid}")],
             );
         }
-        // Target launcher's tab for splits
-        if terminal_mode == "kitty-tab" || terminal_mode == "kitty-split" {
-            if let Ok(wid) = std::env::var("KITTY_WINDOW_ID") {
-                if !wid.is_empty() && cmd.contains(" -- ") {
-                    cmd = cmd.replacen(" -- ", &format!(" --match window_id:{} -- ", wid), 1);
-                }
-            }
-        }
-        Some(cmd)
+        Some(argv)
     } else {
-        // Custom command template
-        Some(terminal_mode.clone())
+        // Custom command template string (HCOM_TERMINAL / config custom command).
+        // Tokenize once via the double-quote-aware splitter; the array-form TOML
+        // preset path never reaches here (those are known presets).
+        //
+        // `shell_split` itself treats an unquoted `\` as a literal character on
+        // Windows (instead of a POSIX escape), so Windows paths like
+        // `C:\Tools\term.exe` supplied via HCOM_TERMINAL survive intact without
+        // any pre-processing here.
+        let argv = match crate::tools::args_common::shell_split(&terminal_mode, cfg!(windows)) {
+            Ok(argv) if !argv.is_empty() => argv,
+            Ok(_) => bail!("custom terminal command is empty"),
+            Err(e) => bail!("invalid quoting in custom terminal command: {e}"),
+        };
+        Some(windows_shellify_custom_argv(argv)?)
     };
 
     let script_str = script_file.to_string_lossy().to_string();
@@ -1437,13 +2250,43 @@ pub fn launch_terminal(
     }
 
     if let Some(cmd_template) = custom_cmd {
-        // Parse user-provided or preset command template
-        let final_argv = parse_terminal_command(
-            &cmd_template,
-            &script_str,
-            env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or(""),
-        )?;
-        let (success, captured_id) = spawn_terminal_process(&final_argv, inside_ai_tool)?;
+        // {instance_name} falls back to process_id so presets that label panes
+        // (e.g. herdr) never produce an empty `[tool]-` suffix when invoked
+        // outside the normal launch flow.
+        let process_id = env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or("");
+        let instance_name = env
+            .get("HCOM_INSTANCE_NAME")
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(process_id);
+        let ctx = TerminalCommandContext {
+            script: &script_str,
+            process_id,
+            cwd: cwd.unwrap_or(""),
+            instance_name,
+            tool: env
+                .get("HCOM_TOOL")
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("hcom"),
+            // launcher::launch pre-formats the title; here we only read it.
+            pane_title: env
+                .get("HCOM_PANE_TITLE")
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty()),
+        };
+        // Herdr launches in two steps: `tab create` (stdout carries the pane
+        // id) then `pane run <pane_id> "bash {script}"`. This doesn't fit the
+        // single-argv preset model, so handle it natively. Everything else is a
+        // single spawn.
+        let (success, captured_id) = if terminal_mode == "herdr" {
+            launch_herdr_two_step(&cmd_template, ctx, inside_ai_tool)?
+        } else {
+            // The Windows `.ps1`-via-PowerShell variant is already selected by
+            // the preset's `open_argv(cfg!(windows))`; no text rewrite needed.
+            let final_argv = substitute_open_argv(&cmd_template, ctx)?;
+            spawn_terminal_process(&final_argv, inside_ai_tool)?
+        };
         write_terminal_id(env, &captured_id);
         if success {
             Ok((LaunchResult::Success, terminal_mode))
@@ -1455,7 +2298,11 @@ pub fn launch_terminal(
         }
     } else {
         // Platform default
-        if platform::is_termux() {
+        if termux_host_visible() {
+            if !is_native_termux_runtime() {
+                bail!("{}", proot_termux_launch_error());
+            }
+
             let am_argv = vec![
                 "am",
                 "startservice",
@@ -1472,27 +2319,39 @@ pub fn launch_terminal(
                 "com.termux.RUN_COMMAND_BACKGROUND",
                 "false",
             ];
-            Command::new(am_argv[0])
+            let status = Command::new(am_argv[0])
                 .args(&am_argv[1..])
                 .status()
                 .context("Failed to launch Termux")?;
+            validate_termux_dispatch_status(status)?;
             return Ok((LaunchResult::Success, terminal_mode));
         }
 
         let argv = match platform::platform_name() {
-            "Darwin" => parse_terminal_command(
-                &get_macos_terminal_command(),
-                &script_str,
-                env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or(""),
+            "Darwin" => substitute_open_argv(
+                &get_macos_terminal_argv(),
+                TerminalCommandContext {
+                    script: &script_str,
+                    process_id: env.get("HCOM_PROCESS_ID").map(|s| s.as_str()).unwrap_or(""),
+                    cwd: cwd.unwrap_or(""),
+                    instance_name: env
+                        .get("HCOM_INSTANCE_NAME")
+                        .map(|s| s.as_str())
+                        .unwrap_or(""),
+                    tool: env.get("HCOM_TOOL").map(|s| s.as_str()).unwrap_or(""),
+                    pane_title: None,
+                },
             )?,
             "Linux" => get_linux_terminal_argv()
                 .ok_or_else(|| anyhow::anyhow!("No supported terminal emulator found"))?,
+            "Windows" => get_windows_terminal_argv(),
             other => bail!("Unsupported platform: {}", other),
         };
 
         let final_argv: Vec<String> = if platform::platform_name() == "Darwin" {
             argv
         } else {
+            // Linux/Windows defaults carry only `{script}` placeholders.
             argv.iter()
                 .map(|a| a.replace("{script}", &script_str))
                 .collect()
@@ -1514,7 +2373,7 @@ pub fn launch_terminal(
 fn build_full_env(config_env: &HashMap<String, String>) -> HashMap<String, String> {
     let mut full = config_env.clone();
     for (k, v) in std::env::vars() {
-        if TOOL_MARKER_VARS.contains(&k.as_str()) {
+        if tool_marker_vars().contains(&k.as_str()) {
             continue;
         }
         if k == "HCOM_TERMINAL" {
@@ -1538,18 +2397,20 @@ pub fn close_terminal_pane(
     kitty_listen_on: &str,
     terminal_id: &str,
     zellij_session_name: &str,
-) -> bool {
+) -> PaneCloseResult {
+    let failed_without_command = || PaneCloseResult {
+        closed: false,
+        retry_command: None,
+    };
     let merged = match crate::config::get_merged_preset(preset_name) {
         Some(p) => p,
-        None => return false,
+        None => return failed_without_command(),
     };
 
-    let close_template = match merged.close {
-        Some(ref c) => c.clone(),
-        None => return false,
+    let close_template = match merged.close_argv(cfg!(windows)) {
+        Some(c) => c,
+        None => return failed_without_command(),
     };
-
-    let mut close_cmd = close_template;
 
     // Determine effective pane_id (fall back to terminal_id)
     let effective_pane_id = if pane_id.is_empty() && !terminal_id.is_empty() {
@@ -1558,93 +2419,136 @@ pub fn close_terminal_pane(
         pane_id
     };
 
-    // Skip if command needs a placeholder we don't have
-    if close_cmd.contains("{pane_id}") && effective_pane_id.is_empty() {
-        return false;
-    }
-    if close_cmd.contains("{process_id}") && process_id.is_empty() {
-        return false;
-    }
-    if close_cmd.contains("{id}") && terminal_id.is_empty() {
-        return false;
-    }
+    // Substitute close placeholders per-element. Returns None when a required
+    // placeholder is present but its value is empty (skip the close).
+    let mut argv = match substitute_close_argv(
+        &close_template,
+        pid,
+        effective_pane_id,
+        process_id,
+        terminal_id,
+    ) {
+        Some(a) => a,
+        None => return failed_without_command(),
+    };
 
-    close_cmd = close_cmd.replace("{pid}", &pid.to_string());
-    close_cmd = close_cmd.replace("{pane_id}", effective_pane_id);
-    close_cmd = close_cmd.replace("{process_id}", process_id);
-    close_cmd = close_cmd.replace("{id}", terminal_id);
-
-    let is_zellij = is_zellij_preset(preset_name);
+    let is_zellij = is_zellij_merged(&merged);
 
     let zellij_before_close = if is_zellij {
         match zellij_terminal_pane_exists(zellij_session_name, effective_pane_id) {
             Some(true) => Some(true),
-            Some(false) => return false,
+            Some(false) => return failed_without_command(),
             None => None,
         }
     } else {
         None
     };
 
-    if is_zellij && !zellij_session_name.is_empty() && close_cmd.starts_with("zellij action ") {
-        close_cmd = format!(
-            "zellij --session {}{}",
-            shell_quote(zellij_session_name),
-            &close_cmd["zellij".len()..]
+    // Splice `--session <name>` right after `zellij` for `zellij action ...`.
+    if is_zellij
+        && !zellij_session_name.is_empty()
+        && argv.first().map(String::as_str) == Some("zellij")
+        && argv.get(1).map(String::as_str) == Some("action")
+    {
+        argv.splice(
+            1..1,
+            ["--session".to_string(), zellij_session_name.to_string()],
         );
     }
 
-    // Resolve binary path via app bundle fallback
-    if let Some(ref binary) = merged.binary {
-        let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
-        if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name) {
-            if close_cmd.starts_with(binary.as_str()) {
-                close_cmd = format!("{}{}", full_path, &close_cmd[binary.len()..]);
-            }
-        }
-    }
-    if close_cmd.starts_with("kitten ") {
-        if let Some(full_path) = find_kitten_binary() {
-            close_cmd = format!(
-                "{}{}",
-                shell_quote(&full_path),
-                &close_cmd["kitten".len()..]
-            );
-        }
-    }
-
-    // Inject --to for kitten commands when we have the socket path
-    if close_cmd.contains("kitten @")
+    // Inject `--to <socket>` (after the `@`) for kitten commands when we have
+    // the socket path. Must run before the binary-path rewrite below, because
+    // that rewrite replaces argv[0] with an absolute path and the "kitten"
+    // string check would no longer match.
+    if argv.first().map(String::as_str) == Some("kitten")
+        && argv.get(1).map(String::as_str) == Some("@")
         && !kitty_listen_on.is_empty()
-        && !close_cmd.contains("--to")
+        && !argv.iter().any(|a| a == "--to")
         && !kitty_listen_on.starts_with("fd:")
     {
-        close_cmd = close_cmd.replace(
-            "kitten @",
-            &format!("kitten @ --to {}", shell_quote(kitty_listen_on)),
-        );
+        argv.splice(2..2, ["--to".to_string(), kitty_listen_on.to_string()]);
     }
 
-    let output = Command::new("sh")
-        .args(["-c", &close_cmd])
+    // Resolve binary path via app bundle fallback (replace argv[0]).
+    if let Some(ref binary) = merged.binary {
+        let app_name = merged.app_name.as_deref().unwrap_or(preset_name);
+        if let Some(full_path) = resolve_binary_path(binary, Some(app_name), preset_name)
+            && argv.first().map(String::as_str) == Some(binary.as_str())
+        {
+            argv[0] = full_path;
+        }
+    }
+    if argv.first().map(String::as_str) == Some("kitten")
+        && let Some(full_path) = find_kitten_binary()
+    {
+        argv[0] = full_path;
+    }
+
+    if argv.is_empty() {
+        return failed_without_command();
+    }
+    let retry_command = format_close_command(&argv);
+    let failed = || PaneCloseResult {
+        closed: false,
+        retry_command: Some(retry_command.clone()),
+    };
+
+    // Run the close command directly (no shell) so it works on Windows too.
+    let mut child = match Command::new(&argv[0])
+        .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    let Ok(output) = output else {
-        return false;
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("Failed to close {preset_name} pane: {err}");
+            return failed();
+        }
     };
-    if !output.status.success() {
-        return false;
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < TERMINAL_CLOSE_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                eprintln!(
+                    "Timed out after {}s closing {preset_name} pane {effective_pane_id}",
+                    TERMINAL_CLOSE_TIMEOUT.as_secs()
+                );
+                return failed();
+            }
+            Err(err) => {
+                let _ = child.kill();
+                eprintln!("Failed waiting for {preset_name} pane close: {err}");
+                return failed();
+            }
+        }
+    };
+
+    if !status.success() {
+        eprintln!("Failed to close {preset_name} pane {effective_pane_id}: {status}");
+        return failed();
     }
 
     if is_zellij {
-        return zellij_before_close == Some(true)
+        let closed = zellij_before_close == Some(true)
             && zellij_terminal_pane_exists(zellij_session_name, effective_pane_id) == Some(false);
+        return PaneCloseResult {
+            closed,
+            retry_command: (!closed).then_some(retry_command),
+        };
     }
 
-    true
+    PaneCloseResult {
+        closed: true,
+        retry_command: None,
+    }
 }
 
 fn zellij_terminal_pane_exists(session_name: &str, pane_id: &str) -> Option<bool> {
@@ -1684,8 +2588,8 @@ pub fn kill_process(
     kitty_listen_on: &str,
     terminal_id: &str,
     zellij_session_name: &str,
-) -> (KillResult, bool) {
-    let pane_closed = if !preset_name.is_empty() {
+) -> (KillResult, bool, Option<String>) {
+    let pane_close = if !preset_name.is_empty() {
         close_terminal_pane(
             pid,
             preset_name,
@@ -1696,22 +2600,24 @@ pub fn kill_process(
             zellij_session_name,
         )
     } else {
-        false
-    };
-
-    // SIGTERM the process group
-    let result = unsafe { libc::killpg(pid as i32, libc::SIGTERM) };
-    let kill_result = if result == 0 {
-        KillResult::Sent
-    } else {
-        match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ESRCH) => KillResult::AlreadyDead,
-            Some(libc::EPERM) => KillResult::PermissionDenied,
-            _ => KillResult::AlreadyDead,
+        PaneCloseResult {
+            closed: false,
+            retry_command: None,
         }
     };
 
-    (kill_result, pane_closed)
+    // SIGTERM the process group
+    use crate::sys::process::GroupSignal;
+    let kill_result = match crate::sys::process::terminate_group(pid) {
+        GroupSignal::Sent => KillResult::Sent,
+        #[cfg(unix)]
+        GroupSignal::PermissionDenied => KillResult::PermissionDenied,
+        GroupSignal::NotFound => KillResult::AlreadyDead,
+        #[cfg(unix)]
+        GroupSignal::Other => KillResult::AlreadyDead,
+    };
+
+    (kill_result, pane_close.closed, pane_close.retry_command)
 }
 
 /// Resolve terminal info from the canonical preset fields plus launch_context metadata.
@@ -1724,55 +2630,55 @@ pub fn resolve_terminal_info(
         ..TerminalInfo::default()
     };
 
-    if let Some(launch_context_json) = launch_context_json.filter(|s| !s.is_empty()) {
-        if let Ok(lc) = serde_json::from_str::<serde_json::Value>(launch_context_json) {
-            if info.preset_name.is_empty() {
-                info.preset_name = lc
-                    .get("terminal_preset_effective")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        lc.get("terminal_preset")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                    })
-                    .unwrap_or("")
-                    .to_string();
-            }
-            info.pane_id = lc
-                .get("pane_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            info.process_id = lc
-                .get("process_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            info.terminal_id = lc
-                .get("terminal_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if is_zellij_preset(&info.preset_name) {
-                if let Some(pane_id) = zellij_pane_id_from_terminal_id(&info.terminal_id) {
-                    info.pane_id = pane_id;
-                }
-            }
-            // Kitty socket from launch context or env snapshot
-            let lc_env = lc.get("env").and_then(|v| v.as_object());
-            info.kitty_listen_on = lc
-                .get("kitty_listen_on")
+    if let Some(launch_context_json) = launch_context_json.filter(|s| !s.is_empty())
+        && let Ok(lc) = serde_json::from_str::<serde_json::Value>(launch_context_json)
+    {
+        if info.preset_name.is_empty() {
+            info.preset_name = lc
+                .get("terminal_preset_effective")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .or_else(|| lc_env.and_then(|e| e.get("KITTY_LISTEN_ON").and_then(|v| v.as_str())))
-                .unwrap_or("")
-                .to_string();
-            info.zellij_session_name = lc_env
-                .and_then(|e| e.get("ZELLIJ_SESSION_NAME").and_then(|v| v.as_str()))
+                .or_else(|| {
+                    lc.get("terminal_preset")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
                 .unwrap_or("")
                 .to_string();
         }
+        info.pane_id = lc
+            .get("pane_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        info.process_id = lc
+            .get("process_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        info.terminal_id = lc
+            .get("terminal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if is_zellij_preset(&info.preset_name)
+            && let Some(pane_id) = zellij_pane_id_from_terminal_id(&info.terminal_id)
+        {
+            info.pane_id = pane_id;
+        }
+        // Kitty socket from launch context or env snapshot
+        let lc_env = lc.get("env").and_then(|v| v.as_object());
+        info.kitty_listen_on = lc
+            .get("kitty_listen_on")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| lc_env.and_then(|e| e.get("KITTY_LISTEN_ON").and_then(|v| v.as_str())))
+            .unwrap_or("")
+            .to_string();
+        info.zellij_session_name = lc_env
+            .and_then(|e| e.get("ZELLIJ_SESSION_NAME").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
     }
 
     // Legacy kitty launches may have pane/socket metadata but no persisted preset.
@@ -1801,7 +2707,124 @@ fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serial_test::serial;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+
+    fn shellify(argv: &[&str]) -> Vec<String> {
+        shellify_bash_script_pair(argv.iter().map(|s| s.to_string()).collect())
+    }
+
+    const PS: &[&str] = &[
+        "powershell",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-NoExit",
+        "-File",
+        "{script}",
+    ];
+
+    #[test]
+    fn shellify_rewrites_leading_bash_script() {
+        assert_eq!(shellify(&["bash", "{script}"]), PS);
+    }
+
+    #[test]
+    fn shellify_rewrites_non_leading_bash_script() {
+        // Finding 12: bash is argv[2], not argv[0]; must still be rewritten.
+        let mut expected = vec!["myterm".to_string(), "--".to_string()];
+        expected.extend(PS.iter().map(|s| s.to_string()));
+        assert_eq!(shellify(&["myterm", "--", "bash", "{script}"]), expected);
+        // `gnome-terminal -- bash {script}` is adjacent → rewritten, not bailed.
+        let mut expected = vec!["gnome-terminal".to_string(), "--".to_string()];
+        expected.extend(PS.iter().map(|s| s.to_string()));
+        assert_eq!(
+            shellify(&["gnome-terminal", "--", "bash", "{script}"]),
+            expected
+        );
+    }
+
+    #[test]
+    fn shellify_rewrites_bash_family_interpreters() {
+        // B-3+B-4: any bash-family token (bash.exe, /bin/bash) adjacent to
+        // {script} is rewritten, not just the exact `bash`.
+        assert_eq!(shellify(&["bash.exe", "{script}"]), PS);
+        assert_eq!(shellify(&["/bin/bash", "{script}"]), PS);
+    }
+
+    #[test]
+    fn shellify_leaves_bash_with_flags_alone() {
+        // Finding 15: `bash -c {script}` has no adjacent `{script}`, so the
+        // pair never matches and the argv is left intact (no broken splice).
+        assert_eq!(
+            shellify(&["bash", "-c", "{script}"]),
+            vec!["bash", "-c", "{script}"]
+        );
+    }
+
+    #[test]
+    fn shellify_leaves_non_bash_alone() {
+        assert_eq!(
+            shellify(&["myterm", "-e", "{script}"]),
+            vec!["myterm", "-e", "{script}"]
+        );
+    }
+
+    struct EnvGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvGuard {
+        fn clear(vars: &'static [&'static str]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|&var| (var, std::env::var(var).ok()))
+                .collect::<Vec<_>>();
+            for &var in vars {
+                unsafe {
+                    std::env::remove_var(var);
+                }
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (var, value) in &self.0 {
+                unsafe {
+                    if let Some(value) = value {
+                        std::env::set_var(var, value);
+                    } else {
+                        std::env::remove_var(var);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_native_termux_runtime_requires_all_native_signals() {
+        assert!(is_native_termux_runtime_from(true, true, true, true));
+        assert!(!is_native_termux_runtime_from(false, true, true, true));
+        assert!(!is_native_termux_runtime_from(true, false, true, true));
+        assert!(!is_native_termux_runtime_from(true, true, false, true));
+        assert!(!is_native_termux_runtime_from(true, true, true, false));
+    }
+
+    #[test]
+    fn test_proot_termux_launch_error_is_actionable() {
+        let message = proot_termux_launch_error();
+        assert!(message.contains("--headless"));
+        assert!(message.contains("--terminal tmux"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_termux_dispatch_rejects_nonzero_exit_status() {
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        let err = validate_termux_dispatch_status(status)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Termux RUN_COMMAND dispatch failed"));
+    }
 
     #[test]
     fn test_shell_quote_empty() {
@@ -1823,27 +2846,9 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
-    #[test]
-    fn test_shell_split_basic() {
-        let parts = shell_split("foo bar baz").unwrap();
-        assert_eq!(parts, vec!["foo", "bar", "baz"]);
-    }
-
-    #[test]
-    fn test_shell_split_quoted() {
-        let parts = shell_split("foo 'bar baz' qux").unwrap();
-        assert_eq!(parts, vec!["foo", "bar baz", "qux"]);
-    }
-
-    #[test]
-    fn test_shell_split_double_quoted() {
-        let parts = shell_split(r#"foo "bar baz" qux"#).unwrap();
-        assert_eq!(parts, vec!["foo", "bar baz", "qux"]);
-    }
-
-    #[test]
-    fn test_shell_split_unmatched_quote() {
-        assert!(shell_split("foo 'bar").is_err());
+    /// Build a `Vec<String>` argv from `&str` literals (test helper).
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -1886,6 +2891,21 @@ mod tests {
     }
 
     #[test]
+    fn test_launcher_env_keeps_herdr_socket_path() {
+        // The herdr preset's CLI resolves its socket from env; see the comment
+        // on TERMINAL_CONTEXT_VARS for why HERDR_* is not stripped.
+        let env = get_launcher_env_from(vec![
+            ("HERDR_SOCKET_PATH".into(), "/tmp/herdr.sock".into()),
+            ("PATH".into(), "/bin".into()),
+        ]);
+        assert_eq!(
+            env.get("HERDR_SOCKET_PATH").map(String::as_str),
+            Some("/tmp/herdr.sock"),
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn test_zellij_session_ambiguity_stderr_fails_launch_even_with_exit_zero() {
         let output = std::process::Output {
             status: std::process::ExitStatus::from_raw(0),
@@ -1946,6 +2966,8 @@ mod tests {
         assert_eq!(dir, Path::new("/h/.warp/launch_configurations"));
     }
 
+    // Unix-only: Warp is a macOS terminal and the assertion pins POSIX paths.
+    #[cfg(unix)]
     #[test]
     fn test_write_warp_launch_config_writes_to_stable_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1964,12 +2986,124 @@ mod tests {
     }
 
     #[test]
+    fn test_ps_quote_doubles_single_quotes() {
+        assert_eq!(ps_quote("plain"), "'plain'");
+        assert_eq!(ps_quote("it's"), "'it''s'");
+        assert_eq!(ps_quote(""), "''");
+    }
+
+    #[test]
+    fn test_ps_env_assignments_sorted_and_validated() {
+        let mut env = HashMap::new();
+        env.insert("ZED".to_string(), "z".to_string());
+        env.insert("ABE".to_string(), "a'b".to_string());
+        env.insert("1bad".to_string(), "skip".to_string()); // invalid name dropped
+        let lines = ps_env_assignments(&env);
+        assert_eq!(
+            lines,
+            vec![
+                "$env:ABE = 'a''b'".to_string(),
+                "$env:ZED = 'z'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_create_powershell_script_window_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("launch.ps1");
+        let mut env = HashMap::new();
+        env.insert("HCOM_TOOL".to_string(), "claude".to_string());
+        create_powershell_script(
+            &script,
+            &env,
+            Some("/work/dir"),
+            "claude --foo",
+            false, // background
+            Some("claude"),
+            true, // opens_new_window
+        )
+        .unwrap();
+        assert!(
+            std::fs::read(&script)
+                .unwrap()
+                .starts_with(&[0xEF, 0xBB, 0xBF])
+        );
+        let content = std::fs::read_to_string(&script).unwrap();
+        assert!(content.contains("$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude...\""));
+        assert!(content.contains("Write-Host \"Starting Claude...\""));
+        assert!(content.contains("Remove-Item Env:"));
+        assert!(content.contains("$env:HCOM_TOOL = 'claude'"));
+        assert!(content.contains("Set-Location '/work/dir'"));
+        // The command args survive whether or not the tool resolved to a full
+        // path (bare `claude --foo` or call-operator `& '<path>' --foo`).
+        assert!(content.contains("--foo"));
+        // Window mode self-deletes but does not `exit` (window persists via -NoExit).
+        assert!(content.contains("Remove-Item -Force -ErrorAction SilentlyContinue"));
+        assert!(!content.contains("exit $hcom_status"));
+    }
+
+    #[test]
+    fn test_create_powershell_script_run_once_exits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("launch.ps1");
+        let env = HashMap::new();
+        create_powershell_script(
+            &script, &env, None, "codex", false, // background
+            None, false, // run-once (not a new window)
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+        assert!(content.contains("$hcom_status = $LASTEXITCODE"));
+        assert!(content.contains("exit $hcom_status"));
+        assert!(!content.contains("Set-Location"));
+    }
+
+    #[test]
+    fn test_build_env_string_powershell_format() {
+        let mut env = HashMap::new();
+        env.insert("HCOM_A".to_string(), "x".to_string());
+        env.insert("HCOM_B".to_string(), "y'z".to_string());
+        let out = build_env_string(&env, "powershell");
+        assert_eq!(out, "$env:HCOM_A = 'x'\n$env:HCOM_B = 'y''z'");
+    }
+
+    #[test]
+    fn test_wezterm_open_argv_selects_powershell_on_windows() {
+        // The PowerShell variant is now selected by the preset's PlatformArgv,
+        // not a text rewrite. Confirm the merged preset surfaces it.
+        let merged = crate::config::get_merged_preset("wezterm").unwrap();
+        let win = merged.open_argv(true);
+        assert!(win.iter().any(|a| a == "powershell"));
+        assert!(win.iter().any(|a| a == "-File"));
+        assert!(!win.iter().any(|a| a == "bash"));
+        let unix = merged.open_argv(false);
+        assert!(unix.iter().any(|a| a == "bash"));
+    }
+
+    #[test]
+    fn test_mintty_open_argv_has_no_bash() {
+        let merged = crate::config::get_merged_preset("mintty").unwrap();
+        let argv = merged.open_argv(true);
+        assert_eq!(argv.first().map(String::as_str), Some("mintty"));
+        assert!(
+            !argv.iter().any(|a| a == "bash"),
+            "mintty must not hand a .ps1 to bash"
+        );
+        assert!(argv.iter().any(|a| a == "powershell"));
+    }
+
+    // Unix-only: "/abs/path" isn't absolute on Windows (no drive), so it would
+    // be rewritten to the current dir.
+    #[cfg(unix)]
+    #[test]
     fn test_resolve_warp_cwd_keeps_absolute() {
         let home = Path::new("/h");
         assert_eq!(resolve_warp_cwd(Some("/abs/path"), home), "/abs/path");
     }
 
     #[test]
+    #[serial]
     fn test_resolve_warp_cwd_uses_current_dir_for_relative_or_missing() {
         let home = Path::new("/h");
         let cwd_str = std::env::current_dir()
@@ -2018,7 +3152,8 @@ mod tests {
         let preset = crate::shared::terminal_presets::get_terminal_preset("warp").unwrap();
         assert_eq!(preset.app_name, Some("Warp"));
         assert_eq!(preset.binary, None);
-        assert!(preset.open.contains("warp://launch/hcom-{process_id}"));
+        let open = preset.open.select(false).unwrap();
+        assert!(open.contains(&"warp://launch/hcom-{process_id}"));
         assert_eq!(preset.platforms, &["Darwin"]);
     }
 
@@ -2057,11 +3192,16 @@ mod tests {
         let _ = result;
     }
 
+    /// Detection vars not in `TERMINAL_CONTEXT_VARS` — tests that exercise
+    /// `detect_terminal_from_env` must clear these explicitly so a host shell
+    /// running inside herdr doesn't leak into the test.
+    const DETECT_ONLY_VARS: &[&str] = &["HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_ENV"];
+
     #[test]
     #[serial]
     fn test_normalize_terminal_mode_for_launch_resolves_socket_for_auto_detected_kitty() {
-        let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
-        let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -2071,26 +3211,13 @@ mod tests {
 
         assert_eq!(mode, "kitty-split");
         assert_eq!(socket, "unix:/tmp/kitty-test");
-
-        unsafe {
-            if let Some(value) = saved_window {
-                std::env::set_var("KITTY_WINDOW_ID", value);
-            } else {
-                std::env::remove_var("KITTY_WINDOW_ID");
-            }
-            if let Some(value) = saved_listen {
-                std::env::set_var("KITTY_LISTEN_ON", value);
-            } else {
-                std::env::remove_var("KITTY_LISTEN_ON");
-            }
-        }
     }
 
     #[test]
     #[serial]
     fn test_resolve_terminal_mode_for_tips_uses_normalized_auto_detected_mode() {
-        let saved_window = std::env::var("KITTY_WINDOW_ID").ok();
-        let saved_listen = std::env::var("KITTY_LISTEN_ON").ok();
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -2100,19 +3227,116 @@ mod tests {
 
         assert_eq!(mode, "kitty-split");
         assert!(auto);
+    }
 
+    #[test]
+    #[serial]
+    fn test_detect_terminal_from_ptyxis_version() {
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
         unsafe {
-            if let Some(value) = saved_window {
-                std::env::set_var("KITTY_WINDOW_ID", value);
-            } else {
-                std::env::remove_var("KITTY_WINDOW_ID");
-            }
-            if let Some(value) = saved_listen {
-                std::env::set_var("KITTY_LISTEN_ON", value);
-            } else {
-                std::env::remove_var("KITTY_LISTEN_ON");
-            }
+            std::env::set_var("PTYXIS_VERSION", "50.1");
         }
+
+        assert_eq!(detect_terminal_from_env().as_deref(), Some("ptyxis"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_auto_detected_ptyxis_requires_host_launcher_for_new_window() {
+        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        let _path = EnvGuard::clear(&["PATH"]);
+        let empty_path = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("PTYXIS_VERSION", "50.1");
+            std::env::set_var("PATH", empty_path.path());
+        }
+
+        let (mode, socket) = normalize_terminal_mode_for_launch("default".to_string(), true, false);
+
+        assert_eq!(mode, "default");
+        assert!(socket.is_empty());
+    }
+
+    #[test]
+    fn test_launcher_env_strips_ptyxis_identity() {
+        let env = get_launcher_env_from(vec![
+            ("PTYXIS_PROFILE".into(), "profile-id".into()),
+            ("PTYXIS_VERSION".into(), "50.1".into()),
+            ("PATH".into(), "/bin".into()),
+        ]);
+
+        assert!(!env.contains_key("PTYXIS_PROFILE"));
+        assert!(!env.contains_key("PTYXIS_VERSION"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_matches_absolute_app_bundle_path() {
+        // Regression: when `kitten` isn't on PATH, resolve_terminal_open_argv
+        // rewrites argv[0] to kitten's absolute macOS app-bundle path before
+        // this splice runs. A literal "kitten" string match would silently
+        // skip injecting --to, leaving the launched kitten with no socket
+        // and no KITTY_LISTEN_ON (stripped from the child env), causing it to
+        // fall back to controlling-tty discovery — which fails outright when
+        // the calling process (e.g. an AI tool's sandboxed shell) has none.
+        let mut argv = vec![
+            "/Applications/kitty.app/Contents/MacOS/kitten".to_string(),
+            "@".to_string(),
+            "launch".to_string(),
+            "--type=window".to_string(),
+        ];
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(
+            argv,
+            vec![
+                "/Applications/kitty.app/Contents/MacOS/kitten".to_string(),
+                "@".to_string(),
+                "--to".to_string(),
+                "unix:/tmp/kitty-test".to_string(),
+                "launch".to_string(),
+                "--type=window".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_bare_name() {
+        let mut argv = vec!["kitten".to_string(), "@".to_string(), "ls".to_string()];
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(
+            argv,
+            vec![
+                "kitten".to_string(),
+                "@".to_string(),
+                "--to".to_string(),
+                "unix:/tmp/kitty-test".to_string(),
+                "ls".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_noop_for_non_kitten() {
+        let mut argv = vec!["wezterm".to_string(), "cli".to_string()];
+        let before = argv.clone();
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(argv, before);
+    }
+
+    #[test]
+    fn test_splice_kitten_to_socket_noop_when_already_present() {
+        let mut argv = vec![
+            "kitten".to_string(),
+            "@".to_string(),
+            "--to".to_string(),
+            "unix:/tmp/other".to_string(),
+            "ls".to_string(),
+        ];
+        let before = argv.clone();
+        splice_kitten_to_socket(&mut argv, "unix:/tmp/kitty-test");
+        assert_eq!(argv, before);
     }
 
     #[test]
@@ -2139,45 +3363,110 @@ mod tests {
         assert_eq!(info.kitty_listen_on, "unix:/tmp/kitty");
     }
 
-    #[test]
-    fn test_parse_terminal_command_basic() {
-        let argv = parse_terminal_command("open -a Terminal {script}", "/tmp/test.sh", "").unwrap();
-        assert_eq!(argv, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
+    fn ctx_with_script(script: &str) -> TerminalCommandContext<'_> {
+        TerminalCommandContext {
+            script,
+            ..TerminalCommandContext::default()
+        }
     }
 
     #[test]
-    fn test_rewrite_open_command_with_app_path() {
-        let rewritten = rewrite_open_command_with_app_path(
-            "open -a Terminal {script}",
-            Path::new("/System/Applications/Utilities/Terminal.app"),
+    fn test_substitute_open_argv_basic() {
+        let out = substitute_open_argv(
+            &argv(&["open", "-a", "Terminal", "{script}"]),
+            ctx_with_script("/tmp/test.sh"),
         )
         .unwrap();
-        assert_eq!(rewritten, "open -a Terminal {script}");
+        assert_eq!(out, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
     }
 
     #[test]
-    fn test_rewrite_open_command_with_combined_flag() {
-        let rewritten = rewrite_open_command_with_app_path(
-            "open -na Ghostty.app --args -e bash {script}",
-            Path::new("/Applications/Ghostty.app"),
+    fn test_substitute_open_argv_preserves_windows_path() {
+        // A backslashed Windows .ps1 path substituted into a single argv element
+        // must survive byte-for-byte (no shell splitting, no escaping).
+        let out = substitute_open_argv(
+            &argv(&["wt", "--", "powershell", "-File", "{script}"]),
+            ctx_with_script(r"C:\Users\x\s.ps1"),
         )
         .unwrap();
         assert_eq!(
-            rewritten,
-            "open -n /Applications/Ghostty.app --args -e bash '{script}'"
+            out,
+            vec!["wt", "--", "powershell", "-File", r"C:\Users\x\s.ps1"]
         );
     }
 
     #[test]
-    fn test_rewrite_open_command_with_explicit_args() {
-        let rewritten = rewrite_open_command_with_app_path(
-            "open -a Terminal --args bash {script}",
-            Path::new("/System/Applications/Utilities/Terminal.app"),
+    fn test_substitute_open_argv_process_id_element() {
+        // `HCOM_PROCESS_ID={process_id}` is one element; the placeholder is
+        // replaced inside it without needing quoting.
+        let out = substitute_open_argv(
+            &argv(&["kitty", "--env", "HCOM_PROCESS_ID={process_id}", "{script}"]),
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                ..TerminalCommandContext::default()
+            },
         )
         .unwrap();
         assert_eq!(
-            rewritten,
-            "open /System/Applications/Utilities/Terminal.app --args bash '{script}'"
+            out,
+            vec!["kitty", "--env", "HCOM_PROCESS_ID=abc-123", "/tmp/test.sh"]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_open_argv_with_app_path_keeps_plain_open_a() {
+        // No `--args` tail ⇒ leave `-a Terminal` intact (file-open form).
+        let mut v = argv(&["open", "-a", "Terminal", "{script}"]);
+        rewrite_open_argv_with_app_path(
+            &mut v,
+            Path::new("/System/Applications/Utilities/Terminal.app"),
+        );
+        assert_eq!(v, vec!["open", "-a", "Terminal", "{script}"]);
+    }
+
+    #[test]
+    fn test_rewrite_open_argv_with_combined_flag() {
+        let mut v = argv(&[
+            "open",
+            "-na",
+            "Ghostty.app",
+            "--args",
+            "-e",
+            "bash",
+            "{script}",
+        ]);
+        rewrite_open_argv_with_app_path(&mut v, Path::new("/Applications/Ghostty.app"));
+        assert_eq!(
+            v,
+            vec![
+                "open",
+                "-n",
+                "/Applications/Ghostty.app",
+                "--args",
+                "-e",
+                "bash",
+                "{script}"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rewrite_open_argv_with_explicit_args() {
+        let mut v = argv(&["open", "-a", "Terminal", "--args", "bash", "{script}"]);
+        rewrite_open_argv_with_app_path(
+            &mut v,
+            Path::new("/System/Applications/Utilities/Terminal.app"),
+        );
+        assert_eq!(
+            v,
+            vec![
+                "open",
+                "/System/Applications/Utilities/Terminal.app",
+                "--args",
+                "bash",
+                "{script}"
+            ]
         );
     }
 
@@ -2223,29 +3512,46 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_terminal_command_missing_placeholder() {
-        assert!(parse_terminal_command("open -a Terminal", "/tmp/test.sh", "").is_err());
+    fn test_substitute_open_argv_missing_placeholder() {
+        assert!(
+            substitute_open_argv(
+                &argv(&["open", "-a", "Terminal"]),
+                ctx_with_script("/tmp/test.sh")
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn test_parse_terminal_command_with_process_id() {
-        let argv = parse_terminal_command(
-            "tmux split -t {process_id} -- {script}",
-            "/tmp/test.sh",
-            "abc-123",
+    fn test_substitute_open_argv_with_process_id() {
+        let out = substitute_open_argv(
+            &argv(&["tmux", "split", "-t", "{process_id}", "--", "{script}"]),
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                ..TerminalCommandContext::default()
+            },
         )
         .unwrap();
         assert_eq!(
-            argv,
+            out,
             vec!["tmux", "split", "-t", "abc-123", "--", "/tmp/test.sh"]
         );
     }
 
     #[test]
     fn test_waveterm_preset_uses_run_separator() {
-        let cmd = resolve_terminal_preset("waveterm").unwrap();
-        let argv = parse_terminal_command(&cmd, "/tmp/test.sh", "abc-123").unwrap();
-        assert_eq!(argv, vec!["wsh", "run", "--", "bash", "/tmp/test.sh"]);
+        let cmd = resolve_terminal_open_argv("waveterm").unwrap();
+        let out = substitute_open_argv(
+            &cmd,
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                ..TerminalCommandContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out, vec!["wsh", "run", "--", "bash", "/tmp/test.sh"]);
     }
 
     #[test]
@@ -2258,9 +3564,340 @@ mod tests {
     }
 
     #[test]
-    fn test_kill_result_enum() {
-        assert_eq!(KillResult::Sent, KillResult::Sent);
-        assert_ne!(KillResult::Sent, KillResult::AlreadyDead);
+    fn test_normalize_herdr_agent_start_json() {
+        let json = r#"{"id":"cli:agent:start","result":{"agent":{"agent_status":"unknown","cwd":"/tmp","focused":false,"name":"hcom-abc123","pane_id":"w123abc-3","revision":0,"tab_id":"w123abc:2","terminal_id":"term_abc","workspace_id":"w123abc"},"argv":["bash","/tmp/script.sh"],"type":"agent_started"}}"#;
+        assert_eq!(normalize_captured_terminal_id(json), "w123abc-3");
+    }
+
+    #[test]
+    fn test_normalize_herdr_error_json_falls_through() {
+        // Error JSON from herdr should not match (no result.agent.pane_id)
+        let json = r#"{"error":{"code":"server_unavailable","message":"herdr server not running"},"id":"cli:agent:start"}"#;
+        assert_eq!(normalize_captured_terminal_id(json), json);
+    }
+
+    #[test]
+    fn test_normalize_herdr_empty_pane_id() {
+        let json = r#"{"id":"cli:agent:start","result":{"agent":{"pane_id":""}}}"#;
+        assert_eq!(normalize_captured_terminal_id(json), json);
+    }
+
+    #[test]
+    fn test_normalize_herdr_tab_create_json() {
+        // The default herdr preset launches via `tab create`; the pane id lives
+        // at result.root_pane.pane_id.
+        let json = r#"{"id":"cli:tab:create","result":{"type":"tab_created","tab":{"tab_id":"w1:2"},"root_pane":{"pane_id":"p_7","terminal_id":"term_x","workspace_id":"w1","tab_id":"w1:2","focused":false}}}"#;
+        assert_eq!(normalize_captured_terminal_id(json), "p_7");
+    }
+
+    #[test]
+    fn test_normalize_herdr_pane_split_json() {
+        let json = r#"{"id":"cli:pane:split","result":{"root_pane":{"pane_id":"p_9"}}}"#;
+        assert_eq!(normalize_captured_terminal_id(json), "p_9");
+    }
+
+    #[test]
+    fn test_substitute_herdr_create_argv_uses_instance_name_and_cwd() {
+        let template = argv(&[
+            "herdr",
+            "tab",
+            "create",
+            "--cwd",
+            "{cwd}",
+            "--no-focus",
+            "--label",
+            "{instance_name}",
+        ]);
+        let out = substitute_herdr_create_argv(
+            &template,
+            &TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                cwd: "/home/user/project",
+                instance_name: "luna",
+                tool: "claude",
+                pane_title: Some("\u{25c9} luna [claude]"),
+            },
+        );
+        assert_eq!(
+            out,
+            vec![
+                "herdr",
+                "tab",
+                "create",
+                "--cwd",
+                "/home/user/project",
+                "--no-focus",
+                "--label",
+                "luna",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_herdr_preset_template_uses_stable_instance_name() {
+        // The herdr preset opens the pane with `tab create` and a stable
+        // `--label {instance_name}` (e.g. `luna`). The runner script is sent
+        // separately via `pane run` (handled natively in `launch_terminal`), so
+        // the open argv carries no `{script}` slot. The styled status label
+        // (`◉ luna [claude]`) is pushed via `pane.rename` from the delivery
+        // loop, not baked into the pane label.
+        let preset = crate::shared::terminal_presets::get_terminal_preset("herdr").unwrap();
+        let open = preset.open.select(false).unwrap();
+        assert!(open.contains(&"tab"));
+        assert!(open.contains(&"create"));
+        assert!(
+            !open.contains(&"{script}"),
+            "herdr's `tab create` open argv must not carry {{script}} — the \
+             runner is sent separately via `pane run`"
+        );
+        assert!(open.contains(&"{instance_name}"));
+        assert!(
+            !open.contains(&"{pane_title}"),
+            "herdr preset must not use {{pane_title}} as the pane label"
+        );
+        assert!(open.contains(&"{cwd}"));
+        assert!(!open.contains(&"{process_id}"));
+        assert_eq!(preset.binary, Some("herdr"));
+        // Close must use {pane_id} (stable raw `p_N`), not {id} (public
+        // `<ws>-<N>` which herdr renumbers when sibling panes close — a kill
+        // batch addressing the public id can land on the wrong pane).
+        let close = preset.close.select(false).unwrap();
+        assert!(close.contains(&"{pane_id}"));
+    }
+
+    #[test]
+    fn test_substitute_herdr_open_argv_uses_pane_title() {
+        let template = argv(&[
+            "herdr",
+            "agent",
+            "start",
+            "{pane_title}",
+            "--cwd",
+            "{cwd}",
+            "--no-focus",
+            "--",
+            "bash",
+            "{script}",
+        ]);
+        let out = substitute_open_argv(
+            &template,
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                process_id: "abc-123",
+                cwd: "/home/user/project",
+                instance_name: "luna",
+                tool: "claude",
+                pane_title: Some("\u{25c9} luna [claude]"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "herdr",
+                "agent",
+                "start",
+                "\u{25c9} luna [claude]",
+                "--cwd",
+                "/home/user/project",
+                "--no-focus",
+                "--",
+                "bash",
+                "/tmp/test.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_substitute_open_argv_pane_title_falls_back_to_instance_name() {
+        let out = substitute_open_argv(
+            &argv(&[
+                "herdr",
+                "agent",
+                "start",
+                "{pane_title}",
+                "--",
+                "bash",
+                "{script}",
+            ]),
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                instance_name: "abc-123",
+                tool: "codex",
+                ..TerminalCommandContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "herdr",
+                "agent",
+                "start",
+                "abc-123",
+                "--",
+                "bash",
+                "/tmp/test.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_substitute_open_argv_cwd_placeholder() {
+        let out = substitute_open_argv(
+            &argv(&["myterm", "--dir", "{cwd}", "--", "bash", "{script}"]),
+            TerminalCommandContext {
+                script: "/tmp/test.sh",
+                cwd: "/home/user",
+                ..TerminalCommandContext::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "myterm",
+                "--dir",
+                "/home/user",
+                "--",
+                "bash",
+                "/tmp/test.sh"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_substitute_open_argv_empty_cwd() {
+        // Templates without {cwd} should work with empty cwd
+        let out = substitute_open_argv(
+            &argv(&["open", "-a", "Terminal", "{script}"]),
+            ctx_with_script("/tmp/test.sh"),
+        )
+        .unwrap();
+        assert_eq!(out, vec!["open", "-a", "Terminal", "/tmp/test.sh"]);
+    }
+
+    #[test]
+    fn test_substitute_close_argv_skips_when_pane_id_missing() {
+        // Required {pane_id} placeholder but empty value ⇒ None (skip close).
+        assert!(
+            substitute_close_argv(
+                &argv(&["wezterm", "cli", "kill-pane", "--pane-id", "{pane_id}"]),
+                42,
+                "",
+                "proc-1",
+                "",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_substitute_close_argv_substitutes_pane_id() {
+        let out = substitute_close_argv(
+            &argv(&["wezterm", "cli", "kill-pane", "--pane-id", "{pane_id}"]),
+            42,
+            "pane-7",
+            "proc-1",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec!["wezterm", "cli", "kill-pane", "--pane-id", "pane-7"]
+        );
+    }
+
+    #[test]
+    fn test_format_close_command_preserves_all_arguments() {
+        let command = format_close_command(&[
+            "wezterm".to_string(),
+            "cli".to_string(),
+            "kill-pane".to_string(),
+            "--pane-id".to_string(),
+            "123".to_string(),
+        ]);
+        assert_eq!(command, "wezterm cli kill-pane --pane-id 123");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_format_close_command_quotes_powershell_arguments() {
+        let command = format_close_command(&[
+            r"C:\Program Files\kitty\kitten.exe".to_string(),
+            "@".to_string(),
+            "--to".to_string(),
+            r"unix:C:\Users\O'Brien\kitty.sock".to_string(),
+        ]);
+        assert_eq!(
+            command,
+            r#"'C:\Program Files\kitty\kitten.exe' @ --to 'unix:C:\Users\O''Brien\kitty.sock'"#
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_format_close_command_quotes_posix_arguments() {
+        let command = format_close_command(&[
+            "kitten".to_string(),
+            "@".to_string(),
+            "--to".to_string(),
+            "/tmp/O'Brien kitty.sock".to_string(),
+        ]);
+        assert_eq!(command, "kitten '@' --to '/tmp/O'\\''Brien kitty.sock'");
+    }
+
+    #[test]
+    fn test_zellij_close_argv_session_splice() {
+        // Reproduce the close_terminal_pane splice: --session <name> after zellij.
+        let mut a = substitute_close_argv(
+            &argv(&["zellij", "action", "close-pane", "--pane-id", "{pane_id}"]),
+            0,
+            "6",
+            "",
+            "",
+        )
+        .unwrap();
+        a.splice(1..1, ["--session".to_string(), "wise-kangaroo".to_string()]);
+        assert_eq!(
+            a,
+            vec![
+                "zellij",
+                "--session",
+                "wise-kangaroo",
+                "action",
+                "close-pane",
+                "--pane-id",
+                "6"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_kitten_close_argv_to_splice() {
+        // Reproduce the close_terminal_pane splice: --to <socket> after `@`.
+        let mut a = substitute_close_argv(
+            &argv(&["kitten", "@", "close-window", "--match", "id:{pane_id}"]),
+            0,
+            "13",
+            "",
+            "",
+        )
+        .unwrap();
+        a.splice(2..2, ["--to".to_string(), "unix:/tmp/kitty".to_string()]);
+        assert_eq!(
+            a,
+            vec![
+                "kitten",
+                "@",
+                "--to",
+                "unix:/tmp/kitty",
+                "close-window",
+                "--match",
+                "id:13"
+            ]
+        );
     }
 
     #[test]
@@ -2294,6 +3931,27 @@ mod tests {
         assert!(!has_node_shebang(path.to_str().unwrap()));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_codex_npm_launcher_bypasses_cmd_shim() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim = temp.path().join("codex.cmd");
+        let entrypoint = temp.path().join("node_modules/@openai/codex/bin/codex.js");
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(&shim, "@echo off\r\n").unwrap();
+        std::fs::write(&entrypoint, "").unwrap();
+
+        let (launcher, args) =
+            resolve_windows_tool_launcher("codex", shim.to_str().unwrap()).unwrap();
+        assert!(
+            Path::new(&launcher)
+                .file_stem()
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("node"))
+        );
+        assert_eq!(args, vec![entrypoint.to_string_lossy().into_owned()]);
+        assert!(resolve_windows_tool_launcher("claude", shim.to_str().unwrap()).is_none());
+    }
+
     #[test]
     fn test_has_node_shebang_with_elf_binary() {
         let dir = tempfile::tempdir().unwrap();
@@ -2310,9 +3968,7 @@ mod tests {
     #[test]
     fn test_resolve_termux_tool_launcher_codex_wrapper() {
         let resolved = resolve_termux_tool_launcher("codex", TERMUX_CODEX_WRAPPER_PATH);
-        if crate::shared::platform::is_termux()
-            && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists()
-        {
+        if is_native_termux_runtime() && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists() {
             let (command, args) = resolved.expect("expected termux codex wrapper override");
             assert!(command.ends_with("/sh") || command == "sh");
             assert_eq!(args, vec![TERMUX_CODEX_INNER_WRAPPER_PATH.to_string()]);
@@ -2328,12 +3984,139 @@ mod tests {
         std::fs::write(&path, "#!/usr/bin/env node\nconsole.log('ok');\n").unwrap();
 
         let resolved = resolve_termux_tool_launcher("tool", path.to_str().unwrap());
-        if crate::shared::platform::is_termux() {
+        if is_native_termux_runtime() {
             let (command, args) = resolved.expect("expected node wrapper on termux");
             assert!(command.ends_with("/node") || command == "node");
             assert_eq!(args, vec![path.to_string_lossy().to_string()]);
         } else {
             assert!(resolved.is_none());
         }
+    }
+
+    // Finding 22: the no-`wt` `cmd /c start` branch used to bake literal `"`
+    // quotes around `{script}`, which collided with `Command`'s own Windows
+    // argv quoting on spaced paths. `{script}` is now bare.
+    #[test]
+    fn windows_cmd_fallback_leaves_spaced_script_unquoted() {
+        let tmpl = windows_default_terminal_template(false);
+        let script = r"C:\Users\a b\hcom\s.ps1";
+        let out: Vec<String> = tmpl.iter().map(|a| a.replace("{script}", script)).collect();
+        assert_eq!(out.last().unwrap(), script);
+        assert!(!out.last().unwrap().contains('"'));
+        assert_eq!(out[3], "");
+    }
+
+    // Finding 19: `hcom status`'s default-terminal display name must track the
+    // same has_wt branch as the launch planner, instead of falling through to
+    // "unknown" on Windows.
+    #[test]
+    fn windows_status_name_tracks_launch_planner() {
+        assert_eq!(windows_default_terminal_template(true)[0], "wt");
+        assert_eq!(
+            windows_default_terminal_display_name(true),
+            "Windows Terminal"
+        );
+        assert_eq!(windows_default_terminal_template(false)[0], "cmd");
+        assert_eq!(windows_default_terminal_display_name(false), "cmd.exe");
+    }
+
+    // B-3+B-4: any bash-family interpreter with a NON-adjacent `{script}` (any
+    // flag, or none) can't be rewritten by `shellify_bash_script_pair`, so on
+    // Windows it must be rejected instead of silently handing a `.ps1` to bash.
+    // Adjacent `<interp> {script}` is rewritten, not flagged.
+    #[test]
+    fn detects_unsupported_bash_c_script() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Non-adjacent {script}, regardless of flag → flagged (returns interp).
+        assert_eq!(
+            unsupported_bash_script_interp(&v(&["bash", "-c", "{script}"])).as_deref(),
+            Some("bash")
+        );
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-x", "{script}"])).is_some());
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-i", "{script}"])).is_some());
+        assert!(unsupported_bash_script_interp(&v(&["bash", "-lc", "{script}"])).is_some());
+        assert_eq!(
+            unsupported_bash_script_interp(&v(&["bash.exe", "-c", "{script}"])).as_deref(),
+            Some("bash.exe")
+        );
+        assert!(unsupported_bash_script_interp(&v(&["/bin/bash", "-c", "{script}"])).is_some());
+        // Adjacent bash-family + {script} → rewritten by shellify, not flagged.
+        assert!(unsupported_bash_script_interp(&v(&["bash", "{script}"])).is_none());
+        assert!(unsupported_bash_script_interp(&v(&["bash.exe", "{script}"])).is_none());
+        assert!(unsupported_bash_script_interp(&v(&["/bin/bash", "{script}"])).is_none());
+        assert!(
+            unsupported_bash_script_interp(&v(&["gnome-terminal", "--", "bash", "{script}"]))
+                .is_none()
+        );
+        // Non-bash command → untouched.
+        assert!(unsupported_bash_script_interp(&v(&["mypowershell", "{script}"])).is_none());
+    }
+
+    // Finding 25: background and run-here launches must resolve `bash` the
+    // same way (PATH match, falling back to `/bin/bash`) so they can't drift.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_bash_command_prefers_path_then_fallback() {
+        let r = resolve_bash_command();
+        assert!(r.ends_with("bash"));
+        match which_bin("bash") {
+            Some(p) => assert_eq!(r, p),
+            None => assert_eq!(r, "/bin/bash"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn which_fallback_finds_user_bin_installs() {
+        let home = tempfile::tempdir().unwrap();
+        let install = |parts: &[&str], name: &str| {
+            let dir = parts
+                .iter()
+                .fold(home.path().to_path_buf(), |p, part| p.join(part));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), "").unwrap();
+            dir.join(name).to_string_lossy().to_string()
+        };
+        assert_eq!(which_in_fallback_dirs(home.path(), "omp"), None);
+
+        // `bun install -g` links into ~/.bun/bin.
+        let bun_omp = install(&[".bun", "bin"], "omp");
+        assert_eq!(which_in_fallback_dirs(home.path(), "omp"), Some(bun_omp));
+        // ~/.local/bin (native installer) wins over the bun link.
+        let local_omp = install(&[".local", "bin"], "omp");
+        assert_eq!(which_in_fallback_dirs(home.path(), "omp"), Some(local_omp));
+
+        // A tool's own installer dir comes before the shared ones.
+        install(&[".local", "bin"], "grok");
+        let grok = install(&[".grok", "bin"], "grok");
+        assert_eq!(which_in_fallback_dirs(home.path(), "grok"), Some(grok));
+        let kimi = install(&[".kimi-code", "bin"], "kimi");
+        assert_eq!(which_in_fallback_dirs(home.path(), "kimi"), Some(kimi));
+        let pi = install(&[".pi", "agent", "bin"], "pi");
+        assert_eq!(which_in_fallback_dirs(home.path(), "pi"), Some(pi));
+
+        // Claude: ~/.local/bin (native installer) wins over legacy ~/.claude/bin.
+        install(&[".claude", "bin"], "claude");
+        let claude = install(&[".local", "bin"], "claude");
+        assert_eq!(which_in_fallback_dirs(home.path(), "claude"), Some(claude));
+
+        // Directories are not binaries.
+        std::fs::create_dir_all(home.path().join(".bun").join("bin").join("gemini")).unwrap();
+        assert_eq!(which_in_fallback_dirs(home.path(), "gemini"), None);
+    }
+
+    // Finding 17: built-in preset platform capability, checked against the
+    // real `TERMINAL_PRESETS` table (see src/shared/terminal_presets.rs).
+    #[test]
+    fn terminal_preset_platform_capability() {
+        use crate::config::terminal_preset_supported_on;
+        assert!(terminal_preset_supported_on("iterm", "Darwin"));
+        assert!(!terminal_preset_supported_on("iterm", "Windows"));
+        assert!(terminal_preset_supported_on("wttab", "Windows"));
+        assert!(!terminal_preset_supported_on("wttab", "Darwin"));
+        assert!(terminal_preset_supported_on("wezterm", "Windows"));
+        assert!(terminal_preset_supported_on("ptyxis", "Linux"));
+        assert!(!terminal_preset_supported_on("ptyxis", "Darwin"));
+        assert!(!terminal_preset_supported_on("nope", "Darwin"));
     }
 }

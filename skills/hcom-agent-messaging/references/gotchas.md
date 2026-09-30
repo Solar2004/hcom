@@ -4,18 +4,17 @@ Common issues and fixes discovered during real testing.
 
 ## Script Hangs Forever
 
-**Cause:** Missing `--go` flag on `hcom 1 claude`, `hcom kill`, or any command that normally prompts for confirmation.
+**Cause:** Missing `--go` flag on launch commands such as `hcom 1 claude`.
 
-**Fix:** Always include `--go` on every hcom launch and kill command in scripts.
+**Fix:** Include `--go` on launch commands in scripts. `hcom kill` does not
+prompt, so `--go` is optional for kill commands.
 
 ```bash
 # WRONG - hangs waiting for user confirmation
 hcom 1 claude --tag worker --headless --hcom-prompt "..."
-hcom kill luna
 
 # RIGHT
 hcom 1 claude --tag worker --go --headless --hcom-prompt "..."
-hcom kill luna --go
 ```
 
 ## Agent Not Receiving Messages
@@ -33,7 +32,7 @@ hcom events --agent luna     # What has luna seen recently?
 |-------|---------------|-----|
 | Agent already stopped | `hcom list` shows inactive/missing | Check timing; agent may finish before message arrives |
 | Agent has not bound session yet | `hcom list` shows "launching" | Wait: `hcom events --wait 30 --idle "$name"` |
-| Wrong @-mention syntax | Event shows empty `delivered_to` array | Use `@tag-` prefix, not raw 4-letter name |
+| Mistyped @-mention | `send` fails: "non-existent or stopped agents" + Available list | Names resolve exactly — use the exact agent name or `@tag-` group, no partial/prefix matching |
 | No matching thread | Agent sees no messages | Both sides must use exact same `--thread` value |
 | Message scope mismatch | Event `scope` is "mentions" but agent not in `mentions` array | Verify @mention matches agent name or tag |
 | Identity binding failed | Agent not in `instances` table | Check `HCOM_PROCESS_ID` env var propagation |

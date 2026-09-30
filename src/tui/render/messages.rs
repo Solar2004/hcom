@@ -468,12 +468,11 @@ fn render_all_messages(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in &msgs {
-        if !is_fts_search {
-            if let Some(query) = search_query {
-                if !msg_matches(msg, query) {
-                    continue;
-                }
-            }
+        if !is_fts_search
+            && let Some(query) = search_query
+            && !msg_matches(msg, query)
+        {
+            continue;
         }
 
         if !lines.is_empty() {

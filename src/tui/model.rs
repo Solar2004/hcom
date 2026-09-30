@@ -75,23 +75,59 @@ impl AgentStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Tool {
     Claude,
     Gemini,
     Codex,
     OpenCode,
+    Kilo,
+    Pi,
+    Omp,
+    Antigravity,
+    Cursor,
+    Kimi,
+    Copilot,
+    Grok,
     Adhoc,
+    /// Persisted value written by a newer or third-party integration.
+    Unknown(String),
 }
 
 impl Tool {
-    pub fn name(&self) -> &'static str {
+    /// Convert to the canonical `crate::tool::Tool` for spec lookup.
+    pub fn canonical(&self) -> Option<crate::tool::Tool> {
         match self {
-            Self::Claude => "claude",
-            Self::Gemini => "gemini",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Adhoc => "adhoc",
+            Self::Claude => Some(crate::tool::Tool::Claude),
+            Self::Gemini => Some(crate::tool::Tool::Gemini),
+            Self::Codex => Some(crate::tool::Tool::Codex),
+            Self::OpenCode => Some(crate::tool::Tool::OpenCode),
+            Self::Kilo => Some(crate::tool::Tool::Kilo),
+            Self::Pi => Some(crate::tool::Tool::Pi),
+            Self::Omp => Some(crate::tool::Tool::Omp),
+            Self::Antigravity => Some(crate::tool::Tool::Antigravity),
+            Self::Cursor => Some(crate::tool::Tool::Cursor),
+            Self::Kimi => Some(crate::tool::Tool::Kimi),
+            Self::Copilot => Some(crate::tool::Tool::Copilot),
+            Self::Grok => Some(crate::tool::Tool::Grok),
+            Self::Adhoc => Some(crate::tool::Tool::Adhoc),
+            Self::Unknown(_) => None,
+        }
+    }
+
+    /// Integration spec for known TUI tools.
+    pub fn spec(&self) -> Option<&'static crate::integration_spec::IntegrationSpec> {
+        self.canonical().map(crate::tool::Tool::spec)
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Unknown(raw) => raw,
+            _ => {
+                self.spec()
+                    .expect("known TUI tool must have an integration spec")
+                    .name
+            }
         }
     }
 
@@ -101,19 +137,37 @@ impl Tool {
             Self::Claude => Self::Gemini,
             Self::Gemini => Self::Codex,
             Self::Codex => Self::OpenCode,
-            Self::OpenCode => Self::Claude,
+            Self::OpenCode => Self::Kilo,
+            Self::Kilo => Self::Pi,
+            Self::Pi => Self::Omp,
+            Self::Omp => Self::Antigravity,
+            Self::Antigravity => Self::Cursor,
+            Self::Cursor => Self::Kimi,
+            Self::Kimi => Self::Copilot,
+            Self::Copilot => Self::Grok,
+            Self::Grok => Self::Claude,
             Self::Adhoc => Self::Adhoc,
+            Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
     }
 
     /// Cycle backward (for launch panel). Adhoc is not launchable.
     pub fn prev(&self) -> Self {
         match self {
-            Self::Claude => Self::OpenCode,
+            Self::Claude => Self::Grok,
             Self::Gemini => Self::Claude,
             Self::Codex => Self::Gemini,
             Self::OpenCode => Self::Codex,
+            Self::Antigravity => Self::Omp,
+            Self::Omp => Self::Pi,
+            Self::Pi => Self::Kilo,
+            Self::Kilo => Self::OpenCode,
+            Self::Cursor => Self::Antigravity,
+            Self::Kimi => Self::Cursor,
+            Self::Copilot => Self::Kimi,
+            Self::Grok => Self::Copilot,
             Self::Adhoc => Self::Adhoc,
+            Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
     }
 }
@@ -161,6 +215,40 @@ impl Agent {
         self.device_name.is_some()
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.status == AgentStatus::Inactive
+    }
+
+    pub fn can_kill(&self) -> bool {
+        !self.is_stopped()
+    }
+
+    pub fn can_resume(&self) -> bool {
+        self.is_stopped() && self.tool.spec().is_some_and(|spec| spec.resume.is_some())
+    }
+
+    pub fn can_fork_from_tui(&self) -> bool {
+        !self.is_remote()
+            && !self.is_stopped()
+            && self
+                .tool
+                .spec()
+                .and_then(|spec| spec.resume)
+                .is_some_and(|resume| resume.fork.is_some())
+    }
+
+    pub fn can_tag(&self) -> bool {
+        true
+    }
+
+    pub fn action_name(&self) -> String {
+        if self.is_remote() {
+            self.display_name()
+        } else {
+            self.name.clone()
+        }
+    }
+
     pub fn context_display(&self) -> String {
         // Strip known internal prefixes for cleaner display
         let ctx = strip_context_prefix(&self.status_context);
@@ -196,7 +284,21 @@ impl Agent {
 /// Strip known internal prefixes from status_context for display.
 /// e.g. "tool:Bash" → "Bash", "tui:not-ready" → "not-ready"
 fn strip_context_prefix(ctx: &str) -> &str {
-    const PREFIXES: &[&str] = &["tool:", "deliver:", "approved:", "exit:", "stale:", "tui:"];
+    if let Some(rest) = ctx.strip_prefix("exit:") {
+        return match rest {
+            "unknown" => "ended",
+            "" => "ended",
+            other => other,
+        };
+    }
+    const PREFIXES: &[&str] = &[
+        "tool:",
+        "deliver:",
+        "approved:",
+        "denied:",
+        "stale:",
+        "tui:",
+    ];
     for p in PREFIXES {
         if let Some(rest) = ctx.strip_prefix(p) {
             return rest;
@@ -326,6 +428,14 @@ pub enum CursorTarget {
     Orphan(usize),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ActionAvailability {
+    pub kill: bool,
+    pub fork: bool,
+    pub resume: bool,
+    pub tag: bool,
+}
+
 pub struct Flash {
     pub text: String,
     pub style: Style,
@@ -442,14 +552,14 @@ impl CommandPalette {
             .map(|(i, _)| i)
             .collect();
         // Clamp cursor into bounds
-        if let Some(c) = self.cursor {
-            if c >= self.filtered.len() {
-                self.cursor = if self.filtered.is_empty() {
-                    None
-                } else {
-                    Some(self.filtered.len() - 1)
-                };
-            }
+        if let Some(c) = self.cursor
+            && c >= self.filtered.len()
+        {
+            self.cursor = if self.filtered.is_empty() {
+                None
+            } else {
+                Some(self.filtered.len() - 1)
+            };
         }
     }
 
@@ -494,6 +604,10 @@ pub struct LaunchState {
     pub options_cursor: Option<LaunchField>,
     pub tag: String,
     pub headless: bool,
+    /// Claude-only: when headless, `true` keeps the default live PTY-backed
+    /// session; `false` opts into `-p` print mode. Ignored for other
+    /// tools (their only headless mode is the PTY wrapper).
+    pub headless_pty: bool,
     pub terminal: usize,
     pub terminal_presets: Vec<String>,
     pub editing: Option<LaunchField>,
@@ -522,6 +636,7 @@ impl LaunchState {
             options_cursor: None,
             tag: defaults.tag,
             headless: false,
+            headless_pty: false,
             terminal: terminal_idx,
             terminal_presets: presets,
             editing: None,
@@ -532,33 +647,22 @@ impl LaunchState {
 
     /// Height of the inline panel.
     pub fn panel_height(&self) -> u16 {
-        if self.tool == Tool::Claude {
-            // sep + tool + count + tag + headless + terminal
-            6
-        } else {
-            // sep + tool + count + tag + terminal
-            5
-        }
+        // sep + tool + count + tag + headless + terminal. Headless is available
+        // for every tool (claude additionally toggles print vs PTY headless).
+        6
     }
 
     /// Ordered navigable fields in the settings area.
     pub fn settings_fields(&self) -> &'static [LaunchField] {
-        if self.tool == Tool::Claude {
-            &[
-                LaunchField::Tool,
-                LaunchField::Count,
-                LaunchField::Tag,
-                LaunchField::Headless,
-                LaunchField::Terminal,
-            ]
-        } else {
-            &[
-                LaunchField::Tool,
-                LaunchField::Count,
-                LaunchField::Tag,
-                LaunchField::Terminal,
-            ]
-        }
+        // Headless applies to every tool. For non-claude tools it routes through
+        // the PTY headless wrapper; claude's Headless field cycles off/print/pty.
+        &[
+            LaunchField::Tool,
+            LaunchField::Count,
+            LaunchField::Tag,
+            LaunchField::Headless,
+            LaunchField::Terminal,
+        ]
     }
 
     /// Move cursor up. At top, wraps to None (input focus).
@@ -620,11 +724,14 @@ impl LaunchState {
 
     pub fn adjust_left(&mut self) {
         match self.options_cursor {
-            Some(LaunchField::Tool) => self.tool = self.tool.prev(),
-            Some(LaunchField::Count) => {
-                if self.count > 1 {
-                    self.count -= 1;
+            Some(LaunchField::Tool) => {
+                self.tool = self.tool.prev();
+                if self.tool != Tool::Claude {
+                    self.headless_pty = false;
                 }
+            }
+            Some(LaunchField::Count) if self.count > 1 => {
+                self.count -= 1;
             }
             Some(LaunchField::Terminal) => {
                 if self.terminal == 0 {
@@ -639,11 +746,14 @@ impl LaunchState {
 
     pub fn adjust_right(&mut self) {
         match self.options_cursor {
-            Some(LaunchField::Tool) => self.tool = self.tool.next(),
-            Some(LaunchField::Count) => {
-                if self.count < 99 {
-                    self.count += 1;
+            Some(LaunchField::Tool) => {
+                self.tool = self.tool.next();
+                if self.tool != Tool::Claude {
+                    self.headless_pty = false;
                 }
+            }
+            Some(LaunchField::Count) if self.count < 99 => {
+                self.count += 1;
             }
             Some(LaunchField::Terminal) => {
                 self.terminal = (self.terminal + 1) % self.terminal_presets.len();
@@ -654,7 +764,19 @@ impl LaunchState {
 
     pub fn toggle_or_select(&mut self) {
         if self.options_cursor == Some(LaunchField::Headless) {
-            self.headless = !self.headless;
+            if self.tool == Tool::Claude {
+                // Cycle off → PTY headless (default) → print headless → off.
+                // PTY is the default; print (`-p`) is the opt-in second stop
+                // because it draws from a separate Agent SDK credit pool.
+                (self.headless, self.headless_pty) = match (self.headless, self.headless_pty) {
+                    (false, _) => (true, true),      // pty (default)
+                    (true, true) => (true, false),   // print
+                    (true, false) => (false, false), // off
+                };
+            } else {
+                self.headless = !self.headless;
+                self.headless_pty = false;
+            }
         }
     }
 
@@ -681,10 +803,10 @@ impl LaunchState {
     }
 
     pub fn cancel_editing(&mut self) {
-        if let (Some(field), Some(snapshot)) = (self.editing, self.edit_snapshot.take()) {
-            if let Some(s) = self.field_value_mut(field) {
-                *s = snapshot;
-            }
+        if let (Some(field), Some(snapshot)) = (self.editing, self.edit_snapshot.take())
+            && let Some(s) = self.field_value_mut(field)
+        {
+            *s = snapshot;
         }
         self.editing = None;
         self.edit_cursor = 0;
@@ -1146,12 +1268,28 @@ mod tests {
         assert_eq!(Tool::Claude.next(), Tool::Gemini);
         assert_eq!(Tool::Gemini.next(), Tool::Codex);
         assert_eq!(Tool::Codex.next(), Tool::OpenCode);
-        assert_eq!(Tool::OpenCode.next(), Tool::Claude);
+        assert_eq!(Tool::OpenCode.next(), Tool::Kilo);
+        assert_eq!(Tool::Kilo.next(), Tool::Pi);
+        assert_eq!(Tool::Pi.next(), Tool::Omp);
+        assert_eq!(Tool::Omp.next(), Tool::Antigravity);
+        assert_eq!(Tool::Antigravity.next(), Tool::Cursor);
+        assert_eq!(Tool::Cursor.next(), Tool::Kimi);
+        assert_eq!(Tool::Kimi.next(), Tool::Copilot);
+        assert_eq!(Tool::Copilot.next(), Tool::Grok);
+        assert_eq!(Tool::Grok.next(), Tool::Claude);
     }
 
     #[test]
     fn tool_prev_cycles_backward() {
-        assert_eq!(Tool::Claude.prev(), Tool::OpenCode);
+        assert_eq!(Tool::Claude.prev(), Tool::Grok);
+        assert_eq!(Tool::Grok.prev(), Tool::Copilot);
+        assert_eq!(Tool::Copilot.prev(), Tool::Kimi);
+        assert_eq!(Tool::Kimi.prev(), Tool::Cursor);
+        assert_eq!(Tool::Cursor.prev(), Tool::Antigravity);
+        assert_eq!(Tool::Antigravity.prev(), Tool::Omp);
+        assert_eq!(Tool::Omp.prev(), Tool::Pi);
+        assert_eq!(Tool::Pi.prev(), Tool::Kilo);
+        assert_eq!(Tool::Kilo.prev(), Tool::OpenCode);
         assert_eq!(Tool::OpenCode.prev(), Tool::Codex);
         assert_eq!(Tool::Codex.prev(), Tool::Gemini);
         assert_eq!(Tool::Gemini.prev(), Tool::Claude);
@@ -1251,6 +1389,7 @@ mod tests {
             options_cursor: None,
             tag: String::new(),
             headless: false,
+            headless_pty: false,
             terminal: 0,
             terminal_presets: vec!["default".into(), "kitty".into()],
             editing: None,
@@ -1260,24 +1399,20 @@ mod tests {
     }
 
     #[test]
-    fn launch_panel_height_claude_vs_others() {
+    fn launch_panel_height_constant_across_tools() {
+        // Headless is available for every tool, so the panel is the same height.
         let mut ls = test_launch();
-        assert_eq!(ls.panel_height(), 6); // claude has headless field
+        assert_eq!(ls.panel_height(), 6);
         ls.tool = Tool::Gemini;
-        assert_eq!(ls.panel_height(), 5);
+        assert_eq!(ls.panel_height(), 6);
     }
 
     #[test]
-    fn launch_settings_fields_claude_has_headless() {
-        let ls = test_launch();
+    fn launch_settings_fields_have_headless_for_all_tools() {
+        let mut ls = test_launch();
         assert!(ls.settings_fields().contains(&LaunchField::Headless));
-    }
-
-    #[test]
-    fn launch_settings_fields_gemini_no_headless() {
-        let mut ls = test_launch();
         ls.tool = Tool::Gemini;
-        assert!(!ls.settings_fields().contains(&LaunchField::Headless));
+        assert!(ls.settings_fields().contains(&LaunchField::Headless));
     }
 
     #[test]
@@ -1346,14 +1481,39 @@ mod tests {
     }
 
     #[test]
-    fn launch_headless_toggles() {
+    fn launch_headless_cycles_off_pty_print_for_claude() {
+        let mut ls = test_launch(); // claude by default
+        ls.options_cursor = Some(LaunchField::Headless);
+        assert!(!ls.headless && !ls.headless_pty); // off
+        ls.toggle_or_select();
+        assert!(ls.headless && ls.headless_pty); // pty (default)
+        ls.toggle_or_select();
+        assert!(ls.headless && !ls.headless_pty); // print
+        ls.toggle_or_select();
+        assert!(!ls.headless && !ls.headless_pty); // back to off
+    }
+
+    #[test]
+    fn launch_headless_is_plain_toggle_for_non_claude() {
         let mut ls = test_launch();
+        ls.tool = Tool::Gemini;
         ls.options_cursor = Some(LaunchField::Headless);
         assert!(!ls.headless);
         ls.toggle_or_select();
-        assert!(ls.headless);
+        assert!(ls.headless && !ls.headless_pty);
         ls.toggle_or_select();
-        assert!(!ls.headless);
+        assert!(!ls.headless && !ls.headless_pty);
+    }
+
+    #[test]
+    fn launch_switching_tool_off_claude_clears_pty() {
+        let mut ls = test_launch(); // claude
+        ls.options_cursor = Some(LaunchField::Tool);
+        ls.headless = true;
+        ls.headless_pty = true;
+        ls.adjust_right(); // cycle off claude
+        assert_ne!(ls.tool, Tool::Claude);
+        assert!(!ls.headless_pty);
     }
 
     #[test]

@@ -10,11 +10,32 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use regex::Regex;
-
 use crate::db::HcomDb;
-use crate::log::log_warn;
 use crate::shared::CommandContext;
+use crate::tool::Tool;
+use crate::transcript::{self, Exchange, ReadOptions, format_exchanges, summarize_action};
+
+fn run_search_tool(program: &str, args: &[&str]) -> Result<Option<std::process::Output>, String> {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(output) if output.status.success() => Ok(Some(output)),
+        Ok(output) if output.status.code() == Some(1) => Ok(None),
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            Err(format!(
+                "{program} failed{}",
+                if detail.trim().is_empty() {
+                    format!(" with {}", output.status)
+                } else {
+                    format!(": {}", detail.trim())
+                }
+            ))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "required search tool `{program}` was not found on PATH"
+        )),
+        Err(err) => Err(format!("could not run `{program}`: {err}")),
+    }
+}
 
 /// Parsed arguments for `hcom transcript`.
 #[derive(clap::Parser, Debug)]
@@ -35,7 +56,7 @@ pub struct TranscriptArgs {
     /// Full output (no streamlining)
     #[arg(long)]
     pub full: bool,
-    /// Detailed output (include tool details)
+    /// Show tool inputs/outputs, file edits, and errors
     #[arg(long)]
     pub detailed: bool,
     /// Last N exchanges
@@ -74,7 +95,7 @@ pub struct TranscriptSearchArgs {
     /// Max results (default: 20)
     #[arg(long, default_value = "20")]
     pub limit: usize,
-    /// Filter by agent type (claude, gemini, codex, opencode)
+    /// Filter by exact agent type (canonical name or declared alias)
     #[arg(long)]
     pub agent: Option<String>,
 }
@@ -96,142 +117,6 @@ pub struct TranscriptTimelineArgs {
     pub last: Option<usize>,
 }
 
-/// Lazy-initialized error detection regex.
-/// Uses `(?:^|\W)error:` to match "error:" not preceded by a word character
-/// (lookbehinds not supported by the regex crate).
-fn error_patterns() -> &'static Regex {
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(rejected|interrupted|traceback|failed|exception)\b|(?:^|\W)error:|command failed with exit code|Traceback \(most recent call last\)").unwrap()
-    })
-}
-
-/// Check if a tool result indicates an error.
-fn is_error_result(result: &Value) -> bool {
-    if result
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    let content = result.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    if content.is_empty() {
-        return false;
-    }
-    let check = truncate_str(content, 500);
-    error_patterns().is_match(check)
-}
-
-/// Check if Codex tool output indicates an error.
-fn codex_is_error(output: &str) -> bool {
-    if output.is_empty() {
-        return false;
-    }
-    if output.starts_with("Exit code:") {
-        let exit_line = output.lines().next().unwrap_or("");
-        if !exit_line.contains("Exit code: 0") {
-            return true;
-        }
-    }
-    let check = truncate_str(output, 200);
-    error_patterns().is_match(check)
-}
-
-/// Extract text from tool_result content that may be a string or array of text blocks.
-///
-fn extract_content_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => {
-            let mut parts = Vec::new();
-            for block in arr {
-                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        parts.push(trimmed.to_string());
-                    }
-                }
-            }
-            parts.join("\n")
-        }
-        Some(other) => other.to_string(),
-        None => String::new(),
-    }
-}
-
-/// Extract edit info from toolUseResult and/or tool_use input.
-fn extract_edit_info(tool_use_result: &Option<Value>, tool_input: &Value) -> Option<Value> {
-    // Try toolUseResult first
-    if let Some(result) = tool_use_result.as_ref().and_then(|v| v.as_object()) {
-        if result.contains_key("structuredPatch") || result.contains_key("oldString") {
-            let file = result
-                .get("filePath")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let diff = if let Some(patch) = result.get("structuredPatch").and_then(|v| v.as_array())
-            {
-                format_structured_patch(patch)
-            } else if let (Some(old), Some(new)) = (
-                result.get("oldString").and_then(|v| v.as_str()),
-                result.get("newString").and_then(|v| v.as_str()),
-            ) {
-                let old_preview = truncate_str(old, 100);
-                let new_preview = truncate_str(new, 100);
-                let old_suffix = if old.len() > 100 { "..." } else { "" };
-                let new_suffix = if new.len() > 100 { "..." } else { "" };
-                format!("-{old_preview}{old_suffix}\n+{new_preview}{new_suffix}")
-            } else {
-                String::new()
-            };
-            return Some(json!({"file": file, "diff": diff}));
-        }
-    }
-
-    // Fallback: extract from tool_use input
-    if let Some(obj) = tool_input.as_object() {
-        if obj.contains_key("old_string") || obj.contains_key("new_string") {
-            let file = obj.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let old = obj.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new = obj.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
-            let old_preview = truncate_str(old, 100);
-            let new_preview = truncate_str(new, 100);
-            let old_suffix = if old.len() > 100 { "..." } else { "" };
-            let new_suffix = if new.len() > 100 { "..." } else { "" };
-            return Some(
-                json!({"file": file, "diff": format!("-{old_preview}{old_suffix}\n+{new_preview}{new_suffix}")}),
-            );
-        }
-    }
-
-    None
-}
-
-/// Format structuredPatch into readable diff.
-fn format_structured_patch(patch: &[Value]) -> String {
-    let mut lines = Vec::new();
-    for hunk in patch {
-        if let Some(obj) = hunk.as_object() {
-            let old_start = obj.get("oldStart").and_then(|v| v.as_u64()).unwrap_or(0);
-            let new_start = obj.get("newStart").and_then(|v| v.as_u64()).unwrap_or(0);
-            lines.push(format!("@@ -{old_start} +{new_start} @@"));
-            if let Some(hunk_lines) = obj.get("lines").and_then(|v| v.as_array()) {
-                for (i, line) in hunk_lines.iter().enumerate() {
-                    if i >= 20 {
-                        lines.push(format!("  ... +{} more lines", hunk_lines.len() - 20));
-                        break;
-                    }
-                    if let Some(s) = line.as_str() {
-                        lines.push(s.to_string());
-                    }
-                }
-            }
-        }
-    }
-    lines.join("\n")
-}
-
 /// Truncate a string to at most `max` bytes at a valid UTF-8 char boundary.
 fn truncate_str(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -244,1541 +129,179 @@ fn truncate_str(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-// ── Tool Aliases ─────────────────────────────────────────────────────────
+/// Snippet width (bytes) for transcript search matches, centered on the hit.
+const SEARCH_SNIPPET_WIDTH: usize = 160;
 
-/// Normalize tool names across agents to canonical Claude names.
-fn normalize_tool_name(name: &str) -> &str {
-    match name {
-        "run_shell_command" | "shell" | "shell_command" | "bash" => "Bash",
-        "read_file" | "read" | "read_many_files" => "Read",
-        "write_file" | "write" => "Write",
-        "edit_file" | "edit" | "apply_patch" | "replace" => "Edit",
-        "search_files" | "grep" | "grep_search" => "Grep",
-        "list_files" | "list_directory" | "glob" => "Glob",
-        "fetch" => "WebFetch",
-        "skill" => "Skill",
-        _ => name,
+/// Build a snippet of ~`width` bytes centered on a match.
+///
+/// Transcript lines are whole JSON message objects (thousands of bytes), so a
+/// start-anchored truncation only ever shows leading metadata (`parentUuid`…),
+/// never the match. `col` is ripgrep's 1-based byte column of the match start;
+/// we window around it so the matched text is actually visible, with `…`
+/// markers when content is elided on either side. All slice points are snapped
+/// to UTF-8 char boundaries.
+fn centered_snippet(line_text: &str, col: usize, width: usize) -> String {
+    if line_text.len() <= width {
+        return line_text.to_string();
     }
+    let match_start = col.saturating_sub(1).min(line_text.len());
+    let half = width / 2;
+    let mut start = match_start.saturating_sub(half);
+    while start > 0 && !line_text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (start + width).min(line_text.len());
+    while end < line_text.len() && !line_text.is_char_boundary(end) {
+        end += 1;
+    }
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.push_str(line_text[start..end].trim());
+    if end < line_text.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Parse one search-tool output line into `(line_number, centered_snippet)`.
+///
+/// `has_column` is true for ripgrep run with `--column` (`LINE:COL:TEXT`) and
+/// false for the `grep` fallback (`LINE:TEXT`), where we locate the pattern
+/// literally to center on it and fall back to the line start otherwise.
+fn parse_match_line(raw: &str, has_column: bool, pattern: &str) -> (usize, String) {
+    let Some((line_str, rest)) = raw.split_once(':') else {
+        return (0, centered_snippet(raw, 1, SEARCH_SNIPPET_WIDTH));
+    };
+    let line_num = line_str.parse::<usize>().unwrap_or(0);
+
+    if has_column
+        && let Some((col_str, text)) = rest.split_once(':')
+        && let Ok(col) = col_str.parse::<usize>()
+    {
+        return (line_num, centered_snippet(text, col, SEARCH_SNIPPET_WIDTH));
+    }
+
+    // grep fallback (or malformed rg line): best-effort literal locate.
+    let col = rest
+        .to_lowercase()
+        .find(&pattern.to_lowercase())
+        .map(|byte| byte + 1)
+        .unwrap_or(1);
+    (line_num, centered_snippet(rest, col, SEARCH_SNIPPET_WIDTH))
 }
 
 // ── Transcript Path Discovery ────────────────────────────────────────────
 
-/// Get Claude config directory.
-pub(crate) fn claude_config_dir() -> PathBuf {
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".claude"))
-}
-
-/// Detect agent type from transcript path.
-pub(crate) fn detect_agent_type(path: &str) -> &str {
-    if path.contains(".claude") || path.contains("/projects/") {
-        "claude"
-    } else if path.contains(".gemini") {
-        "gemini"
-    } else if path.contains(".codex") || path.contains("codex") {
-        "codex"
-    } else if path.contains("opencode") {
-        "opencode"
-    } else {
-        "unknown"
-    }
+/// Detect canonical agent type from transcript path.
+pub(crate) fn detect_agent_type(path: &str) -> &'static str {
+    transcript::agent_name_from_path(path)
 }
 
 fn transcript_search_key(path: &str, session_id: Option<&str>) -> String {
     format!("{path}\u{0}{}", session_id.unwrap_or(""))
 }
 
-fn transcript_agent_matches(filter: Option<&str>, agent: &str) -> bool {
-    filter.is_none_or(|f| agent.contains(f) || f.contains(agent))
-}
-
-fn get_opencode_db_path() -> Option<PathBuf> {
-    let xdg_data = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.local/share")
-    });
-    let db_path = PathBuf::from(xdg_data).join("opencode").join("opencode.db");
-    db_path.exists().then_some(db_path)
-}
-
-#[derive(Debug, Clone)]
-struct TranscriptSearchMatch {
-    path: String,
-    agent: String,
-    line: usize,
-    text: String,
-    matches: usize,
-    session_id: Option<String>,
-    label: Option<String>,
-}
-
-fn search_opencode_sessions(
-    db_path: &Path,
-    pattern: &str,
-    limit: usize,
-) -> Result<Vec<TranscriptSearchMatch>, String> {
-    let re = Regex::new(pattern).map_err(|e| format!("Invalid regex: {e}"))?;
-    let conn =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| format!("Cannot open OpenCode DB: {e}"))?;
-
-    let mut stmt = conn
-        .prepare(
-            "SELECT s.id, s.title, p.data
-             FROM session s
-             JOIN part p ON p.session_id = s.id
-             WHERE json_extract(p.data, '$.type') = 'text'
-             ORDER BY p.time_created ASC",
-        )
-        .map_err(|e| format!("Query error: {e}"))?;
-
-    let mut by_session: std::collections::HashMap<String, TranscriptSearchMatch> =
-        std::collections::HashMap::new();
-    let mut order = Vec::new();
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|e| format!("Query error: {e}"))?;
-
-    for row in rows {
-        let (session_id, title, data_str) = match row {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let data = match serde_json::from_str::<Value>(&data_str) {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
-        if data
-            .get("synthetic")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        let text = data.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        if text.is_empty() || !re.is_match(text) {
-            continue;
-        }
-
-        let entry = by_session.entry(session_id.clone()).or_insert_with(|| {
-            order.push(session_id.clone());
-            TranscriptSearchMatch {
-                path: db_path.to_string_lossy().to_string(),
-                agent: "opencode".to_string(),
-                line: 0,
-                text: truncate_str(&text.replace('\n', " "), 100).to_string(),
-                matches: 0,
-                session_id: Some(session_id.clone()),
-                label: Some(title.clone()),
-            }
-        });
-        entry.matches += 1;
+/// Attribute a `--all` disk match to a canonical tool.
+///
+/// Content detection wins when it lands on a selected tool: it resolves every
+/// signatured format and the one shared root (gemini/antigravity under
+/// `~/.gemini`). Otherwise the file is attributed by provenance — the search
+/// root it was found under — which is what classifies unsignatured sessions such
+/// as pi's bare `<uuid>.jsonl` reached via a custom `PI_CODING_AGENT_SESSION_DIR`.
+/// Provenance is only trusted when exactly one selected root owns the path, so
+/// the shared gemini/antigravity root never guesses.
+fn attribute_disk_match(
+    file_path: &str,
+    selected: &[Tool],
+    root_owners: &[(PathBuf, Tool)],
+) -> Option<Tool> {
+    if let Some(detected) = transcript::detect_tool_from_path(file_path)
+        && selected.contains(&detected)
+    {
+        return Some(detected);
     }
-
-    Ok(order
-        .into_iter()
-        .filter_map(|session_id| by_session.remove(&session_id))
-        .take(limit)
-        .collect())
+    let path = Path::new(file_path);
+    let mut owner: Option<Tool> = None;
+    for (root, tool) in root_owners {
+        if selected.contains(tool) && path.starts_with(root) {
+            match owner {
+                None => owner = Some(*tool),
+                Some(existing) if existing == *tool => {}
+                Some(_) => return None, // ambiguous provenance — do not guess
+            }
+        }
+    }
+    owner
 }
 
-/// Get transcript path for an instance from DB.
-fn get_transcript_path(db: &HcomDb, name: &str) -> Option<String> {
-    db.conn()
-        .query_row(
-            "SELECT transcript_path FROM instances WHERE name = ?",
-            rusqlite::params![name],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
+/// Explain an empty range result against the exchanges that do exist.
+fn range_miss_message(
+    exchanges: &[Exchange],
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+) -> Option<String> {
+    let start = range_start?;
+    let end = range_end.unwrap_or(start);
+    let last = exchanges.iter().map(|e| e.position).max()?;
+    Some(format!(
+        "No exchanges in range {start}-{end}; this transcript has 1-{last} (e.g. --last 5 or {}-{last})",
+        last.saturating_sub(4).max(1)
+    ))
 }
 
 /// Build an appropriate error message when transcript resolution fails.
-/// Uses resolve_display_name_or_stopped (which already handles prefix matching)
-/// to check if the instance exists without a transcript.
-fn no_transcript_error(db: &HcomDb, name: &str) -> String {
-    if let Some(resolved) = crate::instances::resolve_display_name_or_stopped(db, name) {
-        format!(
-            "Agent '{}' has no transcript yet — no messages have been exchanged",
-            resolved
-        )
-    } else {
-        format!("Agent '{name}' not found")
-    }
-}
-
-// ── Transcript Parsing (simplified) ──────────────────────────────────────
-
-/// An exchange in a transcript.
-#[derive(Debug, Clone)]
-struct Exchange {
-    position: usize,
-    user: String,
-    action: String,
-    files: Vec<String>,
-    timestamp: String,
-    tools: Vec<ToolUse>,
-    edits: Vec<Value>,
-    errors: Vec<Value>,
-    ended_on_error: bool,
-}
-
-/// A tool use within an exchange.
-#[derive(Debug, Clone)]
-struct ToolUse {
-    name: String,
-    is_error: bool,
-    file: Option<String>,
-    command: Option<String>,
-}
-
-fn summarize_tool_names(tools: &[ToolUse]) -> String {
-    let mut names = Vec::new();
-    for tool in tools {
-        if !names.contains(&tool.name) {
-            names.push(tool.name.clone());
-        }
-    }
-
-    match names.len() {
-        0 => "tools".to_string(),
-        1..=3 => names.join(", "),
-        _ => format!("{}, +{} more", names[..3].join(", "), names.len() - 3),
-    }
-}
-
-fn finalize_action_text(
-    action: &str,
-    tools: &[ToolUse],
-    errors: &[Value],
-    ended_on_error: bool,
+/// Uses resolve_display_name_or_stopped (which handles exact base and tag-name
+/// resolution) to check if the instance exists without a transcript.
+fn no_transcript_error(
+    db: &HcomDb,
+    name: &str,
+    display_name: &str,
+    device: Option<&str>,
 ) -> String {
-    let trimmed = action.trim();
-    if !trimmed.is_empty() {
-        return trimmed.to_string();
-    }
-
-    let _ = errors;
-    if ended_on_error {
-        if tools.is_empty() {
-            "(turn ended in error)".to_string()
+    if let Some(resolved) = crate::identity::resolve_display_name_or_stopped(db, name) {
+        let display_name = if display_name.is_empty() {
+            &resolved
         } else {
-            format!(
-                "(turn ended in error after using {})",
-                summarize_tool_names(tools)
-            )
-        }
-    } else if !tools.is_empty() {
-        format!("(tool-only turn: {})", summarize_tool_names(tools))
-    } else {
-        "(no response)".to_string()
-    }
-}
-
-fn is_codex_system_injected_user_text(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with("<environment_context>")
-        || trimmed.starts_with("<permissions")
-        || trimmed.starts_with("# AGENTS.md")
-}
-
-fn extract_codex_event_message_text(payload: &Value) -> String {
-    if let Some(text) = payload.get("message").and_then(|v| v.as_str()) {
-        return text.trim().to_string();
-    }
-    extract_text_content(payload)
-}
-
-fn same_trimmed_text(a: &str, b: &str) -> bool {
-    a.trim() == b.trim()
-}
-
-fn is_no_response_action(action: &str) -> bool {
-    action.trim() == "(no response)"
-}
-
-fn merge_exchange_metadata(dst: &mut Exchange, src: Exchange) {
-    for file in src.files {
-        if !dst.files.contains(&file) {
-            dst.files.push(file);
-        }
-    }
-    dst.files = dedup_sorted_capped(&dst.files, 5);
-
-    for tool in src.tools {
-        dst.tools.push(tool);
-    }
-    for edit in src.edits {
-        dst.edits.push(edit);
-    }
-    for error in src.errors {
-        dst.errors.push(error);
-    }
-    dst.ended_on_error = src.ended_on_error;
-}
-
-fn collapse_codex_duplicate_exchanges(exchanges: Vec<Exchange>) -> Vec<Exchange> {
-    let mut collapsed: Vec<Exchange> = Vec::new();
-
-    for ex in exchanges {
-        if let Some(last) = collapsed.last_mut() {
-            let same_user = same_trimmed_text(&last.user, &ex.user);
-            let same_action = same_trimmed_text(&last.action, &ex.action);
-
-            if same_user
-                && is_no_response_action(&last.action)
-                && !is_no_response_action(&ex.action)
-            {
-                last.action = ex.action.clone();
-                last.timestamp = ex.timestamp.clone();
-                merge_exchange_metadata(last, ex);
-                continue;
-            }
-
-            if same_user && same_action && !is_no_response_action(&last.action) {
-                merge_exchange_metadata(last, ex);
-                continue;
-            }
-        }
-
-        collapsed.push(ex);
-    }
-
-    for (idx, ex) in collapsed.iter_mut().enumerate() {
-        ex.position = idx + 1;
-    }
-
-    collapsed
-}
-
-/// Parse Claude JSONL transcript.
-fn parse_claude_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exchange>, String> {
-    let content = read_file_lossy(path)?;
-
-    // First pass: parse all entries and build tool_use index for detailed mode
-    struct ParsedEntry {
-        entry_type: String,
-        ts: String,
-        data: Value,
-    }
-
-    let mut entries = Vec::new();
-    // Map (session_id, tool_use_id) -> {name, input} for matching tool_results to tool_uses
-    let mut tool_use_index: std::collections::HashMap<(String, String), (String, Value)> =
-        std::collections::HashMap::new();
-
-    for line in content.lines() {
-        let entry: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
+            display_name
         };
-
-        // Skip meta/system entries
-        if entry
-            .get("isMeta")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || entry
-                .get("isCompactSummary")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            || entry
-                .get("isSidechain")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        {
-            continue;
-        }
-
-        let entry_type = entry
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let ts = entry
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // Skip system-level entry types
-        if matches!(
-            entry_type.as_str(),
-            "summary"
-                | "system"
-                | "result"
-                | "progress"
-                | "file-history-snapshot"
-                | "saved_hook_context"
-        ) {
-            continue;
-        }
-
-        // Build tool_use index from assistant entries
-        if entry_type == "assistant" {
-            let session_id = entry
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if let Some(arr) = entry
-                .get("message")
-                .and_then(|v| v.get("content"))
-                .and_then(|v| v.as_array())
-            {
-                for block in arr {
-                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                        let tool_id = block
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = block
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let input = block.get("input").cloned().unwrap_or(json!({}));
-                        tool_use_index.insert((session_id.clone(), tool_id), (name, input));
-                    }
-                }
-            }
-        }
-
-        entries.push(ParsedEntry {
-            entry_type,
-            ts,
-            data: entry,
-        });
-    }
-
-    // Second pass: build exchanges
-    let mut exchanges = Vec::new();
-    let mut current_user = String::new();
-    let mut current_action = String::new();
-    let mut current_tools: Vec<ToolUse> = Vec::new();
-    let mut current_files: Vec<String> = Vec::new();
-    let mut current_ts = String::new();
-    let mut current_edits: Vec<Value> = Vec::new();
-    let mut current_errors: Vec<Value> = Vec::new();
-    let mut current_last_was_error = false;
-    let mut position = 0;
-
-    for pe in &entries {
-        match pe.entry_type.as_str() {
-            "user" => {
-                // Check if this user entry has actual user text (not just tool_result blocks)
-                let has_text = has_user_text(&pe.data.get("message").cloned().unwrap_or(json!({})));
-                if !has_text {
-                    // tool_result-only user entry — process for error detection in detailed mode
-                    if detailed {
-                        let session_id = pe
-                            .data
-                            .get("sessionId")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let tool_use_result = pe.data.get("toolUseResult").cloned();
-                        if let Some(arr) = pe
-                            .data
-                            .get("message")
-                            .and_then(|v| v.get("content"))
-                            .and_then(|v| v.as_array())
-                        {
-                            for block in arr {
-                                if block.get("type").and_then(|v| v.as_str()) != Some("tool_result")
-                                {
-                                    continue;
-                                }
-                                let tool_use_id = block
-                                    .get("tool_use_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let (tool_name, tool_input) = tool_use_index
-                                    .get(&(session_id.clone(), tool_use_id.clone()))
-                                    .map(|(n, i)| (n.clone(), i.clone()))
-                                    .unwrap_or_else(|| ("unknown".to_string(), json!({})));
-
-                                let is_err = is_error_result(block);
-                                let normalized = normalize_tool_name(&tool_name);
-
-                                let file = if normalized == "Edit" {
-                                    tool_use_result
-                                        .as_ref()
-                                        .and_then(|r| r.get("filePath").and_then(|v| v.as_str()))
-                                        .or_else(|| {
-                                            tool_input.get("file_path").and_then(|v| v.as_str())
-                                        })
-                                        .map(|s| {
-                                            Path::new(s)
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or(s)
-                                                .to_string()
-                                        })
-                                } else {
-                                    None
-                                };
-
-                                let command = if normalized == "Bash" {
-                                    tool_input.get("command").and_then(|v| v.as_str()).map(|s| {
-                                        if s.len() > 80 {
-                                            format!("{}...", truncate_str(s, 77))
-                                        } else {
-                                            s.to_string()
-                                        }
-                                    })
-                                } else {
-                                    None
-                                };
-
-                                current_tools.push(ToolUse {
-                                    name: normalized.to_string(),
-                                    is_error: is_err,
-                                    file,
-                                    command,
-                                });
-
-                                // Extract edit info for Edit tools
-                                if normalized == "Edit" {
-                                    if let Some(edit) =
-                                        extract_edit_info(&tool_use_result, &tool_input)
-                                    {
-                                        current_edits.push(edit);
-                                    }
-                                }
-
-                                if is_err {
-                                    let raw_content = extract_content_text(block.get("content"));
-                                    let truncated = truncate_str(&raw_content, 300);
-                                    current_errors.push(json!({
-                                        "tool": normalized,
-                                        "content": truncated,
-                                    }));
-                                    current_last_was_error = true;
-                                } else {
-                                    current_last_was_error = false;
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // Save previous exchange
-                if !current_user.is_empty() || !current_action.is_empty() {
-                    position += 1;
-                    exchanges.push(Exchange {
-                        position,
-                        user: current_user.clone(),
-                        action: finalize_action_text(
-                            &current_action,
-                            &current_tools,
-                            &current_errors,
-                            current_last_was_error,
-                        ),
-                        files: dedup_sorted_capped(&current_files, 5),
-                        timestamp: current_ts.clone(),
-                        tools: std::mem::take(&mut current_tools),
-                        edits: std::mem::take(&mut current_edits),
-                        errors: std::mem::take(&mut current_errors),
-                        ended_on_error: current_last_was_error,
-                    });
-                }
-
-                // Extract user text
-                current_user =
-                    extract_text_content(&pe.data.get("message").cloned().unwrap_or(json!({})));
-                current_action = String::new();
-                current_tools = Vec::new();
-                current_files = Vec::new();
-                current_edits = Vec::new();
-                current_errors = Vec::new();
-                current_last_was_error = false;
-                current_ts = pe.ts.clone();
-            }
-            "assistant" => {
-                let msg = pe.data.get("message").cloned().unwrap_or(json!({}));
-
-                // Extract text and tool_use blocks
-                if let Some(content) = msg.get("content") {
-                    if let Some(arr) = content.as_array() {
-                        for block in arr {
-                            if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-                                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                    if !current_action.is_empty() {
-                                        current_action.push('\n');
-                                    }
-                                    current_action.push_str(text);
-                                }
-                            } else if block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
-                            {
-                                let tool_name =
-                                    block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                let input = block.get("input").cloned().unwrap_or(json!({}));
-
-                                // Extract file from tool input (including notebook_path)
-                                let file = input
-                                    .get("file_path")
-                                    .or_else(|| input.get("path"))
-                                    .or_else(|| input.get("filePath"))
-                                    .or_else(|| input.get("notebook_path"))
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| {
-                                        Path::new(s)
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or(s)
-                                            .to_string()
-                                    });
-
-                                if let Some(ref f) = file {
-                                    if !current_files.contains(f) {
-                                        current_files.push(f.clone());
-                                    }
-                                }
-
-                                // Don't push tool to current_tools here in detailed mode —
-                                // tools come from tool_result processing for accurate is_error.
-                                // In non-detailed mode, push with is_error=false.
-                                if !detailed {
-                                    let command = if normalize_tool_name(tool_name) == "Bash" {
-                                        input.get("command").and_then(|v| v.as_str()).map(|s| {
-                                            if s.len() > 80 {
-                                                format!("{}...", truncate_str(s, 77))
-                                            } else {
-                                                s.to_string()
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    };
-
-                                    current_tools.push(ToolUse {
-                                        name: normalize_tool_name(tool_name).to_string(),
-                                        is_error: false,
-                                        file,
-                                        command,
-                                    });
-                                }
-                            }
-                        }
-                    } else if let Some(text) = content.as_str() {
-                        current_action = text.to_string();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Save last exchange
-    if !current_user.is_empty() || !current_action.is_empty() {
-        position += 1;
-        exchanges.push(Exchange {
-            position,
-            user: current_user,
-            action: finalize_action_text(
-                &current_action,
-                &current_tools,
-                &current_errors,
-                current_last_was_error,
+        let command = match device {
+            Some(device) => format!(
+                "hcom events --remote-fetch --device {device} --participant {resolved} --type message"
             ),
-            files: dedup_sorted_capped(&current_files, 5),
-            timestamp: current_ts,
-            tools: current_tools,
-            edits: current_edits,
-            errors: current_errors,
-            ended_on_error: current_last_was_error,
-        });
-    }
-
-    // Apply last N
-    exchanges = collapse_codex_duplicate_exchanges(exchanges);
-
-    if exchanges.len() > last {
-        let start = exchanges.len() - last;
-        exchanges = exchanges[start..].to_vec();
-    }
-
-    Ok(exchanges)
-}
-
-/// Deduplicate, sort, and cap a list of file names.
-fn dedup_sorted_capped(files: &[String], cap: usize) -> Vec<String> {
-    let mut seen = Vec::new();
-    for f in files {
-        if !seen.contains(f) {
-            seen.push(f.clone());
-        }
-    }
-    seen.sort();
-    seen.truncate(cap);
-    seen
-}
-
-/// Parse Gemini JSON transcript.
-fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange>, String> {
-    let content = read_file_lossy(path)?;
-
-    let data: Value = serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {e}"))?;
-
-    let messages = data
-        .get("messages")
-        .and_then(|v| v.as_array())
-        .ok_or("No messages array")?;
-
-    let mut exchanges = Vec::new();
-    let mut current_user = String::new();
-    let mut current_action = String::new();
-    let mut current_ts = String::new();
-    let mut position = 0;
-
-    let mut current_tools: Vec<ToolUse> = Vec::new();
-    let mut current_files: Vec<String> = Vec::new();
-
-    for msg in messages {
-        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let ts = msg
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if msg_type == "user" {
-            if !current_user.is_empty() || !current_action.is_empty() {
-                position += 1;
-                exchanges.push(Exchange {
-                    position,
-                    user: current_user.clone(),
-                    action: finalize_action_text(&current_action, &current_tools, &[], false),
-                    files: std::mem::take(&mut current_files),
-                    timestamp: current_ts.clone(),
-                    tools: std::mem::take(&mut current_tools),
-                    edits: Vec::new(),
-                    errors: Vec::new(),
-                    ended_on_error: false,
-                });
-            }
-            // Gemini user content can be a string or array of {text: ...} blocks.
-            // Use displayContent if available (user-visible text without hook context).
-            current_user = extract_gemini_user_text(msg);
-            current_action = String::new();
-            current_tools = Vec::new();
-            current_files = Vec::new();
-            current_ts = ts;
-        } else if msg_type == "gemini" || msg_type == "model" {
-            if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-                if !current_action.is_empty() {
-                    current_action.push('\n');
-                }
-                current_action.push_str(text);
-            }
-
-            // Extract tool calls
-            if let Some(tool_calls) = msg.get("toolCalls").and_then(|v| v.as_array()) {
-                for tc in tool_calls {
-                    let raw_name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let tool_name = normalize_tool_name(raw_name);
-                    let args = tc.get("args").cloned().unwrap_or(json!({}));
-                    let is_err = tc
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|status| {
-                            !matches!(
-                                status.to_ascii_lowercase().as_str(),
-                                "ok" | "success" | "completed"
-                            )
-                        });
-
-                    // Extract file paths from tool args
-                    if let Some(obj) = args.as_object() {
-                        for field in &["file", "path", "file_path", "directory"] {
-                            if let Some(val) = obj.get(*field).and_then(|v| v.as_str()) {
-                                if !val.is_empty() {
-                                    let fname = Path::new(val)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(val)
-                                        .to_string();
-                                    if !current_files.contains(&fname) {
-                                        current_files.push(fname.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let command = if tool_name == "Bash" {
-                        args.get("command").and_then(|v| v.as_str()).map(|s| {
-                            if s.len() > 80 {
-                                format!("{}...", truncate_str(s, 77))
-                            } else {
-                                s.to_string()
-                            }
-                        })
-                    } else {
-                        None
-                    };
-
-                    let file = args.as_object().and_then(|o| {
-                        o.get("file_path")
-                            .or(o.get("path"))
-                            .or(o.get("file"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| {
-                                Path::new(s)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(s)
-                                    .to_string()
-                            })
-                    });
-
-                    current_tools.push(ToolUse {
-                        name: tool_name.to_string(),
-                        is_error: is_err,
-                        file,
-                        command,
-                    });
-                }
-            }
-        }
-    }
-
-    // Last exchange
-    if !current_user.is_empty() || !current_action.is_empty() {
-        position += 1;
-        exchanges.push(Exchange {
-            position,
-            user: current_user,
-            action: finalize_action_text(&current_action, &current_tools, &[], false),
-            files: current_files,
-            timestamp: current_ts,
-            tools: current_tools,
-            edits: Vec::new(),
-            errors: Vec::new(),
-            ended_on_error: false,
-        });
-    }
-
-    if exchanges.len() > last {
-        let start = exchanges.len() - last;
-        exchanges = exchanges[start..].to_vec();
-    }
-
-    Ok(exchanges)
-}
-
-/// Parse Codex JSONL transcript.
-/// Handles both response_item (older) and event_msg (newer) formats.
-fn parse_codex_jsonl(path: &Path, last: usize, detailed: bool) -> Result<Vec<Exchange>, String> {
-    let content = read_file_lossy(path)?;
-
-    // First pass: build call_id → output map for error detection
-    let mut call_outputs: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut parsed_lines: Vec<Value> = Vec::new();
-
-    for line in content.lines() {
-        let entry: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
+            None => format!("hcom events --participant {resolved} --type message"),
         };
-        let payload = entry.get("payload").cloned().unwrap_or(entry.clone());
-        let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if payload_type == "function_call_output" {
-            let call_id = payload
-                .get("call_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let output = payload
-                .get("output")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            call_outputs.insert(call_id, output);
-        }
-        parsed_lines.push(entry);
-    }
-
-    // Second pass: build exchanges
-    let mut exchanges = Vec::new();
-    let mut current_user = String::new();
-    let mut current_action = String::new();
-    let mut current_tools: Vec<ToolUse> = Vec::new();
-    let mut current_files: Vec<String> = Vec::new();
-    let mut current_ts = String::new();
-    let mut current_errors: Vec<Value> = Vec::new();
-    let mut current_last_was_error = false;
-    let mut current_assistant_chunks: Vec<String> = Vec::new();
-    let mut position = 0;
-    let mut in_exchange = false; // track whether we have a real user entry
-
-    let save_exchange = |exchanges: &mut Vec<Exchange>,
-                         position: &mut usize,
-                         in_exchange: &mut bool,
-                         user: &mut String,
-                         action: &mut String,
-                         files: &mut Vec<String>,
-                         ts: &mut String,
-                         tools: &mut Vec<ToolUse>,
-                         errors: &mut Vec<Value>,
-                         assistant_chunks: &mut Vec<String>,
-                         last_was_error: &mut bool| {
-        if !user.is_empty() || !action.is_empty() {
-            *position += 1;
-            let final_action = finalize_action_text(action, tools, errors, *last_was_error);
-            exchanges.push(Exchange {
-                position: *position,
-                user: std::mem::take(user),
-                action: final_action,
-                files: dedup_sorted_capped(files, 5),
-                timestamp: std::mem::take(ts),
-                tools: std::mem::take(tools),
-                edits: Vec::new(),
-                errors: std::mem::take(errors),
-                ended_on_error: *last_was_error,
-            });
-            let _ = std::mem::take(action);
-            files.clear();
-            assistant_chunks.clear();
-            *last_was_error = false;
-        }
-        *in_exchange = false;
-    };
-
-    for entry in &parsed_lines {
-        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let ts = entry
-            .get("timestamp")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let payload = entry.get("payload").cloned().unwrap_or(entry.clone());
-        let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-        // Skip system entry types
-        if matches!(
-            entry_type,
-            "session_meta" | "turn_context" | "session_start" | "session_end"
-        ) {
-            continue;
-        }
-
-        // Handle response_item format (older Codex)
-        if entry_type == "response_item" || (entry_type.is_empty() && payload_type == "message") {
-            match payload_type {
-                "message" => {
-                    let role = payload.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                    if role == "user" {
-                        let text = extract_text_content(&payload);
-                        // Only start exchange if user has actual text
-                        if text.is_empty() || is_codex_system_injected_user_text(&text) {
-                            continue;
-                        }
-                        if in_exchange
-                            && current_action.is_empty()
-                            && same_trimmed_text(&current_user, &text)
-                        {
-                            current_ts = ts.clone();
-                            continue;
-                        }
-                        save_exchange(
-                            &mut exchanges,
-                            &mut position,
-                            &mut in_exchange,
-                            &mut current_user,
-                            &mut current_action,
-                            &mut current_files,
-                            &mut current_ts,
-                            &mut current_tools,
-                            &mut current_errors,
-                            &mut current_assistant_chunks,
-                            &mut current_last_was_error,
-                        );
-                        current_user = text;
-                        current_ts = ts.clone();
-                        in_exchange = true;
-                    } else if role == "assistant" {
-                        let text = extract_text_content(&payload);
-                        if !text.is_empty() {
-                            if current_assistant_chunks
-                                .iter()
-                                .any(|chunk| same_trimmed_text(chunk, &text))
-                            {
-                                continue;
-                            }
-                            if !current_action.is_empty() {
-                                current_action.push('\n');
-                            }
-                            current_action.push_str(&text);
-                            current_assistant_chunks.push(text);
-                        }
-                    }
-                }
-                "function_call" => {
-                    let raw_name = payload
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let tool_name = normalize_tool_name(raw_name);
-                    let args_str = payload
-                        .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("{}");
-                    let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
-                    let call_id = payload
-                        .get("call_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    // Extract files from args
-                    if let Some(obj) = args.as_object() {
-                        for field in &["file_path", "path", "file"] {
-                            if let Some(val) = obj.get(*field).and_then(|v| v.as_str()) {
-                                if !val.is_empty() {
-                                    let fname = Path::new(val)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(val)
-                                        .to_string();
-                                    if !current_files.contains(&fname) {
-                                        current_files.push(fname);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Determine is_error from call output
-                    let output = call_outputs.get(&call_id).map(|s| s.as_str()).unwrap_or("");
-                    let is_err = if detailed {
-                        codex_is_error(output)
-                    } else {
-                        false
-                    };
-
-                    let command = if tool_name == "Bash" {
-                        args.get("command").and_then(|v| v.as_str()).map(|s| {
-                            if s.len() > 80 {
-                                format!("{}...", truncate_str(s, 77))
-                            } else {
-                                s.to_string()
-                            }
-                        })
-                    } else {
-                        None
-                    };
-
-                    let file = args.as_object().and_then(|o| {
-                        o.get("file_path")
-                            .or(o.get("path"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| {
-                                Path::new(s)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(s)
-                                    .to_string()
-                            })
-                    });
-
-                    current_tools.push(ToolUse {
-                        name: tool_name.to_string(),
-                        is_error: is_err,
-                        file,
-                        command,
-                    });
-
-                    if is_err {
-                        let truncated = truncate_str(output, 300);
-                        current_errors.push(json!({
-                            "tool": tool_name,
-                            "content": truncated,
-                        }));
-                        current_last_was_error = true;
-                    } else {
-                        current_last_was_error = false;
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Handle event_msg format (newer Codex)
-        else if entry_type == "event_msg" {
-            match payload_type {
-                "user_message" => {
-                    let text = extract_codex_event_message_text(&payload);
-                    if text.is_empty() {
-                        continue;
-                    }
-                    if in_exchange
-                        && current_action.is_empty()
-                        && same_trimmed_text(&current_user, &text)
-                    {
-                        continue;
-                    }
-                    save_exchange(
-                        &mut exchanges,
-                        &mut position,
-                        &mut in_exchange,
-                        &mut current_user,
-                        &mut current_action,
-                        &mut current_files,
-                        &mut current_ts,
-                        &mut current_tools,
-                        &mut current_errors,
-                        &mut current_assistant_chunks,
-                        &mut current_last_was_error,
-                    );
-                    current_user = text;
-                    current_ts = ts.clone();
-                    in_exchange = true;
-                }
-                "agent_message" => {
-                    let text = extract_codex_event_message_text(&payload);
-                    if !text.is_empty() {
-                        if current_assistant_chunks
-                            .iter()
-                            .any(|chunk| same_trimmed_text(chunk, &text))
-                        {
-                            continue;
-                        }
-                        if !current_action.is_empty() {
-                            current_action.push('\n');
-                        }
-                        current_action.push_str(&text);
-                        current_assistant_chunks.push(text);
-                    }
-                }
-                _ => {} // token_count, agent_reasoning, etc — skip
-            }
-        }
-    }
-
-    // Last exchange
-    save_exchange(
-        &mut exchanges,
-        &mut position,
-        &mut in_exchange,
-        &mut current_user,
-        &mut current_action,
-        &mut current_files,
-        &mut current_ts,
-        &mut current_tools,
-        &mut current_errors,
-        &mut current_assistant_chunks,
-        &mut current_last_was_error,
-    );
-
-    exchanges = collapse_codex_duplicate_exchanges(exchanges);
-
-    if exchanges.len() > last {
-        let start = exchanges.len() - last;
-        exchanges = exchanges[start..].to_vec();
-    }
-
-    Ok(exchanges)
-}
-
-/// Extract text content from a message (handles string or content blocks).
-/// Check if a message has actual user text (not just tool_result blocks).
-fn has_user_text(msg: &Value) -> bool {
-    let content = msg.get("content");
-    if let Some(text) = content.and_then(|v| v.as_str()) {
-        return !text.trim().is_empty();
-    }
-    if let Some(arr) = content.and_then(|v| v.as_array()) {
-        return arr.iter().any(|block| {
-            block.get("type").and_then(|v| v.as_str()) == Some("text")
-                && block
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(|s| !s.trim().is_empty())
-                    .unwrap_or(false)
-        });
-    }
-    false
-}
-
-/// Extract user text from a Gemini user message.
-/// Prefers displayContent (user-visible text without hook context),
-/// falls back to content (string or array of {text: ...} blocks).
-fn extract_gemini_user_text(msg: &Value) -> String {
-    // displayContent: the user-visible text (excludes hook_context injections)
-    if let Some(arr) = msg.get("displayContent").and_then(|v| v.as_array()) {
-        let mut parts = Vec::new();
-        for block in arr {
-            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
-            }
-        }
-        if !parts.is_empty() {
-            return parts.join("\n");
-        }
-    }
-    // Fallback: content as string
-    if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-        return text.to_string();
-    }
-    // Fallback: content as array of text blocks
-    if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
-        let mut parts = Vec::new();
-        for block in arr {
-            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
-            }
-        }
-        return parts.join("\n");
-    }
-    String::new()
-}
-
-fn extract_text_content(msg: &Value) -> String {
-    if let Some(text) = msg.get("content").and_then(|v| v.as_str()) {
-        return text.trim().to_string();
-    }
-    if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
-        let mut parts = Vec::new();
-        for block in arr {
-            // Skip tool_result blocks (they're not user text)
-            if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                continue;
-            }
-            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    parts.push(trimmed.to_string());
-                }
-            }
-        }
-        return parts.join("\n");
-    }
-    // Fallback: look for text directly
-    msg.get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string()
-}
-
-/// Parse OpenCode SQLite transcript database.
-///
-/// OpenCode stores conversations in `opencode.db` with `message` and `part` tables.
-/// Messages have role in their JSON `data` column; parts contain text, tool calls, etc.
-fn parse_opencode_sqlite(
-    db_path: &Path,
-    session_id: &str,
-    last: usize,
-) -> Result<Vec<Exchange>, String> {
-    let conn =
-        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| format!("Cannot open OpenCode DB: {e}"))?;
-
-    // Fetch messages for this session (include time_created for timestamp)
-    let mut stmt = conn.prepare(
-        "SELECT id, data, time_created FROM message WHERE session_id = ? ORDER BY time_created ASC"
-    ).map_err(|e| format!("Query error: {e}"))?;
-
-    struct MsgRow {
-        id: String,
-        _data: Value,
-        role: String,
-        time_created: i64,
-    }
-
-    let messages: Vec<MsgRow> = stmt
-        .query_map(rusqlite::params![session_id], |row| {
-            let id: String = row.get(0)?;
-            let data_str: String = row.get(1)?;
-            let time_created: i64 = row.get::<_, i64>(2).unwrap_or(0);
-            Ok((id, data_str, time_created))
-        })
-        .map_err(|e| format!("Query error: {e}"))?
-        .filter_map(|r| r.ok())
-        .filter_map(
-            |(id, data_str, time_created)| match serde_json::from_str::<Value>(&data_str) {
-                Ok(data) => {
-                    let role = data
-                        .get("role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    Some(MsgRow {
-                        id,
-                        _data: data,
-                        role,
-                        time_created,
-                    })
-                }
-                Err(e) => {
-                    log_warn(
-                        "transcript",
-                        "opencode_parse",
-                        &format!("skipping message {id}: invalid JSON in data column: {e}"),
-                    );
-                    None
-                }
-            },
+        format!(
+            "No model transcript is registered for {display_name}.\nView transport messages with: {command}"
         )
-        .collect();
-
-    if messages.is_empty() {
-        return Ok(Vec::new());
+    } else {
+        crate::identity::describe_missing_agent(db, name)
     }
-
-    // Prefetch parts keyed by message_id.
-    // Query per message_id to avoid dependency on part.session_id column.
-    let mut parts_by_msg: std::collections::HashMap<String, Vec<Value>> =
-        std::collections::HashMap::new();
-    for msg in &messages {
-        if let Ok(mut parts_stmt) =
-            conn.prepare("SELECT data FROM part WHERE message_id = ? ORDER BY id ASC")
-        {
-            if let Ok(rows) =
-                parts_stmt.query_map(rusqlite::params![msg.id], |row| row.get::<_, String>(0))
-            {
-                for data_str in rows.flatten() {
-                    if let Ok(v) = serde_json::from_str::<Value>(&data_str) {
-                        parts_by_msg.entry(msg.id.clone()).or_default().push(v);
-                    }
-                }
-            }
-        }
-    }
-
-    // Build exchanges: group by user messages
-    let mut exchanges = Vec::new();
-    let mut position = 0;
-
-    // Find user message indices (with actual text)
-    let mut user_indices: Vec<usize> = Vec::new();
-    for (i, msg) in messages.iter().enumerate() {
-        if msg.role != "user" {
-            continue;
-        }
-        let parts = parts_by_msg.get(&msg.id).cloned().unwrap_or_default();
-        let has_text = parts.iter().any(|p| {
-            p.get("type").and_then(|v| v.as_str()) == Some("text")
-                && !p
-                    .get("synthetic")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                && !p
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .is_empty()
-        });
-        if has_text {
-            user_indices.push(i);
-        }
-    }
-
-    for (ui_pos, &user_idx) in user_indices.iter().enumerate() {
-        let next_user_idx = user_indices
-            .get(ui_pos + 1)
-            .copied()
-            .unwrap_or(messages.len());
-        let user_msg = &messages[user_idx];
-        let user_parts = parts_by_msg.get(&user_msg.id).cloned().unwrap_or_default();
-
-        // Extract user text
-        let user_text: String = user_parts
-            .iter()
-            .filter(|p| {
-                p.get("type").and_then(|v| v.as_str()) == Some("text")
-                    && !p
-                        .get("synthetic")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-            })
-            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let timestamp = if user_msg.time_created > 0 {
-            let secs = user_msg.time_created / 1000;
-            chrono::DateTime::from_timestamp(secs, 0)
-                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-
-        // Process assistant messages between this user msg and next
-        let mut action_parts: Vec<String> = Vec::new();
-        let mut files: Vec<String> = Vec::new();
-        let mut tools: Vec<ToolUse> = Vec::new();
-
-        for msg in &messages[(user_idx + 1)..next_user_idx] {
-            if msg.role != "assistant" {
-                continue;
-            }
-            let msg_parts = parts_by_msg.get(&msg.id).cloned().unwrap_or_default();
-            for p in &msg_parts {
-                let ptype = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match ptype {
-                    "text" => {
-                        if p.get("synthetic")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        if let Some(text) = p.get("text").and_then(|v| v.as_str()) {
-                            if !text.is_empty() {
-                                action_parts.push(text.to_string());
-                            }
-                        }
-                    }
-                    "tool" => {
-                        let tool_name = p.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let normalized = normalize_tool_name(tool_name);
-                        let state = p.get("state").cloned().unwrap_or(json!({}));
-                        let input = state.get("input").cloned().unwrap_or(json!({}));
-                        let is_err = state.get("status").and_then(|v| v.as_str()) == Some("error");
-
-                        // Extract file paths
-                        if let Some(obj) = input.as_object() {
-                            for field in &["file_path", "filePath", "path", "pattern", "file"] {
-                                if let Some(val) = obj.get(*field).and_then(|v| v.as_str()) {
-                                    if !val.is_empty() {
-                                        let fname = Path::new(val)
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or(val)
-                                            .to_string();
-                                        if !files.contains(&fname) {
-                                            files.push(fname);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let command = if normalized == "Bash" {
-                            input
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        } else {
-                            None
-                        };
-                        let file = input
-                            .get("file_path")
-                            .or_else(|| input.get("filePath"))
-                            .or_else(|| input.get("path"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| {
-                                Path::new(s)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(s)
-                                    .to_string()
-                            });
-
-                        tools.push(ToolUse {
-                            name: normalized.to_string(),
-                            is_error: is_err,
-                            file,
-                            command,
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        position += 1;
-        files.truncate(5);
-
-        // Collect errors from tools with is_error
-        let errors: Vec<Value> = tools
-            .iter()
-            .filter(|t| t.is_error)
-            .map(|t| json!({"tool": t.name, "content": ""}))
-            .collect();
-        let ended_on_error = tools.last().map(|t| t.is_error).unwrap_or(false);
-        let action =
-            finalize_action_text(&action_parts.join("\n"), &tools, &errors, ended_on_error);
-
-        exchanges.push(Exchange {
-            position,
-            user: user_text,
-            action,
-            files,
-            timestamp,
-            tools,
-            edits: Vec::new(),
-            errors,
-            ended_on_error,
-        });
-    }
-
-    // Apply last N
-    if exchanges.len() > last {
-        let skip = exchanges.len() - last;
-        exchanges = exchanges.into_iter().skip(skip).collect();
-    }
-
-    Ok(exchanges)
 }
 
-/// Read file to string with lossy UTF-8 conversion (handles binary/corrupted files).
-fn read_file_lossy(path: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("Cannot read transcript: {e}"))?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+/// Find a device-suffixed instance name ("dami:KEZE") matching a bare base
+/// name ("dami") that has no exact/tag/stopped match of its own. Relay pull
+/// always namespaces remote instances with a device suffix (see
+/// `relay::add_device_suffix`), so a bare name typed by the user never
+/// matches those rows directly — only this prefix lookup does. Without it,
+/// callers fall through to a plain-name DB lookup, which still succeeds via
+/// a looser `LIKE` prefix match and returns the remote device's transcript
+/// path as if it were a local file.
+fn resolve_remote_instance_name(db: &HcomDb, base_name: &str) -> Option<String> {
+    db.conn()
+        .query_row(
+            "SELECT name FROM instances WHERE name LIKE ?1 ESCAPE '\\' ORDER BY status_time DESC LIMIT 1",
+            rusqlite::params![format!(
+                "{}:____",
+                base_name.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            )],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
 }
 
-fn should_retry_codex_transcript(exchanges: &[Exchange]) -> bool {
-    exchanges
-        .last()
-        .map(|ex| is_no_response_action(&ex.action))
-        .unwrap_or(false)
-}
-
-fn retry_codex_transcript(
-    path: &Path,
-    last: usize,
-    detailed: bool,
-    mut exchanges: Vec<Exchange>,
-) -> Result<Vec<Exchange>, String> {
-    for _ in 0..4 {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let retried = parse_codex_jsonl(path, last, detailed)?;
-        if !should_retry_codex_transcript(&retried) {
-            return Ok(retried);
-        }
-        if retried.len() > exchanges.len() {
-            exchanges = retried;
-        }
-    }
-    Ok(exchanges)
-}
-
-/// Get exchanges from a transcript file.
+/// Get exchanges from a transcript file using the shared transcript module.
 fn get_exchanges(
     path: &str,
     agent: &str,
@@ -1787,134 +310,14 @@ fn get_exchanges(
     session_id: Option<&str>,
     retry_codex: bool,
 ) -> Result<Vec<Exchange>, String> {
-    let p = Path::new(path);
-    if !p.exists() {
-        return Err(format!("Transcript not found: {path}"));
-    }
-
-    let mut exchanges = match agent {
-        "claude" => parse_claude_jsonl(p, last, detailed),
-        "gemini" => parse_gemini_json(p, last),
-        "codex" => parse_codex_jsonl(p, last, detailed),
-        "opencode" => {
-            let sid = session_id.unwrap_or("");
-            if sid.is_empty() {
-                return Err("OpenCode transcript requires a session_id".to_string());
-            }
-            parse_opencode_sqlite(p, sid, last)
-        }
-        _ => {
-            // Try to detect from extension/path
-            if path.ends_with(".json") {
-                parse_gemini_json(p, last)
-            } else if path.ends_with(".db") {
-                let sid = session_id.unwrap_or("");
-                if sid.is_empty() {
-                    return Err("SQLite transcript requires a session_id".to_string());
-                }
-                parse_opencode_sqlite(p, sid, last)
-            } else {
-                parse_claude_jsonl(p, last, detailed)
-            }
-        }
-    }?;
-
-    if agent == "codex" && retry_codex && should_retry_codex_transcript(&exchanges) {
-        // Codex rollout JSONL can briefly contain the user turn before the
-        // assistant text for that same turn lands. Local transcript reads do a
-        // short retry; RPC handlers opt out so they do not block the relay
-        // reader thread.
-        exchanges = retry_codex_transcript(p, last, detailed, exchanges)?;
-    }
-
-    Ok(exchanges)
-}
-
-// ── Formatting ───────────────────────────────────────────────────────────
-
-/// Format exchanges for display
-fn format_exchanges(exchanges: &[Exchange], _instance: &str, full: bool, detailed: bool) -> String {
-    let mut lines = Vec::new();
-
-    for ex in exchanges {
-        let user_text = if full || ex.user.len() <= 300 {
-            ex.user.clone()
-        } else {
-            format!("{}...", truncate_str(&ex.user, 297))
-        };
-
-        let action_text = if full {
-            ex.action.clone()
-        } else {
-            summarize_action(&ex.action)
-        };
-
-        lines.push(format!("[{}] USER: {}", ex.position, user_text));
-        lines.push(format!("ASSISTANT: {}", action_text));
-
-        if !ex.files.is_empty() {
-            lines.push(format!("FILES: {}", ex.files.join(", ")));
-        }
-
-        if detailed && !ex.tools.is_empty() {
-            for tool in &ex.tools {
-                let marker = if tool.is_error { "  ✗" } else { "  ├─" };
-                let detail = tool
-                    .file
-                    .as_deref()
-                    .or(tool.command.as_deref())
-                    .unwrap_or("");
-                lines.push(format!("{marker} {} {detail}", tool.name));
-            }
-        }
-
-        lines.push(String::new()); // blank line between exchanges
-    }
-
-    // Trailing hint
-    if !exchanges.is_empty() {
-        if !full {
-            lines.push("Note: Output truncated. Use --full for full text.".to_string());
-        } else {
-            lines.push(
-                "Note: Tool outputs & file edits hidden. Use --detailed for full details."
-                    .to_string(),
-            );
-        }
-    }
-
-    lines.join("\n")
-}
-
-/// Summarize action text (first 3 lines, strip prefixes).
-fn summarize_action(text: &str) -> String {
-    if text.is_empty() {
-        return "(no response)".to_string();
-    }
-    let mut lines: Vec<String> = text
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .take(3)
-        .collect();
-    if lines.is_empty() {
-        return "(no response)".to_string();
-    }
-    // Strip common prefixes
-    for prefix in &["I'll ", "I will ", "Let me ", "Sure, ", "Okay, ", "OK, "] {
-        if lines[0].starts_with(prefix) {
-            lines[0] = lines[0][prefix.len()..].to_string();
-            break;
-        }
-    }
-    let summary = lines.join(" ");
-    if summary.len() > 200 {
-        format!("{}...", truncate_str(&summary, 197))
-    } else if text.lines().filter(|l| !l.trim().is_empty()).count() > 3 {
-        format!("{summary} ...")
-    } else {
-        summary
-    }
+    let backend = transcript::backend_from_agent_or_path(agent, path)?;
+    let opts = ReadOptions {
+        last,
+        detailed,
+        session_id: session_id.map(|s| s.to_string()),
+        allow_codex_retry: retry_codex,
+    };
+    transcript::read(Path::new(path), backend, &opts)
 }
 
 // ── Search ───────────────────────────────────────────────────────────────
@@ -1937,19 +340,17 @@ fn correlate_paths_to_hcom(
         "SELECT name, transcript_path, session_id
          FROM instances
          WHERE transcript_path IS NOT NULL",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        }) {
-            for (name, tp, session_id) in rows.flatten() {
-                let key = transcript_search_key(&tp, session_id.as_deref());
-                if target_keys.contains(&key) {
-                    result.insert(key, name);
-                }
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    }) {
+        for (name, tp, session_id) in rows.flatten() {
+            let key = transcript_search_key(&tp, session_id.as_deref());
+            if target_keys.contains(&key) {
+                result.insert(key, name);
             }
         }
     }
@@ -1963,19 +364,17 @@ fn correlate_paths_to_hcom(
          AND json_extract(data, '$.action') = 'stopped' \
          AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL \
          ORDER BY id DESC",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        }) {
-            for (name, tp, session_id) in rows.flatten() {
-                let key = transcript_search_key(&tp, session_id.as_deref());
-                if target_keys.contains(&key) && !result.contains_key(&key) {
-                    result.insert(key, name);
-                }
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    }) {
+        for (name, tp, session_id) in rows.flatten() {
+            let key = transcript_search_key(&tp, session_id.as_deref());
+            if target_keys.contains(&key) && !result.contains_key(&key) {
+                result.insert(key, name);
             }
         }
     }
@@ -1993,7 +392,16 @@ fn cmd_transcript_search(
     let all_mode = args.all;
     let json_mode = args.json;
     let limit = args.limit;
-    let agent_filter = args.agent.as_ref();
+    let agent_filter = match args.agent.as_deref() {
+        Some(value) => match transcript::parse_tool_filter(value) {
+            Ok(tool) => Some(tool),
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return 1;
+            }
+        },
+        None => None,
+    };
 
     // Resolve self name for --exclude-self
     let ctx_name = if args.exclude_self {
@@ -2011,71 +419,94 @@ fn cmd_transcript_search(
     let mut seen = std::collections::HashSet::new();
 
     if all_mode {
-        // --all: search disk-wide directories (not just hcom-tracked instances)
+        // --all: derive file roots and database sources from canonical tools.
+        let selected_tools = agent_filter
+            .map(|tool| vec![tool])
+            .unwrap_or_else(transcript::transcript_tools);
         let mut search_dirs: Vec<PathBuf> = Vec::new();
-        let agent_filter = agent_filter.map(|s| s.as_str());
-        let opencode_db = if transcript_agent_matches(agent_filter, "opencode") {
-            get_opencode_db_path()
-        } else {
-            None
-        };
+        // Remember which tool each search root belongs to so matches found under
+        // an override root with no content signature (e.g. pi's bare
+        // `<uuid>.jsonl` under a custom PI_CODING_AGENT_SESSION_DIR) can still be
+        // attributed. A path can map to more than one tool — gemini and
+        // antigravity share `~/.gemini` — which `attribute_disk_match` treats as
+        // ambiguous and defers to content detection.
+        let mut root_owners: Vec<(PathBuf, Tool)> = Vec::new();
+        for tool in &selected_tools {
+            for path in transcript::disk_search_roots(*tool) {
+                if path.exists() {
+                    if !search_dirs.contains(&path) {
+                        search_dirs.push(path.clone());
+                    }
+                    root_owners.push((path, *tool));
+                }
+            }
+        }
+        let database_sources: Vec<(Tool, PathBuf)> = selected_tools
+            .iter()
+            .filter_map(|tool| transcript::database_search_path(*tool).map(|path| (*tool, path)))
+            .collect();
 
-        if transcript_agent_matches(agent_filter, "claude") {
-            let p = claude_config_dir().join("projects");
-            if p.exists() {
-                search_dirs.push(p);
-            }
-        }
-        if transcript_agent_matches(agent_filter, "gemini") {
-            let home = dirs::home_dir().unwrap_or_default();
-            let p = home.join(".gemini");
-            if p.exists() {
-                search_dirs.push(p);
-            }
-        }
-        if transcript_agent_matches(agent_filter, "codex") {
-            let home = dirs::home_dir().unwrap_or_default();
-            let p = home.join(".codex").join("sessions");
-            if p.exists() {
-                search_dirs.push(p);
-            }
-        }
-
-        if search_dirs.is_empty() && opencode_db.is_none() {
-            println!("No transcript directories found on disk.");
+        if search_dirs.is_empty() && database_sources.is_empty() {
+            println!("No transcript directories or databases found on disk.");
             return 0;
         }
 
-        // Phase 1: find matching files with rg -l (recursive, *.jsonl/*.json)
-        let mut cmd = std::process::Command::new("rg");
-        cmd.args(["-l", "--glob", "*.jsonl", "--glob", "*.json", pattern]);
-        for d in &search_dirs {
-            cmd.arg(d);
-        }
-        let output = cmd.output();
-        let matching_files: Vec<String> = match output {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect(),
-            _ => Vec::new(),
-        };
-
-        let opencode_matches = opencode_db
-            .as_deref()
-            .map(|db_path| search_opencode_sessions(db_path, pattern, limit))
-            .transpose();
-        let opencode_matches = match opencode_matches {
-            Ok(Some(matches)) => matches,
-            Ok(None) => Vec::new(),
-            Err(err) => {
-                eprintln!("Error: {err}");
-                return 1;
+        // Phase 1: find matching files with rg -l (recursive, *.jsonl/*.json).
+        // Avoid invoking rg without a path when only SQLite sources exist; that
+        // would make it read stdin and potentially block an interactive command.
+        let matching_files: Vec<String> = if search_dirs.is_empty() {
+            Vec::new()
+        } else {
+            let mut cmd = std::process::Command::new("rg");
+            cmd.args(["-l", "--glob", "*.jsonl", "--glob", "*.json", pattern]);
+            for d in &search_dirs {
+                cmd.arg(d);
+            }
+            match cmd.output() {
+                Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                Ok(out) if out.status.code() == Some(1) => Vec::new(),
+                Ok(out) => {
+                    eprintln!(
+                        "Error: ripgrep failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                    return 1;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("Error: transcript search --all requires `rg` (ripgrep) on PATH");
+                    return 1;
+                }
+                Err(err) => {
+                    eprintln!("Error: could not run `rg`: {err}");
+                    return 1;
+                }
             }
         };
 
-        if matching_files.is_empty() && opencode_matches.is_empty() {
+        let mut database_matches = Vec::new();
+        for (tool, db_path) in &database_sources {
+            if database_matches.len() >= limit {
+                break;
+            }
+            match transcript::search_database_sessions(
+                *tool,
+                db_path,
+                pattern,
+                limit - database_matches.len(),
+            ) {
+                Ok(matches) => database_matches.extend(matches),
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return 1;
+                }
+            }
+        }
+
+        if matching_files.is_empty() && database_matches.is_empty() {
             if json_mode {
                 println!("{}", json!({"count": 0, "results": [], "scope": "all"}));
             } else {
@@ -2091,7 +522,7 @@ fn cmd_transcript_search(
             .map(|path| (path, None))
             .collect();
         targets.extend(
-            opencode_matches
+            database_matches
                 .iter()
                 .filter_map(|m| m.session_id.clone().map(|sid| (m.path.clone(), Some(sid)))),
         );
@@ -2103,46 +534,44 @@ fn cmd_transcript_search(
             if results.len() >= limit {
                 break;
             }
-            let agent = detect_agent_type(file_path);
-            if let Some(af) = agent_filter {
-                if !agent.contains(af) {
-                    continue;
-                }
-            }
+            let Some(detected_tool) =
+                attribute_disk_match(file_path, &selected_tools, &root_owners)
+            else {
+                continue;
+            };
+            let agent = detected_tool.as_str();
             let hcom_name = path_to_hcom
                 .get(&transcript_search_key(file_path, None))
                 .cloned()
                 .unwrap_or_default();
 
             let remaining = limit - results.len();
-            let out = std::process::Command::new("rg")
-                .args([
+            let max_count = remaining.to_string();
+            let out = match run_search_tool(
+                "rg",
+                &[
                     "-n",
+                    "--column",
                     "--max-count",
-                    &remaining.to_string(),
-                    "--max-columns",
-                    "500",
+                    &max_count,
                     pattern,
                     file_path,
-                ])
-                .output();
-            if let Ok(out) = out {
-                if out.status.success() {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let lines: Vec<&str> = stdout.lines().collect();
-                    let match_count = lines.len();
-                    if match_count > 0 {
-                        let first_line = lines[0];
-                        let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
-                            let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
-                            let text = &first_line[colon_pos + 1..];
-                            let text = truncate_str(text, 100);
-                            (num, text.to_string())
-                        } else {
-                            (0, first_line.to_string())
-                        };
+                ],
+            ) {
+                Ok(output) => output,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return 1;
+                }
+            };
+            if let Some(out) = out {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let lines: Vec<&str> = stdout.lines().collect();
+                let match_count = lines.len();
+                if match_count > 0 {
+                    let (line_num, snippet) = parse_match_line(lines[0], true, pattern);
 
-                        results.push(json!({
+                    results.push(json!({
                             "hcom_name": if hcom_name.is_empty() { serde_json::Value::Null } else { json!(hcom_name) },
                             "agent": agent,
                             "path": file_path,
@@ -2150,84 +579,79 @@ fn cmd_transcript_search(
                             "text": snippet,
                             "matches": match_count,
                         }));
-                    }
                 }
             }
         }
 
-        for opencode_match in &opencode_matches {
+        for database_match in &database_matches {
             if results.len() >= limit {
                 break;
             }
             let hcom_name = path_to_hcom
                 .get(&transcript_search_key(
-                    &opencode_match.path,
-                    opencode_match.session_id.as_deref(),
+                    &database_match.path,
+                    database_match.session_id.as_deref(),
                 ))
                 .cloned()
                 .unwrap_or_default();
             results.push(json!({
                 "hcom_name": if hcom_name.is_empty() { serde_json::Value::Null } else { json!(hcom_name) },
-                "agent": opencode_match.agent,
-                "path": opencode_match.path,
-                "line": opencode_match.line,
-                "text": opencode_match.text,
-                "matches": opencode_match.matches,
-                "session_id": opencode_match.session_id,
-                "label": opencode_match.label,
+                "agent": database_match.agent,
+                "path": database_match.path,
+                "line": database_match.line,
+                "text": database_match.text,
+                "matches": database_match.matches,
+                "session_id": database_match.session_id,
+                "label": database_match.label,
             }));
         }
 
-        let scope_label = "";
         if json_mode {
             println!(
                 "{}",
                 json!({"count": results.len(), "results": results, "scope": "all"})
             );
+        } else if results.is_empty() {
+            println!("No matches for \"{pattern}\"");
         } else {
-            if results.is_empty() {
-                println!("No matches for \"{pattern}\"");
-            } else {
-                let _ = scope_label;
-                println!(
-                    "Found matches in {} transcripts (all on disk):",
-                    results.len()
-                );
-                for r in &results {
-                    let path = r["path"].as_str().unwrap_or("");
-                    let agent = r["agent"].as_str().unwrap_or("?");
-                    let line = r["line"].as_u64().unwrap_or(0);
-                    let matches = r["matches"].as_u64().unwrap_or(0);
-                    let snippet = r["text"].as_str().unwrap_or("");
-                    let label = r["label"].as_str().unwrap_or("");
-                    let session_id = r["session_id"].as_str().unwrap_or("");
-                    let short_path = path
-                        .split('/')
-                        .rev()
-                        .take(3)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    let name_part = r["hcom_name"]
-                        .as_str()
-                        .map(|n| format!(" ({n})"))
-                        .unwrap_or_default();
-                    println!("  [{agent}]{name_part} .../{short_path}:{line}  ({matches} matches)");
-                    if !label.is_empty() || !session_id.is_empty() {
-                        let mut details = Vec::new();
-                        if !label.is_empty() {
-                            details.push(label.to_string());
-                        }
-                        if !session_id.is_empty() {
-                            details.push(session_id.to_string());
-                        }
-                        println!("    {}", details.join(" | "));
+            println!(
+                "Found matches in {} transcripts (all on disk):",
+                results.len()
+            );
+            for r in &results {
+                let path = r["path"].as_str().unwrap_or("");
+                let agent = r["agent"].as_str().unwrap_or("?");
+                let line = r["line"].as_u64().unwrap_or(0);
+                let matches = r["matches"].as_u64().unwrap_or(0);
+                let snippet = r["text"].as_str().unwrap_or("");
+                let label = r["label"].as_str().unwrap_or("");
+                let session_id = r["session_id"].as_str().unwrap_or("");
+                let short_path = path
+                    .split('/')
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let name_part = r["hcom_name"]
+                    .as_str()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default();
+                println!("  [{agent}]{name_part} .../{short_path}:{line}  ({matches} matches)");
+                if !label.is_empty() || !session_id.is_empty() {
+                    let mut details = Vec::new();
+                    if !label.is_empty() {
+                        details.push(label.to_string());
                     }
-                    if !snippet.is_empty() {
-                        println!("    {snippet}");
+                    if !session_id.is_empty() {
+                        details.push(session_id.to_string());
                     }
+                    println!("    {}", details.join(" | "));
+                }
+                if !snippet.is_empty() {
+                    println!("    {snippet}");
                 }
             }
         }
@@ -2236,8 +660,8 @@ fn cmd_transcript_search(
         // Active instances
         if let Ok(mut stmt) = db.conn().prepare(
             "SELECT name, transcript_path, tool FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
-        ) {
-            if let Ok(rows) = stmt.query_map([], |row| {
+        )
+            && let Ok(rows) = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -2245,22 +669,23 @@ fn cmd_transcript_search(
                 ))
             }) {
                 for (name, path, tool) in rows.flatten() {
-                    if let Some(agent) = agent_filter {
-                        if !tool.contains(agent.as_str()) { continue; }
+                    if let Some(filter_tool) = agent_filter
+                        && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
+                    {
+                        continue;
                     }
                     if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                     seen.insert(name.clone());
                     paths.push((name, path, tool));
                 }
             }
-        }
 
         // Stopped instances from life event snapshots (C2/C3 fix)
-        if !live_mode {
-            if let Ok(mut stmt) = db.conn().prepare(
+        if !live_mode
+            && let Ok(mut stmt) = db.conn().prepare(
                 "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
-            ) {
-                if let Ok(rows) = stmt.query_map([], |row| {
+            )
+                && let Ok(rows) = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -2269,16 +694,16 @@ fn cmd_transcript_search(
                 }) {
                     for (name, path, tool) in rows.flatten() {
                         if seen.contains(&name) { continue; }
-                        if let Some(agent) = agent_filter {
-                            if !tool.contains(agent.as_str()) { continue; }
+                        if let Some(filter_tool) = agent_filter
+                            && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
+                        {
+                            continue;
                         }
                         if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                         seen.insert(name.clone());
                         paths.push((name, path, tool));
                     }
                 }
-            }
-        }
     }
 
     // Search using ripgrep (with line-level matches + snippets) — hcom-tracked/live paths
@@ -2288,51 +713,53 @@ fn cmd_transcript_search(
             continue;
         }
 
-        // Use rg for line-level matches with context
+        // Use rg for line-level matches with context. `--column` gives us the
+        // match offset so the snippet can be centered on the hit; the grep
+        // fallback has no column, so parse_match_line locates the pattern itself.
         let remaining = limit - results.len();
-        let output = std::process::Command::new("rg")
-            .args([
-                "-n",
-                "--max-count",
-                &remaining.to_string(),
-                "--max-columns",
-                "500",
-                pattern,
-                path,
-            ])
-            .output()
-            .or_else(|_| {
-                std::process::Command::new("grep")
-                    .args(["-n", "-m", &remaining.to_string(), pattern, path])
-                    .output()
-            });
+        let max_count = remaining.to_string();
+        let mut has_column = true;
+        let output = match run_search_tool(
+            "rg",
+            &["-n", "--column", "--max-count", &max_count, pattern, path],
+        ) {
+            Ok(output) => Ok(output),
+            Err(rg_err) if rg_err.contains("was not found on PATH") => {
+                has_column = false;
+                run_search_tool("grep", &["-n", "-m", &max_count, pattern, path]).map_err(
+                    |grep_err| {
+                        format!(
+                            "transcript search requires `rg` or `grep` on PATH ({rg_err}; {grep_err})"
+                        )
+                    },
+                )
+            }
+            Err(err) => Err(err),
+        };
 
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let lines: Vec<&str> = stdout.lines().collect();
-                let match_count = lines.len();
-                if match_count > 0 {
-                    // Extract first match line number and snippet
-                    let first_line = lines[0];
-                    let (line_num, snippet) = if let Some(colon_pos) = first_line.find(':') {
-                        let num = first_line[..colon_pos].parse::<usize>().unwrap_or(0);
-                        let text = &first_line[colon_pos + 1..];
-                        let text = truncate_str(text, 100);
-                        (num, text.to_string())
-                    } else {
-                        (0, first_line.to_string())
-                    };
+        let output = match output {
+            Ok(output) => output,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                return 1;
+            }
+        };
 
-                    results.push(json!({
-                        "hcom_name": name,
-                        "agent": agent,
-                        "path": path,
-                        "line": line_num,
-                        "text": snippet,
-                        "matches": match_count,
-                    }));
-                }
+        if let Some(out) = output {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = stdout.lines().collect();
+            let match_count = lines.len();
+            if match_count > 0 {
+                let (line_num, snippet) = parse_match_line(lines[0], has_column, pattern);
+
+                results.push(json!({
+                    "hcom_name": name,
+                    "agent": agent,
+                    "path": path,
+                    "line": line_num,
+                    "text": snippet,
+                    "matches": match_count,
+                }));
             }
         }
 
@@ -2390,13 +817,10 @@ fn cmd_transcript_search(
             };
 
             println!("[{agent}:{hcom_name}] {path_display}:{line}");
+            // Snippet is already bounded and centered on the match by
+            // parse_match_line; just flatten newlines for single-line display.
             let snippet_clean = snippet.replace('\n', " ");
-            let snippet_short = if snippet_clean.len() > 100 {
-                format!("{}...", truncate_str(&snippet_clean, 100))
-            } else {
-                snippet_clean
-            };
-            println!("    {snippet_short}\n");
+            println!("    {snippet_clean}\n");
         }
     }
 
@@ -2417,8 +841,8 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
     // Active instances
     if let Ok(mut stmt) = db.conn().prepare(
         "SELECT name, transcript_path, tool, session_id FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -2444,13 +868,12 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
                 }
             }
         }
-    }
 
     // Stopped instances from life event snapshots
     if let Ok(mut stmt) = db.conn().prepare(
         "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    )
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -2477,7 +900,6 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
                 }
             }
         }
-    }
 
     // Sort by timestamp (most recent first)
     all_entries.sort_by(|a, b| {
@@ -2494,7 +916,7 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
     if json_mode {
         println!(
             "{}",
-            serde_json::to_string_pretty(&all_entries).unwrap_or_default()
+            serde_json::to_string(&all_entries).unwrap_or_default()
         );
         return 0;
     }
@@ -2590,7 +1012,8 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
 
     if let Some(ref name) = args.name {
         let stripped = name.strip_prefix('@').unwrap_or(name);
-        let resolved = crate::instances::resolve_display_name_or_stopped(db, stripped)
+        let resolved = crate::identity::resolve_display_name_or_stopped(db, stripped)
+            .or_else(|| resolve_remote_instance_name(db, stripped))
             .unwrap_or_else(|| stripped.to_string());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
             return crate::relay::control::dispatch_remote_and_print(
@@ -2600,6 +1023,8 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
                 crate::relay::control::rpc_action::TRANSCRIPT,
                 &json!({
                     "target": base_name,
+                    "display_target": resolved,
+                    "origin_device": device,
                     "last": last_n,
                     "range": args.range_flag.as_ref().or(args.range_positional.as_ref()),
                     "json": json_mode,
@@ -2631,10 +1056,10 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         }
     }
 
-    if let Some(ref range_pos) = args.range_positional {
-        if range_str.is_none() {
-            range_str = Some(range_pos.clone());
-        }
+    if let Some(ref range_pos) = args.range_positional
+        && range_str.is_none()
+    {
+        range_str = Some(range_pos.clone());
     }
 
     // Resolve target to transcript path
@@ -2644,7 +1069,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         match resolved {
             Some(r) => r,
             None => {
-                eprintln!("Error: {}", no_transcript_error(db, name));
+                eprintln!("Error: {}", no_transcript_error(db, name, name, None));
                 return 1;
             }
         }
@@ -2701,6 +1126,14 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         exchanges.iter().collect()
     };
 
+    // Checked before output-mode branching so --json callers see the same error.
+    if filtered.is_empty()
+        && let Some(msg) = range_miss_message(&exchanges, range_start, range_end)
+    {
+        eprintln!("Error: {msg}");
+        return 1;
+    }
+
     if json_mode {
         let json_output: Vec<Value> = filtered
             .iter()
@@ -2740,7 +1173,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json_output).unwrap_or_default()
+            serde_json::to_string(&json_output).unwrap_or_default()
         );
         return 0;
     }
@@ -2804,6 +1237,8 @@ pub fn render_instance_transcript(
             last_n,
             ..Default::default()
         },
+        name,
+        None,
     )
 }
 
@@ -2827,7 +1262,21 @@ pub fn render_instance_transcript_with_options_no_retry(
             detailed,
             retry_codex: false,
         },
+        name,
+        None,
     )
+}
+
+/// Render a remote transcript while retaining the caller's device-qualified
+/// name in diagnostics.
+pub fn render_remote_instance_transcript_with_options_no_retry(
+    db: &HcomDb,
+    name: &str,
+    display_name: &str,
+    device: &str,
+    opts: &TranscriptRenderOpts<'_>,
+) -> Result<String, String> {
+    render_instance_transcript_impl(db, name, opts, display_name, Some(device))
 }
 
 pub fn render_instance_transcript_with_options(
@@ -2850,6 +1299,8 @@ pub fn render_instance_transcript_with_options(
             detailed,
             retry_codex: true,
         },
+        name,
+        None,
     )
 }
 
@@ -2857,9 +1308,12 @@ fn render_instance_transcript_impl(
     db: &HcomDb,
     name: &str,
     opts: &TranscriptRenderOpts<'_>,
+    display_name: &str,
+    device: Option<&str>,
 ) -> Result<String, String> {
     let (instance_name, transcript_path, agent_type, session_id) =
-        resolve_instance_transcript(db, name).ok_or_else(|| no_transcript_error(db, name))?;
+        resolve_instance_transcript(db, name)
+            .ok_or_else(|| no_transcript_error(db, name, display_name, device))?;
     let (range_start, range_end) = if let Some(r) = opts.range {
         parse_range(r)
     } else {
@@ -2889,6 +1343,12 @@ fn render_instance_transcript_impl(
     } else {
         exchanges.iter().collect()
     };
+
+    if filtered.is_empty()
+        && let Some(msg) = range_miss_message(&exchanges, range_start, range_end)
+    {
+        return Err(msg);
+    }
 
     if opts.json_mode {
         let json_output: Vec<Value> = filtered
@@ -2927,7 +1387,7 @@ fn render_instance_transcript_impl(
                 obj
             })
             .collect();
-        return serde_json::to_string_pretty(&json_output).map_err(|e| e.to_string());
+        return serde_json::to_string(&json_output).map_err(|e| e.to_string());
     }
 
     if filtered.is_empty() {
@@ -2954,39 +1414,61 @@ fn resolve_instance_transcript(
     db: &HcomDb,
     name: &str,
 ) -> Option<(String, String, String, Option<String>)> {
-    let name = crate::instances::resolve_display_name_or_stopped(db, name)
-        .unwrap_or_else(|| name.to_string());
+    // An exact live or stopped identity is authoritative even when it has no
+    // transcript. Only infer a prefix when no exact identity exists; otherwise
+    // a transcript-bearing longer name can disclose the wrong conversation.
+    if let Some(exact_name) = crate::identity::resolve_display_name_or_stopped(db, name) {
+        match db.get_instance_full(&exact_name) {
+            Ok(Some(instance)) if !instance.transcript_path.is_empty() => {
+                return Some((
+                    exact_name,
+                    instance.transcript_path,
+                    instance.tool,
+                    instance.session_id,
+                ));
+            }
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {}
+        }
 
-    // Direct match
-    if let Some(path) = get_transcript_path(db, &name) {
-        let (tool, sid) = db
-            .conn()
-            .query_row(
-                "SELECT tool, session_id FROM instances WHERE name = ?",
-                rusqlite::params![&name],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .unwrap_or_else(|_| (detect_agent_type(&path).to_string(), None));
-        return Some((name, path, tool, sid));
+        if let Ok((path, sid)) = db.conn().query_row(
+            "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
+            rusqlite::params![&exact_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        ) {
+            let agent = detect_agent_type(&path).to_string();
+            return Some((exact_name, path, agent, sid));
+        }
+
+        return None;
     }
 
-    // Prefix match
-    if let Ok((matched_name, path, tool, sid)) = db.conn().query_row(
-        "SELECT name, transcript_path, tool, session_id FROM instances WHERE name LIKE ? AND transcript_path IS NOT NULL AND transcript_path != '' LIMIT 1",
-        rusqlite::params![format!("{}%", name)],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)),
-    ) {
-        return Some((matched_name, path, tool, sid));
-    }
+    // Prefix match (literal matching; only an unambiguous single match returns immediately)
+    let escaped = name
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
 
-    // Check stopped events (session_id from snapshot)
-    if let Ok((path, sid)) = db.conn().query_row(
-        "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
-        rusqlite::params![&name],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    if let Ok(mut stmt) = db.conn().prepare(
+        "SELECT name, transcript_path, tool, session_id FROM instances WHERE name LIKE ?1 ESCAPE '\\' AND transcript_path IS NOT NULL AND transcript_path != '' LIMIT 2",
     ) {
-        let agent = detect_agent_type(&path).to_string();
-        return Some((name, path, agent, sid));
+        let rows_res = stmt
+            .query_map(rusqlite::params![pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .and_then(|mapped| mapped.collect::<rusqlite::Result<Vec<_>>>());
+
+        if let Ok(matches) = rows_res
+            && matches.len() == 1
+        {
+            return Some(matches.into_iter().next().unwrap());
+        }
     }
 
     None
@@ -2998,11 +1480,11 @@ fn parse_range(s: &str) -> (Option<usize>, Option<usize>) {
         let start: Option<usize> = s[..dash_pos].parse().ok().filter(|&v: &usize| v >= 1);
         let end: Option<usize> = s[dash_pos + 1..].parse().ok().filter(|&v: &usize| v >= 1);
         // Validate start <= end
-        if let (Some(s), Some(e)) = (start, end) {
-            if s > e {
-                eprintln!("Error: invalid range '{s}-{e}' (start must be <= end)");
-                return (None, None);
-            }
+        if let (Some(s), Some(e)) = (start, end)
+            && s > e
+        {
+            eprintln!("Error: invalid range '{s}-{e}' (start must be <= end)");
+            return (None, None);
         }
         (start, end)
     } else {
@@ -3011,49 +1493,13 @@ fn parse_range(s: &str) -> (Option<usize>, Option<usize>) {
     }
 }
 
-// ── Public API for other commands (bundle) ──────────────────────────────
-
-/// Options for querying and formatting transcript exchanges.
-pub struct TranscriptQuery<'a> {
-    pub path: &'a str,
-    pub agent: &'a str,
-    pub last: usize,
-    pub detailed: bool,
-    pub session_id: Option<&'a str>,
-}
-
-/// Public wrapper for get_exchanges (used by bundle prepare/cat).
-pub fn get_exchanges_pub(q: &TranscriptQuery) -> Result<Vec<Value>, String> {
-    let exchanges = get_exchanges(q.path, q.agent, q.last, q.detailed, q.session_id, true)?;
-    Ok(exchanges
-        .iter()
-        .map(|ex| {
-            json!({
-                "position": ex.position,
-                "user": ex.user,
-                "action": ex.action,
-                "files": ex.files,
-                "timestamp": ex.timestamp,
-            })
-        })
-        .collect())
-}
-
-/// Public wrapper for format_exchanges (used by bundle cat).
-pub fn format_exchanges_pub(
-    q: &TranscriptQuery,
-    instance: &str,
-    full: bool,
-) -> Result<String, String> {
-    let exchanges = get_exchanges(q.path, q.agent, q.last, q.detailed, q.session_id, true)?;
-    Ok(format_exchanges(&exchanges, instance, full, q.detailed))
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::ToolUse;
+    use crate::transcript::shared::finalize_action_text;
     use std::fs;
 
     fn test_db() -> HcomDb {
@@ -3066,17 +1512,42 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_tool_name() {
-        assert_eq!(normalize_tool_name("run_shell_command"), "Bash");
-        assert_eq!(normalize_tool_name("read_file"), "Read");
-        assert_eq!(normalize_tool_name("write_file"), "Write");
-        assert_eq!(normalize_tool_name("edit_file"), "Edit");
-        assert_eq!(normalize_tool_name("search_files"), "Grep");
-        assert_eq!(normalize_tool_name("replace"), "Edit");
-        assert_eq!(normalize_tool_name("grep_search"), "Grep");
-        assert_eq!(normalize_tool_name("read_many_files"), "Read");
-        assert_eq!(normalize_tool_name("list_directory"), "Glob");
-        assert_eq!(normalize_tool_name("Bash"), "Bash"); // Already canonical
+    fn known_agent_without_transcript_points_to_transport_history() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+             VALUES ('pita', 100.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        let error = no_transcript_error(&db, "pita", "pita", None);
+        assert_eq!(
+            error,
+            "No model transcript is registered for pita.\n\
+View transport messages with: hcom events --participant pita --type message"
+        );
+        assert!(!error.contains("no messages have been exchanged"));
+    }
+
+    #[test]
+    fn remote_agent_without_transcript_queries_its_origin_device() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+                 VALUES ('pita', 100.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        let error = no_transcript_error(&db, "pita", "pita:ABCD", Some("ABCD"));
+        assert_eq!(
+            error,
+            "No model transcript is registered for pita:ABCD.\n\
+View transport messages with: hcom events --remote-fetch --device ABCD --participant pita --type message"
+        );
     }
 
     #[test]
@@ -3084,6 +1555,64 @@ mod tests {
         assert_eq!(parse_range("5"), (Some(5), Some(5)));
         assert_eq!(parse_range("3-10"), (Some(3), Some(10)));
         assert_eq!(parse_range("abc"), (None, None));
+    }
+
+    #[test]
+    fn test_centered_snippet_shows_match_deep_in_long_line() {
+        // A whole-JSON transcript line: the match sits far past the start, where
+        // start-anchored truncation would never reach it.
+        let prefix = "{\"parentUuid\":null,".repeat(40); // long metadata head
+        let line = format!("{prefix}\"text\":\"NEEDLE here\"}}");
+        let col = line.find("NEEDLE").unwrap() + 1; // rg is 1-based
+        let snip = centered_snippet(&line, col, SEARCH_SNIPPET_WIDTH);
+        assert!(snip.contains("NEEDLE"), "match must be visible: {snip}");
+        assert!(snip.starts_with('…'), "elided head marked: {snip}");
+        assert!(snip.len() <= SEARCH_SNIPPET_WIDTH + 8); // window + ellipses/trim slack
+    }
+
+    #[test]
+    fn test_centered_snippet_short_line_returned_whole() {
+        let line = "{\"text\":\"hi ping there\"}";
+        let col = line.find("ping").unwrap() + 1;
+        let snip = centered_snippet(line, col, SEARCH_SNIPPET_WIDTH);
+        assert_eq!(snip, line, "short line kept intact, no ellipsis");
+    }
+
+    #[test]
+    fn test_centered_snippet_multibyte_safe() {
+        // Match adjacent to multi-byte chars; slicing must not panic and must
+        // stay on char boundaries.
+        let line = format!("{}émoji→NEEDLE←café{}", "🚀".repeat(60), "ü".repeat(60));
+        let col = line.find("NEEDLE").unwrap() + 1;
+        let snip = centered_snippet(&line, col, SEARCH_SNIPPET_WIDTH);
+        assert!(snip.contains("NEEDLE"));
+        assert!(std::str::from_utf8(snip.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_match_line_rg_with_column() {
+        // rg --column format: LINE:COL:TEXT — COL points at the match.
+        let head = "x".repeat(300);
+        let text = format!("{head}FINDME{head}");
+        let col = 301; // 1-based, right after the 300-char head
+        let raw = format!("44:{col}:{text}");
+        let (line, snip) = parse_match_line(&raw, true, "FINDME");
+        assert_eq!(line, 44);
+        assert!(snip.contains("FINDME"), "centered on rg column: {snip}");
+    }
+
+    #[test]
+    fn test_parse_match_line_grep_fallback_locates_pattern() {
+        // grep format: LINE:TEXT (no column) — pattern located case-insensitively.
+        let head = "y".repeat(300);
+        let text = format!("{head}findME{head}");
+        let raw = format!("7:{text}");
+        let (line, snip) = parse_match_line(&raw, false, "FINDME");
+        assert_eq!(line, 7);
+        assert!(
+            snip.contains("findME"),
+            "grep fallback centers on match: {snip}"
+        );
     }
 
     #[test]
@@ -3098,33 +1627,13 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_text_content_string() {
-        let msg = json!({"content": "hello"});
-        assert_eq!(extract_text_content(&msg), "hello");
-    }
-
-    #[test]
-    fn test_extract_text_content_blocks() {
-        let msg = json!({
-            "content": [
-                {"type": "text", "text": "hello "},
-                {"type": "text", "text": "world"},
-                {"type": "tool_result", "content": "ignored"}
-            ]
-        });
-        let result = extract_text_content(&msg);
-        assert!(result.contains("hello"));
-        assert!(result.contains("world"));
-    }
-
-    #[test]
     fn test_detect_agent_type() {
         assert_eq!(
             detect_agent_type("/home/user/.claude/projects/x/transcript.jsonl"),
             "claude"
         );
         assert_eq!(
-            detect_agent_type("/home/user/.gemini/tmp/session.json"),
+            detect_agent_type("/home/user/.gemini/tmp/project/chats/session-1-abc.json"),
             "gemini"
         );
         assert_eq!(
@@ -3135,81 +1644,128 @@ mod tests {
             detect_agent_type("/home/user/.local/share/opencode/opencode.db"),
             "opencode"
         );
+        assert_eq!(
+            detect_agent_type("/home/user/.local/share/kilo/kilo.db"),
+            "kilo"
+        );
+        assert_eq!(
+            detect_agent_type("/home/user/Library/Application Support/Antigravity/session.jsonl"),
+            "antigravity"
+        );
+        assert_eq!(
+            detect_agent_type("/home/user/.copilot/session-state/abc/events.jsonl"),
+            "copilot"
+        );
     }
 
     #[test]
-    fn test_search_opencode_sessions() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("opencode.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (id text PRIMARY KEY, title text NOT NULL);
-             CREATE TABLE part (
-                 id text PRIMARY KEY,
-                 message_id text NOT NULL,
-                 session_id text NOT NULL,
-                 time_created integer NOT NULL,
-                 time_updated integer NOT NULL,
-                 data text NOT NULL
-             );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session (id, title) VALUES (?, ?)",
-            rusqlite::params!["ses_1", "Match Session"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session (id, title) VALUES (?, ?)",
-            rusqlite::params!["ses_2", "No Match Session"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                "part_1",
-                "msg_1",
-                "ses_1",
-                1_i64,
-                1_i64,
-                json!({"type": "text", "text": "first needle hit"}).to_string()
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                "part_2",
-                "msg_2",
-                "ses_1",
-                2_i64,
-                2_i64,
-                json!({"type": "text", "text": "second needle hit"}).to_string()
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            rusqlite::params![
-                "part_3",
-                "msg_3",
-                "ses_2",
-                3_i64,
-                3_i64,
-                json!({"type": "text", "text": "plain text"}).to_string()
-            ],
-        )
-        .unwrap();
+    fn detect_agent_type_covers_released_integrations_with_transcript_parsers() {
+        let cases = [
+            ("/home/user/.claude/projects/x/transcript.jsonl", "claude"),
+            (
+                "/home/user/.gemini/tmp/project/chats/session-1-abc.json",
+                "gemini",
+            ),
+            ("/home/user/.codex/sessions/x/rollout.jsonl", "codex"),
+            ("/home/user/.local/share/opencode/opencode.db", "opencode"),
+            ("/home/user/.local/share/kilo/kilo.db", "kilo"),
+            (
+                "/home/user/Library/Application Support/Antigravity/session.jsonl",
+                "antigravity",
+            ),
+            (
+                "/home/user/.cursor/projects/x/agent-transcripts/abc/abc.jsonl",
+                "cursor",
+            ),
+            (
+                "/home/user/.kimi-code/sessions/wd_x/abc123/agents/main/wire.jsonl",
+                "kimi",
+            ),
+            (
+                "/home/user/.copilot/session-state/abc/events.jsonl",
+                "copilot",
+            ),
+            (
+                "/home/user/.grok/sessions/%2Fhome%2Fuser%2Fproj/019f-uuid/updates.jsonl",
+                "grok",
+            ),
+            ("/home/user/.pi/agent/sessions/x/20260603_abc.jsonl", "pi"),
+            ("/home/user/.omp/agent/sessions/x/20260603_abc.jsonl", "omp"),
+        ];
+        let expected: std::collections::HashSet<&str> =
+            crate::integration_spec::released_tool_names()
+                .into_iter()
+                .collect();
+        let actual: std::collections::HashSet<&str> = cases
+            .iter()
+            .map(|(path, expected_tool)| {
+                let detected = detect_agent_type(path);
+                assert_eq!(detected, *expected_tool);
+                detected
+            })
+            .collect();
 
-        let matches = search_opencode_sessions(&db_path, "needle", 10).unwrap();
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].session_id.as_deref(), Some("ses_1"));
-        assert_eq!(matches[0].label.as_deref(), Some("Match Session"));
-        assert_eq!(matches[0].matches, 2);
-        assert!(matches[0].text.contains("needle"));
+        assert_eq!(
+            actual, expected,
+            "transcript path detection cases must cover every released integration"
+        );
+    }
+
+    #[test]
+    fn attribute_disk_match_uses_provenance_for_unsignatured_pi_sessions() {
+        let pi_root = PathBuf::from("/data/pi-sessions");
+        let gem_root = PathBuf::from("/home/u/.gemini");
+        let owners = vec![
+            (pi_root.clone(), Tool::Pi),
+            // gemini and antigravity share one root — the ambiguous case.
+            (gem_root.clone(), Tool::Gemini),
+            (gem_root.clone(), Tool::Antigravity),
+        ];
+        let selected = [Tool::Pi, Tool::Gemini, Tool::Antigravity];
+
+        // A bare uuid.jsonl under a custom PI_CODING_AGENT_SESSION_DIR has no
+        // content signature, so it is attributed by provenance.
+        assert_eq!(
+            attribute_disk_match("/data/pi-sessions/abc/9f8e.jsonl", &selected, &owners),
+            Some(Tool::Pi)
+        );
+        // A signatured gemini file under the shared root resolves by content.
+        assert_eq!(
+            attribute_disk_match(
+                "/home/u/.gemini/tmp/p/chats/session-1-x.json",
+                &selected,
+                &owners
+            ),
+            Some(Tool::Gemini)
+        );
+        // An unsignatured file under the shared gemini/antigravity root is
+        // ambiguous by provenance and must not be guessed.
+        assert_eq!(
+            attribute_disk_match("/home/u/.gemini/tmp/p/notes.jsonl", &selected, &owners),
+            None
+        );
+        // Provenance only counts roots for selected tools.
+        assert_eq!(
+            attribute_disk_match("/data/pi-sessions/abc/9f8e.jsonl", &[Tool::Gemini], &owners),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_agent_type_cursor_keys_on_agent_transcripts_not_dotcursor() {
+        // Regression: a Claude transcript path with a LITERAL `.cursor` segment
+        // (the CLAUDE_CONFIG_DIR-style vector the old `.contains(".cursor")`
+        // matcher WOULD have misrouted to cursor) must detect claude. Feeds
+        // resume tool detection → wrong match would break resume + parser.
+        assert_eq!(
+            detect_agent_type("/home/u/.claude/projects/x/.cursor/abcd.jsonl"),
+            "claude"
+        );
+        // A real cursor transcript (the `agent-transcripts` segment) detects cursor.
+        assert_eq!(
+            detect_agent_type("/home/u/.cursor/projects/repo/agent-transcripts/uuid/uuid.jsonl"),
+            "cursor"
+        );
     }
 
     #[test]
@@ -3270,6 +1826,7 @@ mod tests {
             is_error: false,
             file: None,
             command: Some("pwd".to_string()),
+            output: None,
         }];
         assert_eq!(
             finalize_action_text("", &tools, &[], false),
@@ -3281,246 +1838,6 @@ mod tests {
             finalize_action_text("", &tools, &errors, true),
             "(turn ended in error after using Bash)"
         );
-    }
-
-    #[test]
-    fn test_parse_codex_prefers_response_items_over_event_msgs() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout.jsonl");
-        let lines = [
-            json!({
-                "type": "event_msg",
-                "timestamp": "2026-03-27T10:00:00.100Z",
-                "payload": {"type": "user_message", "message": "response user"}
-            }),
-            json!({
-                "type": "event_msg",
-                "timestamp": "2026-03-27T10:00:01.100Z",
-                "payload": {"type": "agent_message", "message": "response assistant"}
-            }),
-            json!({
-                "type": "response_item",
-                "timestamp": "2026-03-27T10:00:00Z",
-                "payload": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "response user"}]
-                }
-            }),
-            json!({
-                "type": "response_item",
-                "timestamp": "2026-03-27T10:00:01Z",
-                "payload": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "response assistant"}]
-                }
-            }),
-            json!({
-                "type": "response_item",
-                "timestamp": "2026-03-27T10:00:02Z",
-                "payload": {
-                    "type": "function_call",
-                    "name": "shell",
-                    "call_id": "call_1",
-                    "arguments": "{\"command\":\"pwd\"}"
-                }
-            }),
-            json!({
-                "type": "event_msg",
-                "timestamp": "2026-03-27T10:01:00Z",
-                "payload": {"type": "user_message", "message": "event only user"}
-            }),
-            json!({
-                "type": "event_msg",
-                "timestamp": "2026-03-27T10:01:01Z",
-                "payload": {"type": "agent_message", "message": "event only assistant"}
-            }),
-        ];
-        fs::write(
-            &path,
-            lines
-                .iter()
-                .map(serde_json::Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .unwrap();
-
-        let exchanges = parse_codex_jsonl(&path, 10, false).unwrap();
-        assert_eq!(exchanges.len(), 2);
-        assert_eq!(exchanges[0].user, "response user");
-        assert_eq!(exchanges[0].action, "response assistant");
-        assert_eq!(exchanges[0].tools.len(), 1);
-        assert_eq!(exchanges[0].tools[0].name, "Bash");
-        assert_eq!(exchanges[1].user, "event only user");
-        assert_eq!(exchanges[1].action, "event only assistant");
-    }
-
-    #[test]
-    fn test_parse_codex_dedupes_repeated_assistant_chunks_within_exchange() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rollout.jsonl");
-        let lines = [
-            json!({
-                "type": "response_item",
-                "timestamp": "2026-03-27T10:00:00Z",
-                "payload": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "analyze more code and write implementation plan"}]
-                }
-            }),
-            json!({
-                "type": "event_msg",
-                "timestamp": "2026-03-27T10:00:01Z",
-                "payload": {"type": "agent_message", "message": "first commentary"}
-            }),
-            json!({
-                "type": "response_item",
-                "timestamp": "2026-03-27T10:00:01Z",
-                "payload": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "first commentary"}]
-                }
-            }),
-            json!({
-                "type": "event_msg",
-                "timestamp": "2026-03-27T10:00:02Z",
-                "payload": {"type": "agent_message", "message": "second answer"}
-            }),
-            json!({
-                "type": "response_item",
-                "timestamp": "2026-03-27T10:00:02Z",
-                "payload": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "second answer"}]
-                }
-            }),
-        ];
-        fs::write(
-            &path,
-            lines
-                .iter()
-                .map(serde_json::Value::to_string)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .unwrap();
-
-        let exchanges = parse_codex_jsonl(&path, 10, false).unwrap();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].action, "first commentary\nsecond answer");
-    }
-
-    #[test]
-    fn test_parse_gemini_keeps_tool_only_turns() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.json");
-        let transcript = json!({
-            "messages": [
-                {
-                    "type": "user",
-                    "timestamp": "2026-03-27T10:00:00Z",
-                    "displayContent": [{"text": "find the bug"}]
-                },
-                {
-                    "type": "gemini",
-                    "timestamp": "2026-03-27T10:00:01Z",
-                    "content": "",
-                    "toolCalls": [
-                        {
-                            "name": "replace",
-                            "status": "success",
-                            "args": {"file_path": "/tmp/main.rs"}
-                        }
-                    ]
-                }
-            ]
-        });
-        fs::write(&path, transcript.to_string()).unwrap();
-
-        let exchanges = parse_gemini_json(&path, 10).unwrap();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].user, "find the bug");
-        assert_eq!(exchanges[0].action, "(tool-only turn: Edit)");
-        assert_eq!(exchanges[0].files, vec!["main.rs".to_string()]);
-        assert_eq!(exchanges[0].tools[0].name, "Edit");
-    }
-
-    #[test]
-    fn test_parse_opencode_skips_synthetic_assistant_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("opencode.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE message (
-                 id text PRIMARY KEY,
-                 session_id text NOT NULL,
-                 time_created integer NOT NULL,
-                 data text NOT NULL
-             );
-             CREATE TABLE part (
-                 id text PRIMARY KEY,
-                 message_id text NOT NULL,
-                 session_id text NOT NULL,
-                 data text NOT NULL
-             );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
-            rusqlite::params!["m1", "ses_1", 1_i64, json!({"role": "user"}).to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
-            rusqlite::params![
-                "m2",
-                "ses_1",
-                2_i64,
-                json!({"role": "assistant"}).to_string()
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO part (id, message_id, session_id, data) VALUES (?, ?, ?, ?)",
-            rusqlite::params![
-                "p1",
-                "m1",
-                "ses_1",
-                json!({"type": "text", "text": "user prompt", "synthetic": false}).to_string()
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO part (id, message_id, session_id, data) VALUES (?, ?, ?, ?)",
-            rusqlite::params![
-                "p2",
-                "m2",
-                "ses_1",
-                json!({"type": "text", "text": "synthetic note", "synthetic": true}).to_string()
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO part (id, message_id, session_id, data) VALUES (?, ?, ?, ?)",
-            rusqlite::params![
-                "p3",
-                "m2",
-                "ses_1",
-                json!({"type": "text", "text": "real assistant answer", "synthetic": false})
-                    .to_string()
-            ],
-        )
-        .unwrap();
-
-        let exchanges = parse_opencode_sqlite(&db_path, "ses_1", 10).unwrap();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].user, "user prompt");
-        assert_eq!(exchanges[0].action, "real assistant answer");
     }
 
     #[test]
@@ -3660,68 +1977,49 @@ mod tests {
     }
 
     #[test]
-    fn test_get_exchanges_retries_transient_codex_no_response_tail() {
+    fn test_render_antigravity_transcript_user_input_and_planner_response() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript_path = dir.path().join("rollout.jsonl");
+        let transcript_path = dir.path().join("Antigravity-session.jsonl");
+        let db = test_db();
+        let now = crate::shared::time::now_epoch_f64();
+        let lines = [
+            json!({
+                "type": "USER_INPUT",
+                "timestamp": "2026-03-27T10:00:00Z",
+                "text": "review the hook changes"
+            }),
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "timestamp": "2026-03-27T10:00:01Z",
+                "text": "I will inspect the Antigravity hook path."
+            }),
+        ];
         fs::write(
             &transcript_path,
-            json!({
-                "type": "response_item",
-                "timestamp": "2026-03-27T10:00:00Z",
-                "payload": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "user prompt"}]
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-
-        let path_for_thread = transcript_path.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            fs::write(
-                &path_for_thread,
-                [
-                    json!({
-                        "type": "response_item",
-                        "timestamp": "2026-03-27T10:00:00Z",
-                        "payload": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": "user prompt"}]
-                        }
-                    }),
-                    json!({
-                        "type": "response_item",
-                        "timestamp": "2026-03-27T10:00:01Z",
-                        "payload": {
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": "assistant answer"}]
-                        }
-                    }),
-                ]
+            lines
                 .iter()
                 .map(serde_json::Value::to_string)
                 .collect::<Vec<_>>()
                 .join("\n"),
-            )
-            .unwrap();
-        });
-
-        let exchanges = get_exchanges(
-            transcript_path.to_str().unwrap(),
-            "codex",
-            10,
-            false,
-            None,
-            true,
         )
         .unwrap();
-        assert_eq!(exchanges.len(), 1);
-        assert_eq!(exchanges[0].action, "assistant answer");
+
+        let mut data = serde_json::Map::new();
+        data.insert("created_at".into(), json!(now));
+        data.insert("tool".into(), json!("antigravity"));
+        data.insert(
+            "transcript_path".into(),
+            json!(transcript_path.to_string_lossy().to_string()),
+        );
+        db.save_instance_named("vibo", &data).unwrap();
+
+        let rendered =
+            render_instance_transcript_with_options(&db, "vibo", None, 10, false, false, false)
+                .unwrap();
+
+        assert!(rendered.contains("review the hook changes"));
+        assert!(rendered.contains("inspect the Antigravity hook path."));
+        assert!(!rendered.contains("No exchanges found"));
     }
 
     #[test]
@@ -3732,12 +2030,14 @@ mod tests {
                 is_error: true,
                 file: Some("a.rs".to_string()),
                 command: None,
+                output: None,
             },
             ToolUse {
                 name: "Edit".to_string(),
                 is_error: false,
                 file: Some("a.rs".to_string()),
                 command: None,
+                output: None,
             },
         ];
         let errors = vec![json!({"tool": "Edit", "content": "old failure"})];
@@ -3821,5 +2121,322 @@ mod tests {
     #[test]
     fn test_transcript_rejects_bogus() {
         assert!(TranscriptArgs::try_parse_from(["transcript", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn missing_search_tool_is_an_error_not_an_empty_result() {
+        let err =
+            run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
+        assert!(err.contains("was not found on PATH"));
+    }
+
+    fn insert_test_instance(db: &HcomDb, name: &str, transcript_path: &str, tool: &str) {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "created_at".into(),
+            json!(crate::shared::time::now_epoch_f64()),
+        );
+        data.insert("tool".into(), json!(tool));
+        data.insert("transcript_path".into(), json!(transcript_path));
+        db.save_instance_named(name, &data).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_literal_underscore_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_testa = dir.path().join("testa1.jsonl");
+        fs::write(&p_testa, "").unwrap();
+        insert_test_instance(&db, "testa1", p_testa.to_str().unwrap(), "codex");
+
+        // Literal '_' in requested prefix must not match 'testa1' via SQL LIKE wildcard
+        let res = resolve_instance_transcript(&db, "test_");
+        assert_eq!(
+            res, None,
+            "literal '_' must not match 'testa1' via SQL wildcard"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_literal_percent_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_fooa = dir.path().join("fooa1.jsonl");
+        fs::write(&p_fooa, "").unwrap();
+        insert_test_instance(&db, "fooa1", p_fooa.to_str().unwrap(), "codex");
+
+        // Literal '%' in requested prefix must not match 'fooa1' via SQL LIKE wildcard
+        let res = resolve_instance_transcript(&db, "foo%");
+        assert_eq!(
+            res, None,
+            "literal '%' must not match 'fooa1' via SQL wildcard"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_literal_backslash_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_slash = dir.path().join("esc_slash.jsonl");
+        fs::write(&p_slash, "").unwrap();
+        insert_test_instance(&db, "esc\\1", p_slash.to_str().unwrap(), "codex");
+
+        // Literal backslash in prefix must resolve literal instance 'esc\1'
+        let res = resolve_instance_transcript(&db, "esc\\");
+        assert_eq!(
+            res.as_ref().map(|(n, _, _, _)| n.as_str()),
+            Some("esc\\1"),
+            "literal backslash prefix 'esc\\' must resolve to 'esc\\1'"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_ambiguous_prefix_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p1 = dir.path().join("ambig_one.jsonl");
+        let p2 = dir.path().join("ambig_two.jsonl");
+        fs::write(&p1, "").unwrap();
+        fs::write(&p2, "").unwrap();
+
+        insert_test_instance(&db, "ambig_one", p1.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "ambig_two", p2.to_str().unwrap(), "codex");
+
+        // Multiple candidates matching prefix must fail closed (return None)
+        // rather than picking an arbitrary candidate based on SQLite row order
+        let resolved = resolve_instance_transcript(&db, "ambig_");
+        assert_eq!(
+            resolved, None,
+            "multiple prefix candidates must fail closed to avoid disclosing the wrong transcript"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_exact_match_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_exact = dir.path().join("exact.jsonl");
+        let p_longer = dir.path().join("exact_one.jsonl");
+        fs::write(&p_exact, "").unwrap();
+        fs::write(&p_longer, "").unwrap();
+
+        insert_test_instance(&db, "exact", p_exact.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "exact_one", p_longer.to_str().unwrap(), "codex");
+
+        // Exact match must win immediately, without triggering prefix ambiguity
+        let resolved = resolve_instance_transcript(&db, "exact");
+        assert!(resolved.is_some(), "exact match must resolve");
+        let (name, path, tool, _) = resolved.unwrap();
+        assert_eq!(name, "exact");
+        assert_eq!(path, p_exact.to_str().unwrap());
+        assert_eq!(tool, "codex");
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_exact_live_without_transcript_blocks_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) VALUES ('pico', 1.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+        let p_longer = dir.path().join("pico_worker.jsonl");
+        fs::write(&p_longer, "").unwrap();
+        insert_test_instance(&db, "pico_worker", p_longer.to_str().unwrap(), "codex");
+
+        assert_eq!(
+            resolve_instance_transcript(&db, "pico"),
+            None,
+            "an exact live identity without a transcript must not borrow a prefix match"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_exact_stopped_preempts_unique_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_longer = dir.path().join("pico_worker.jsonl");
+        let p_stopped = dir.path().join("pico_stopped.jsonl");
+        fs::write(&p_longer, "").unwrap();
+        fs::write(&p_stopped, "").unwrap();
+        insert_test_instance(&db, "pico_worker", p_longer.to_str().unwrap(), "codex");
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', 'pico', ?2)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": p_stopped.to_str().unwrap(),
+                            "session_id": "sess-pico-stopped"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let resolved = resolve_instance_transcript(&db, "pico").unwrap();
+        assert_eq!(resolved.0, "pico");
+        assert_eq!(resolved.1, p_stopped.to_str().unwrap());
+        assert_eq!(resolved.3.as_deref(), Some("sess-pico-stopped"));
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_exact_live_without_transcript_blocks_stale_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) VALUES ('pico', 1.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+        let p_stopped = dir.path().join("pico_stopped.jsonl");
+        fs::write(&p_stopped, "").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', 'pico', ?2)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {"transcript_path": p_stopped.to_str().unwrap()}
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolve_instance_transcript(&db, "pico"),
+            None,
+            "a current exact identity must not inherit an older incarnation's transcript"
+        );
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_stopped_instance_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let session_dir = dir.path().join(".codex/sessions/sess-stopped-123");
+        fs::create_dir_all(&session_dir).unwrap();
+        let p_stopped = session_dir.join("rollout.jsonl");
+        fs::write(&p_stopped, "").unwrap();
+
+        // Insert a stopped life event into the events table
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    "miso",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": p_stopped.to_str().unwrap(),
+                            "session_id": "sess-stopped-123"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let res = resolve_instance_transcript(&db, "miso");
+        assert!(
+            res.is_some(),
+            "stopped instance should resolve via events table fallback"
+        );
+        let (name, path, tool, sid) = res.unwrap();
+        assert_eq!(name, "miso");
+        assert_eq!(path, p_stopped.to_str().unwrap());
+        assert_eq!(tool, "codex");
+        assert_eq!(sid.as_deref(), Some("sess-stopped-123"));
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_single_literal_prefix_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let p_sole = dir.path().join("sole_worker.jsonl");
+        fs::write(&p_sole, "").unwrap();
+        insert_test_instance(&db, "sole_worker", p_sole.to_str().unwrap(), "codex");
+
+        // A single unambiguous literal prefix must resolve to its sole candidate
+        let res = resolve_instance_transcript(&db, "sole_");
+        assert!(
+            res.is_some(),
+            "unambiguous single prefix match should resolve"
+        );
+        let (name, path, tool, _) = res.unwrap();
+        assert_eq!(name, "sole_worker");
+        assert_eq!(path, p_sole.to_str().unwrap());
+        assert_eq!(tool, "codex");
+    }
+
+    #[test]
+    fn test_resolve_instance_transcript_stopped_instance_preempts_ambiguous_prefix_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        // Two active prefix candidates starting with "pico_"
+        let p_active1 = dir.path().join("pico_one.jsonl");
+        let p_active2 = dir.path().join("pico_two.jsonl");
+        fs::write(&p_active1, "").unwrap();
+        fs::write(&p_active2, "").unwrap();
+        insert_test_instance(&db, "pico_one", p_active1.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "pico_two", p_active2.to_str().unwrap(), "codex");
+
+        // One stopped instance whose exact name matches input "pico"
+        let session_dir = dir.path().join(".codex/sessions/sess-pico-stopped");
+        fs::create_dir_all(&session_dir).unwrap();
+        let p_stopped = session_dir.join("rollout.jsonl");
+        fs::write(&p_stopped, "").unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    "pico",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": p_stopped.to_str().unwrap(),
+                            "session_id": "sess-pico-stopped"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let res = resolve_instance_transcript(&db, "pico");
+        assert!(
+            res.is_some(),
+            "exact stopped instance must resolve when active prefix candidates are ambiguous"
+        );
+        let (name, path, tool, sid) = res.unwrap();
+        assert_eq!(
+            name, "pico",
+            "must resolve stopped instance, not an active prefix candidate"
+        );
+        assert_eq!(path, p_stopped.to_str().unwrap());
+        assert_eq!(tool, "codex");
+        assert_eq!(sid.as_deref(), Some("sess-pico-stopped"));
     }
 }

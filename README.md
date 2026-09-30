@@ -6,17 +6,31 @@
 
 > **Hook your coding agents together**
 
-`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, and OpenCode without changing how you use them.
+**`hcom`** is a CLI that agents use to message, watch, and spawn each other across terminals.
 
-Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
+Start an agent with `hcom` in front, then prompt normally.
 
-Single Rust binary, no background services. Start an agent with `hcom` in front, then prompt normally.
+Use it to:
+
+- coordinate multi-agent pipelines
+- run different AI CLIs as each other's subagents
+- avoid copy-pasting
+
+Works with: `claude`, `codex`, `opencode`, `pi`, `omp`, `agy`, `cursor`, `kimi`, `kilo`, `copilot`, `gemini`
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
 ---
 
 ## Install
+
+**python -** macOS, Linux, Windows:
+
+```bash
+uv tool install hcom
+```
+
+**homebrew -** macOS, Linux:
 
 ```bash
 brew install aannoo/hcom/hcom
@@ -25,13 +39,18 @@ brew install aannoo/hcom/hcom
 <details><summary>Other install options</summary>
 
 ```bash
-# Shell installer for macOS, Linux, Android (Termux), and WSL
+# macOS, Linux, Android
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
 ```
 
+```powershell
+# Windows
+irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
+```
+
 ```bash
-# With PyPI
-uv tool install hcom  # or: pip install hcom
+# Update any existing install
+hcom update
 ```
 
 </details>
@@ -43,7 +62,7 @@ uv tool install hcom  # or: pip install hcom
 Terminal 1:
 
 ```bash
-hcom claude   # codex / gemini / opencode
+hcom claude
 ```
 
 Terminal 2:
@@ -56,10 +75,11 @@ Prompt:
 
 - `ask the other agent their favorite cake`
 - `review what claude did and send it fixes`
-- `spawn 3x gemini, split work, collect results`
+- `spawn 3x opencode, split work, collect results`
 - `fork yourself to investigate the bug and report back`
+- `when codex goes idle, send it the next task`
 
-Open the TUI:
+Open the TUI dashboard:
 
 ```bash
 hcom
@@ -69,13 +89,13 @@ hcom
 
 ## What agents can do
 
-**Message** each other in real-time: intent, replies, bundled context for handoffs.
+**Message** each other in real time: mid-turn or wake immediately when idle
 
-**Observe** each other: transcripts, file edits, terminal screens, command history.
+**Observe** each other: status, transcripts, file edits, live terminal screens, command history.
 
-**Subscribe** to each other: notify on status changes, file edits, specific events. React automatically.
+**Subscribe** and notify on status changes, file edits, collisions, specific events. React automatically.
 
-**Spawn**, **fork**, **resume**, **kill** each other, in any terminal emulator or headless.
+**Spawn**, **fork**, **resume**, **kill** in any terminal emulator or headless.
 
 ---
 
@@ -83,32 +103,19 @@ hcom
 
 Hooks record activity to a local SQLite database and deliver messages from it.
 
-```bash
+```text
 agent → hooks → db → hooks → other agent
 ```
 
-Messages arrive mid-turn (injected between tool calls) or wake idle agents immediately.
+Hooks activate only when an agent is launched with `hcom` in front. Normal usage is unaffected.
 
-Each agent gets a queryable identity:
-
-- name
-- status (active, blocked, listening)
-- inbox
-- live terminal screen
-- transcript in structured chunks
-- event log of every status change, file edit, tool call
-
-Agents can subscribe to events and react instantly. Collision detection is on by default: if two agents edit the same file within 30 seconds, both get notified.
-
-Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
-
-Without hooks, any other AI tool can join by running `hcom start`. Any process can wake agents with `hcom send`.
+Any other AI tool without hooks can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
 ---
 
 ## Terminal
 
-Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning; **kitty**, **wezterm**, **tmux**, and **cmux** also support closing panes from `hcom kill`.
+Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning. **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux**, **herdr** also support closing panes from `hcom kill`.
 
 To configure a custom terminal open/close setup, tell an agent to run:
 
@@ -189,6 +196,9 @@ To keep using relay after a leak, create a new relay with `hcom relay new` and m
 
 ```bash
 hcom status                  # diagnostics
+```
+
+```bash
 hcom reset all               # clear and archive: database + hooks + config
 ```
 
@@ -196,9 +206,18 @@ hcom reset all               # clear and archive: database + hooks + config
 
 ## Uninstall
 
+Safely remove all hcom hooks:
+
 ```bash
-hcom hooks remove            # safely remove all hcom hooks
-brew uninstall hcom          # or: rm $(which hcom)
+hcom hooks remove
+```
+
+Then remove binary:
+
+```bash
+brew uninstall hcom
+# or: uv tool uninstall hcom
+# or: rm "$(which hcom)"
 ```
 
 ---
@@ -215,7 +234,15 @@ brew uninstall hcom          # or: rm $(which hcom)
 | Claude Code | automatic | `hcom claude` |
 | Gemini CLI | automatic | `hcom gemini` |
 | Codex CLI | automatic | `hcom codex` |
+| Antigravity CLI | automatic | `hcom agy` |
 | OpenCode | automatic | `hcom opencode` |
+| Kilo Code | automatic | `hcom kilo` |
+| Pi | automatic | `hcom pi` |
+| Oh My Pi | automatic | `hcom omp` |
+| Cursor CLI | automatic | `hcom cursor-agent` |
+| Kimi | automatic | `hcom kimi` |
+| Copilot CLI | automatic | `hcom copilot` |
+| Grok Build | automatic | `hcom grok` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
@@ -228,7 +255,8 @@ hcom f <session_id>           # Fork a session in hcom
 Detached background processes in print mode stay alive. Manage through the TUI.
 
 ```bash
-hcom claude -p 'say hi in hcom'
+hcom claude -p 'say hi in hcom'   # print mode (separate Agent SDK credits)
+hcom claude --headless            # Run normal claude in background pty (works for any tool)
 ```
 
 For subagents, run `hcom claude`, then prompt:
@@ -248,10 +276,10 @@ What you might type from a shell. Agents run their own commands that they learn 
 ### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|opencode   # launch N agents
-hcom r <name|session_id>                # resume agent
-hcom f <name|session_id>                # fork session
-hcom kill <name|tag:T|all>              # kill + close terminal pane
+hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot|grok   # launch N agents
+hcom r <name|session_id>     # resume agent
+hcom f <name|session_id>     # fork session
+hcom kill <name|tag:T|all>   # kill + close terminal pane
 ```
 
 hcom launch flags:
@@ -261,7 +289,7 @@ hcom launch flags:
 | `--tag <name>` | Group label — agents can be addressed as `@tag` |
 | `--terminal <preset>` | Where windows open: `default` (auto-detect), `kitty`, `wezterm`, `tmux`, `cmux`, `iterm`, etc… |
 | `--dir <path>` | Directory where the agent launches |
-| `--headless` | Run in background with no terminal window |
+| `--headless` | Run in background pty with no terminal window |
 | `--device <name>` | Spawn on a remote device (via relay) |
 | `--hcom-prompt <text>` | Initial user prompt |
 | `--hcom-system-prompt <text>` | Append to system prompt |
@@ -271,15 +299,15 @@ Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, etc.
 ### Other commands
 
 ```bash
-hcom                                # TUI dashboard
-hcom send -b @luna -- hey           # one-off message to an agent
-hcom list                           # show all active agents
-hcom term [name]                    # view/inject into an agent's PTY screen
-hcom events --wait <filters>         # Block until match for scripting
-hcom update                         # update hcom version
+hcom                           # TUI dashboard
+hcom send -b @luna -- hey      # one-off message to an agent
+hcom list                      # show all active agents
+hcom term [name]               # view/inject into an agent's PTY screen
+hcom events --wait <filters>   # Block until match for scripting
+hcom update                    # update hcom version
 ```
 
-`hcom --help` for all commands.
+`hcom run docs --cli` for all commands.
 
 </details>
 
@@ -308,17 +336,18 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `auto_approve` | Auto-approve safe hcom commands (send/list/events/…) |
 | `auto_subscribe` | Event subscription presets: `collision`, `created`, `stopped`, `blocked` |
 | `name_export` | Export instance name to a custom env var |
+| `title_mode` | Terminal/tab title behavior: `combined` (default), `label`, or `off` |
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
-| `timeout` | Idle timeout for headless/vanilla Claude (seconds) |
+| `timeout` | Idle timeout for headless Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
-| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` | Default args passed to the tool |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` / `grok_args` | Default args passed to the tool |
 
 ### Scope
 
 ```bash
-hcom config tag mycrew                          # global
-hcom config -i luna hints "respond in JSON"     # per-agent
-HCOM_TAG=dev hcom 3 claude                      # per-launch env
+hcom config tag mycrew                        # global
+hcom config -i luna hints "respond in JSON"   # per-agent
+HCOM_TAG=dev hcom 3 claude                    # per-launch env
 ```
 
 ### Per-project isolation
@@ -347,7 +376,7 @@ hcom run debate "topic"    # run one
 hcom run docs              # tell agent to run this to create any new workflow
 ```
 
-### Included Scripts
+### Included scripts
 
 Tell agent to run them:
 
@@ -357,6 +386,8 @@ Tell agent to run them:
 
 **`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
 
+**`hcom run onidle`** — waits for an agent to go idle, then types text into another agent (`hcom run onidle luna nova 'luna is done, review it'`) or launches a new one with it as the prompt (`hcom run onidle luna codex 'review what luna just did'`).
+
 Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovered, override bundled scripts of the same name. Ask an agent to author one; `hcom run docs --scripts` is the authoring guide.
 
 </details>
@@ -364,10 +395,10 @@ Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovere
 <details>
 <summary>Build</summary>
 
-### Building from Source
+### Building from source
 
 ```bash
-# Prerequisites: Rust 1.86+
+# Prerequisites: Rust 1.88+
 
 git clone https://github.com/aannoo/hcom.git
 cd hcom
@@ -401,7 +432,6 @@ HCOM_DIR=$PWD/.hcom HCOM_DEV_ROOT=$PWD hcom claude
 
 </details>
 
-
 ---
 
 ## Contributing
@@ -412,6 +442,7 @@ Issues and PRs welcome. The codebase is Rust.
 cargo build && cargo test
 hcom config dev_root $(pwd)
 hcom status
+just ci  # run the CI gate locally
 ```
 
 ---

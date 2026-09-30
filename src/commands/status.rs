@@ -8,6 +8,7 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::db::HcomDb;
+use crate::hooks::runtime::HookMode;
 use crate::shared::CommandContext;
 
 /// Parsed arguments for `hcom status`.
@@ -25,38 +26,58 @@ pub struct StatusArgs {
 // ── Tool Detection ───────────────────────────────────────────────────────
 
 /// Check if a binary is available in PATH.
+fn path_exists_or_symlink(path: &Path) -> bool {
+    path.exists() || std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Cross-platform PATH scan tolerant of dangling symlinks — status display
+/// wants "is this installed" even for a symlink whose target is momentarily
+/// missing (e.g. mid-upgrade via nvm/homebrew), unlike `which_bin`, whose
+/// results get executed and so require the target to actually resolve.
 fn is_in_path(name: &str) -> bool {
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .any(|dir| Path::new(dir).join(name).exists())
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        crate::terminal::which_candidates(&dir, name)
+            .iter()
+            .any(|candidate| path_exists_or_symlink(candidate))
+    })
 }
 
-// Hook-installation checks delegate to the `verify_*` functions in `hooks::*`
-// so `hcom status` and `hcom hooks status` never disagree.
-
-fn check_claude_hooks() -> bool {
-    crate::hooks::claude::verify_claude_hooks_installed(None, false)
+fn is_antigravity_installed() -> bool {
+    crate::terminal::which_bin("agy").is_some()
+        || is_in_path("antigravity")
+        || std::env::var_os("HOME").is_some_and(|home| {
+            let bin_dir = Path::new(&home).join(".antigravity/antigravity/bin");
+            path_exists_or_symlink(&bin_dir.join("agy"))
+                || path_exists_or_symlink(&bin_dir.join("antigravity"))
+        })
 }
 
-fn check_gemini_hooks() -> bool {
-    crate::hooks::gemini::verify_gemini_hooks_installed(false)
-}
+// Hook-installation checks delegate to the canonical tool adapter so status
+// stays aligned with `hcom hooks status` as integrations are added.
 
-fn check_codex_hooks() -> bool {
-    crate::hooks::codex::verify_codex_hooks_installed(false)
-}
-
-fn check_opencode_hooks() -> bool {
-    crate::hooks::opencode::verify_opencode_plugin_installed()
+fn is_tool_installed(tool: crate::tool::Tool) -> bool {
+    match tool {
+        crate::tool::Tool::Antigravity => is_antigravity_installed(),
+        crate::tool::Tool::Adhoc => false,
+        // Same lookup the launcher uses (PATH, then per-user install dirs).
+        _ => crate::terminal::which_bin(tool.spec().cli_binary).is_some(),
+    }
 }
 
 // ── Status Collection ────────────────────────────────────────────────────
 
 struct ToolStatus {
+    key: &'static str,
     name: &'static str,
     installed: bool,
+    /// hcom launches get hooks with no further setup: always for per-run
+    /// tools, when the global install is present for persistent ones.
     hooks: bool,
+    hook_mode: HookMode,
+    settings_path: String,
 }
 
 impl ToolStatus {
@@ -72,28 +93,41 @@ impl ToolStatus {
 }
 
 fn get_tool_statuses() -> Vec<ToolStatus> {
-    vec![
-        ToolStatus {
-            name: "Claude",
-            installed: is_in_path("claude"),
-            hooks: check_claude_hooks(),
-        },
-        ToolStatus {
-            name: "Gemini",
-            installed: is_in_path("gemini"),
-            hooks: check_gemini_hooks(),
-        },
-        ToolStatus {
-            name: "Codex",
-            installed: is_in_path("codex"),
-            hooks: check_codex_hooks(),
-        },
-        ToolStatus {
-            name: "OpenCode",
-            installed: is_in_path("opencode"),
-            hooks: check_opencode_hooks(),
-        },
-    ]
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released)
+        .map(|spec| {
+            let hook_mode = HookMode::of(spec.tool);
+            let persistent = hook_mode == HookMode::Persistent;
+            ToolStatus {
+                key: spec.name,
+                name: spec.label,
+                installed: is_tool_installed(spec.tool),
+                hooks: !persistent || spec.tool.verify_hooks_installed(false),
+                hook_mode,
+                settings_path: if persistent {
+                    spec.tool.hooks_settings_path()
+                } else {
+                    String::new()
+                },
+            }
+        })
+        .collect()
+}
+
+fn tool_statuses_json(tools: &[ToolStatus]) -> serde_json::Value {
+    let entries = tools.iter().map(|tool| {
+        let mut status = serde_json::Map::from_iter([
+            ("installed".to_string(), json!(tool.installed)),
+            ("hooks".to_string(), json!(tool.hooks)),
+            ("hook_mode".to_string(), json!(tool.hook_mode.as_str())),
+        ]);
+        if !tool.settings_path.is_empty() {
+            status.insert("settings_path".to_string(), json!(tool.settings_path));
+        }
+        (tool.key.to_string(), serde_json::Value::Object(status))
+    });
+    serde_json::Value::Object(entries.collect())
 }
 
 struct AgentCounts {
@@ -104,6 +138,35 @@ struct AgentCounts {
     launching: i64,
     inactive: i64,
     total: i64,
+}
+
+fn recent_launch_failures(db: &HcomDb, limit: usize) -> Vec<(String, String)> {
+    let Ok(mut stmt) = db.conn().prepare(
+        "SELECT name, status_detail
+         FROM instances
+         WHERE status_context = 'launch_failed'
+         ORDER BY status_time DESC
+         LIMIT ?1",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
+fn finalize_timed_out_launches(db: &HcomDb) {
+    if let Ok(instances) = db.iter_instances_full() {
+        for instance in instances {
+            if crate::instances::is_launching_placeholder(&instance) {
+                let _ =
+                    crate::instance_lifecycle::get_or_finalize_launch_failure_detail(db, &instance);
+            }
+        }
+    }
 }
 
 fn get_agent_counts(db: &HcomDb) -> AgentCounts {
@@ -120,20 +183,19 @@ fn get_agent_counts(db: &HcomDb) -> AgentCounts {
     if let Ok(mut stmt) = db
         .conn()
         .prepare("SELECT status, COUNT(*) FROM instances GROUP BY status")
-    {
-        if let Ok(rows) = stmt.query_map([], |row| {
+        && let Ok(rows) = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }) {
-            for row in rows.flatten() {
-                match row.0.as_str() {
-                    s if s.starts_with("active") => c.active += row.1,
-                    "listening" => c.listening += row.1,
-                    s if s.starts_with("blocked") => c.blocked += row.1,
-                    "error" => c.error += row.1,
-                    "launching" => c.launching += row.1,
-                    "inactive" => c.inactive += row.1,
-                    _ => c.inactive += row.1,
-                }
+        })
+    {
+        for row in rows.flatten() {
+            match row.0.as_str() {
+                s if s.starts_with("active") => c.active += row.1,
+                "listening" => c.listening += row.1,
+                s if s.starts_with("blocked") => c.blocked += row.1,
+                "error" => c.error += row.1,
+                "launching" => c.launching += row.1,
+                "inactive" => c.inactive += row.1,
+                _ => c.inactive += row.1,
             }
         }
     }
@@ -160,8 +222,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         false
     };
 
+    finalize_timed_out_launches(db);
     let tools = get_tool_statuses();
     let counts = get_agent_counts(db);
+    let launch_failures = recent_launch_failures(db, 5);
     let dev_root = crate::router::resolve_effective_dev_root(db.path());
 
     // Check config validity
@@ -187,7 +251,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     {
         true
     } else {
-        crate::config::is_known_terminal_preset_pub(&terminal_config)
+        let platform = crate::shared::platform::platform_name();
+        (crate::config::is_known_terminal_preset_pub(&terminal_config)
+            && crate::config::terminal_preset_supported_on(&terminal_config, platform))
+            || crate::config::is_user_defined_preset(&terminal_config)
     };
 
     // Relay — use proper status from relay module
@@ -196,11 +263,6 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     // Paths
     let hcom_dir_override = std::env::var("HCOM_DIR").is_ok();
     let project_root = crate::paths::get_project_root();
-
-    // Settings paths
-    let claude_settings_path = crate::hooks::claude::get_claude_settings_path();
-    let gemini_settings_path = crate::hooks::gemini::get_gemini_settings_path();
-    let codex_config_path = crate::hooks::codex::get_codex_config_path();
 
     if json_mode {
         let log_summary = crate::log::get_log_summary(1.0);
@@ -220,27 +282,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             "project_root": project_root.to_string_lossy(),
             "config_valid": config_valid,
             "config_errors": config_errors,
-            "tools": {
-                "claude": {
-                    "installed": tools[0].installed,
-                    "hooks": tools[0].hooks,
-                    "settings_path": claude_settings_path.to_string_lossy(),
-                },
-                "gemini": {
-                    "installed": tools[1].installed,
-                    "hooks": tools[1].hooks,
-                    "settings_path": gemini_settings_path.to_string_lossy(),
-                },
-                "codex": {
-                    "installed": tools[2].installed,
-                    "hooks": tools[2].hooks,
-                    "settings_path": codex_config_path.to_string_lossy(),
-                },
-                "opencode": {
-                    "installed": tools[3].installed,
-                    "hooks": tools[3].hooks,
-                },
-            },
+            "tools": tool_statuses_json(&tools),
             "terminal": {
                 "config": terminal_config,
                 "available": terminal_available,
@@ -253,6 +295,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                 "launching": counts.launching,
                 "inactive": counts.inactive,
                 "total": counts.total,
+                "launch_failures": launch_failures.iter().map(|(name, detail)| json!({
+                    "name": name,
+                    "detail": detail,
+                })).collect::<Vec<_>>(),
             },
             "relay": {
                 "configured": relay.configured,
@@ -287,10 +333,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                     .map(|p| p.to_string_lossy().into_owned()),
             });
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string(&result).unwrap_or_default());
         return 0;
     }
 
@@ -342,7 +385,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     {
         println!("terminal:  {terminal_config}");
     } else {
-        let available = crate::config::is_known_terminal_preset_pub(&terminal_config);
+        let platform = crate::shared::platform::platform_name();
+        let available = (crate::config::is_known_terminal_preset_pub(&terminal_config)
+            && crate::config::terminal_preset_supported_on(&terminal_config, platform))
+            || crate::config::is_user_defined_preset(&terminal_config);
         let sym = if available { "✓" } else { "✗" };
         println!("terminal:  {terminal_config} {sym}");
     }
@@ -370,6 +416,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             parts.push(format!("{} inactive", counts.inactive));
         }
         println!("agents:    {}", parts.join(", "));
+    }
+    for (name, detail) in &launch_failures {
+        let first_line = detail.lines().next().unwrap_or(detail);
+        println!("failure:   {name}: {first_line}");
     }
 
     // Relay summary + worker process line both branch on the canonical
@@ -512,36 +562,177 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
 mod tests {
     use super::*;
     use crate::db::DEV_ROOT_KV_KEY;
+    use serial_test::serial;
 
     #[test]
     fn test_tool_symbol() {
         let t = ToolStatus {
+            key: "claude",
             name: "Claude",
             installed: true,
             hooks: true,
+            hook_mode: HookMode::Persistent,
+            settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "✓");
 
         let t = ToolStatus {
+            key: "claude",
             name: "Claude",
             installed: true,
             hooks: false,
+            hook_mode: HookMode::Persistent,
+            settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "~");
 
         let t = ToolStatus {
+            key: "claude",
             name: "Claude",
             installed: false,
             hooks: false,
+            hook_mode: HookMode::Persistent,
+            settings_path: String::new(),
         };
         assert_eq!(t.symbol(), "✗");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_is_in_path() {
-        // ls should be in PATH on any Unix system
-        assert!(is_in_path("ls"));
-        assert!(!is_in_path("definitely_not_a_real_binary_xyz123"));
+    fn test_path_exists_or_symlink_accepts_broken_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("shim");
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), &link).unwrap();
+        assert!(path_exists_or_symlink(&link));
+    }
+
+    // Unix-only: relies on `:`-separated PATH and a real symlink.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_is_in_path_tolerates_broken_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("definitely_not_a_real_binary_xyz123");
+        std::os::unix::fs::symlink(dir.path().join("missing-target"), &link).unwrap();
+
+        let original_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", dir.path());
+        }
+        assert!(is_in_path("definitely_not_a_real_binary_xyz123"));
+        assert!(!is_in_path("also_not_a_real_binary_abc456"));
+        unsafe {
+            match &original_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_tool_statuses_cover_released_specs_including_kimi() {
+        let tools = get_tool_statuses();
+        let keys: Vec<_> = tools.iter().map(|tool| tool.key).collect();
+        let expected: Vec<_> = crate::integration_spec::ALL
+            .iter()
+            .filter(|spec| spec.released)
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(keys, expected);
+        assert!(keys.contains(&"kimi"));
+    }
+
+    #[test]
+    fn test_tool_status_json_is_keyed_by_canonical_name() {
+        let tools = vec![
+            ToolStatus {
+                key: "kimi",
+                name: "Kimi",
+                installed: true,
+                hooks: false,
+                hook_mode: HookMode::Persistent,
+                settings_path: "/tmp/kimi.json".to_string(),
+            },
+            ToolStatus {
+                key: "claude",
+                name: "Claude",
+                installed: false,
+                hooks: true,
+                hook_mode: HookMode::PerRun,
+                settings_path: String::new(),
+            },
+        ];
+        let value = tool_statuses_json(&tools);
+        assert_eq!(value["kimi"]["installed"], true);
+        assert_eq!(value["kimi"]["settings_path"], "/tmp/kimi.json");
+        assert_eq!(value["claude"]["installed"], false);
+        assert_eq!(value["kimi"]["hook_mode"], "persistent");
+        assert_eq!(value["claude"]["hook_mode"], "per_run");
+        assert_eq!(value["claude"]["hooks"], true);
+        assert!(value["claude"].get("settings_path").is_none());
+        assert!(value.get("0").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_antigravity_install_fallback_checks_home_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join(".antigravity/antigravity/bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("agy"), "").unwrap();
+
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+        assert!(is_antigravity_installed());
+        unsafe {
+            if let Some(home) = old_home {
+                std::env::set_var("HOME", home);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
+
+    // B-2: preset availability must match the validate/launch platform gate —
+    // a wrong-platform built-in is NOT available, and a user-defined preset IS.
+    #[test]
+    #[serial]
+    fn terminal_availability_matches_platform_gate() {
+        use crate::hooks::test_helpers::isolated_test_env;
+
+        // Mirrors the `available` expression at both status sites.
+        let available = |name: &str| {
+            let platform = crate::shared::platform::platform_name();
+            (crate::config::is_known_terminal_preset_pub(name)
+                && crate::config::terminal_preset_supported_on(name, platform))
+                || crate::config::is_user_defined_preset(name)
+        };
+
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let platform = crate::shared::platform::platform_name();
+        let builtin = match platform {
+            "Darwin" | "Linux" => "windows-terminal",
+            _ => "iterm",
+        };
+
+        // Wrong-platform built-in with no user override: not available.
+        assert!(
+            !available(builtin),
+            "{builtin} must show unavailable on {platform}"
+        );
+
+        // A user-defined preset of the same name: available.
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nopen = \"{builtin} {{script}}\"\n"),
+        )
+        .unwrap();
+        assert!(
+            available(builtin),
+            "user-defined {builtin} must show available on {platform}"
+        );
     }
 
     #[test]

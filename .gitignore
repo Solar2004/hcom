@@ -1,2 +1,4 @@
 /target/
 /bin/
+/.hcom/
+/node_modules/

@@ -1,13 +1,13 @@
 [package]
 name = "hcom"
-version = "0.7.14"
+version = "0.7.26"
 edition = "2024"
 authors = ["hcom"]
-description = "Connect Claude Code, Gemini CLI, Codex, and OpenCode so agents can message, watch, and spawn each other across terminals"
+description = "Connect Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, and Copilot so agents can message, watch, and spawn each other across terminals"
 license = "MIT"
 homepage = "https://github.com/aannoo/hcom"
 repository = "https://github.com/aannoo/hcom"
-rust-version = "1.86"
+rust-version = "1.88"
 
 [[bin]]
 name = "hcom"
@@ -15,12 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-nix = { version = "0.31.2", features = ["term", "signal", "poll", "process", "fs", "ioctl"] }
 vt100 = "0.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-libc = "0.2.184"
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 regex = "1"
 thiserror = "2"
@@ -38,21 +36,50 @@ toml_edit = "0.25.10"
 tempfile = "3"
 rand = "0.10.0"
 glob = "0.3"
-signal-hook = "0.4.4"
 uuid = { version = "1.23.0", features = ["v4"] }
 # Relay (MQTT) dependencies
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
 base64 = "0.22"
 sha2 = "0.11.0"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11.0"
 bytes = "1"
 rustls = "0.23.37"
 webpki-roots = "1.0.6"
 rustls-native-certs = "0.8.3"
-lru = "0.16"
+lru = "0.18.1"
+
+# Unix-only: PTY, signals, fd polling, file locks, process groups.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.2", features = ["term", "signal", "poll", "process", "fs", "ioctl"] }
+libc = "0.2.184"
+signal-hook = "0.4.4"
+
+# Windows-only: process/job-object control, winsock select, file locking.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_Networking_WinSock",
+] }
+# ConPTY-backed pseudoterminal for the Windows PTY wrapper.
+portable-pty = "0.9"
 
 [dev-dependencies]
 serial_test = "3"
+
+# vt100 0.16.2 panics when a downward resize orphans a double-width character's
+# "wide" flag and it's later erased (index out of bounds in Row::clear_wide).
+# Pinned to the fix from the still-open upstream PR until a release ships it:
+# https://github.com/doy/vt100-rust/issues/28
+# https://github.com/doy/vt100-rust/pull/30
+[patch.crates-io]
+vt100 = { git = "https://github.com/Junyi-99/vt100-rust", rev = "131a75e72d9da43d503772578dc1f1c332befbba" }
 
 [profile.release]
 opt-level = 3

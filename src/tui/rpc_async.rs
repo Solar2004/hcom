@@ -17,6 +17,11 @@ pub enum RpcOp {
     },
     ForkAgent {
         name: String,
+        silent: bool,
+    },
+    ResumeAgent {
+        name: String,
+        silent: bool,
     },
     KillPid {
         pid: u32,
@@ -30,6 +35,7 @@ pub enum RpcOp {
         count: u8,
         tag: String,
         headless: bool,
+        headless_pty: bool,
         terminal: String,
         prompt: String,
     },
@@ -149,7 +155,13 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
 
         RpcOp::KillAgent { name } => commands::run_native(&["kill".into(), name.clone()]),
 
-        RpcOp::ForkAgent { name } => commands::run_native(&["f".into(), name.clone()]),
+        RpcOp::ForkAgent { name, .. } => {
+            commands::run_native(&["f".into(), name.clone(), "--no-run-here".into()])
+        }
+
+        RpcOp::ResumeAgent { name, .. } => {
+            commands::run_native(&["r".into(), name.clone(), "--no-run-here".into()])
+        }
 
         RpcOp::KillPid { pid } => commands::run_native(&["kill".into(), pid.to_string()]),
 
@@ -158,10 +170,19 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             count,
             tag,
             headless,
+            headless_pty,
             terminal,
             prompt,
         } => {
-            let argv = build_launch_argv(*tool, *count, tag, *headless, terminal, prompt);
+            let argv = build_launch_argv(
+                tool.clone(),
+                *count,
+                tag,
+                *headless,
+                *headless_pty,
+                terminal,
+                prompt,
+            );
             commands::run_native(&argv)
         }
     }

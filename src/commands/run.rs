@@ -14,8 +14,62 @@ use crate::paths::scripts_dir;
 use crate::scripts;
 use crate::shared::CommandContext;
 
+#[cfg(windows)]
+fn resolve_git_bash() -> Result<String, String> {
+    let bash = crate::terminal::which_bin("bash").ok_or_else(|| BASH_MISSING_MSG.to_string())?;
+    match Command::new(&bash).arg("--version").output() {
+        Ok(output) if output.status.success() => Ok(bash),
+        Ok(_) => Err(format!(
+            "{BASH_MISSING_MSG}\nFound `{bash}`, but it is not a working Bash installation \
+             (the Windows WSL launcher is not sufficient)."
+        )),
+        Err(err) => Err(format!(
+            "{BASH_MISSING_MSG}\nFound `{bash}`, but it could not be executed: {err}"
+        )),
+    }
+}
+#[cfg(windows)]
+const BASH_MISSING_MSG: &str = "Git Bash required to run shell (.sh) workflow scripts — install it and ensure `bash` is on PATH.";
+
+fn python_command() -> Result<Command, String> {
+    if let Ok(program) = std::env::var("PYTHON")
+        && !program.trim().is_empty()
+    {
+        return Ok(Command::new(program));
+    }
+
+    #[cfg(windows)]
+    {
+        for (name, args) in [("python", &[][..]), ("py", &["-3"][..])] {
+            let Some(program) = crate::terminal::which_bin(name) else {
+                continue;
+            };
+            let mut probe = Command::new(&program);
+            probe.args(args).arg("--version");
+            if probe.output().is_ok_and(|output| output.status.success()) {
+                let mut command = Command::new(program);
+                command.args(args);
+                return Ok(command);
+            }
+        }
+        Err(
+            "Python 3 is required to run .py workflow scripts. Install Python, set `PYTHON`, \
+             or ensure `python`/`py` is on PATH."
+                .to_string(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Command::new("python3"))
+    }
+}
+
 #[derive(clap::Parser, Debug)]
-#[command(name = "run", about = "Run a bundled or user workflow script")]
+#[command(
+    name = "run",
+    about = "Run a bundled or user workflow script",
+    disable_help_flag = true
+)]
 pub struct RunArgs {
     /// Script name plus forwarded args
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -186,7 +240,7 @@ fn list_scripts() -> i32 {
     }
 
     if !bundled.is_empty() {
-        println!("Examples:");
+        println!("Bundled Scripts:");
         println!();
         for s in &bundled {
             let agents = bundled_agent_desc(&s.name);
@@ -257,15 +311,15 @@ fn write_embedded_to_temp(name: &str, content: &str) -> std::io::Result<tempfile
 pub fn cmd_run(db: &HcomDb, args: &RunArgs, ctx: Option<&CommandContext>) -> i32 {
     // Re-inject --name for scripts that parse it themselves
     let mut argv = args.args.clone();
-    if let Some(ctx) = ctx {
-        if let Some(ref name) = ctx.explicit_name {
-            let canonical =
-                crate::instances::resolve_display_name(db, name).unwrap_or_else(|| name.clone());
-            argv = vec!["--name".to_string(), canonical]
-                .into_iter()
-                .chain(argv)
-                .collect();
-        }
+    if let Some(ctx) = ctx
+        && let Some(ref name) = ctx.explicit_name
+    {
+        let canonical =
+            crate::identity::resolve_display_name(db, name).unwrap_or_else(|| name.clone());
+        argv = vec!["--name".to_string(), canonical]
+            .into_iter()
+            .chain(argv)
+            .collect();
     }
 
     if argv.is_empty() {
@@ -341,13 +395,28 @@ pub fn cmd_run(db: &HcomDb, args: &RunArgs, ctx: Option<&CommandContext>) -> i32
     match &script.source {
         ScriptSource::User { path } => {
             let mut cmd = if path.extension().and_then(|e| e.to_str()) == Some("py") {
-                let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".into());
-                let mut c = Command::new(&python);
+                let mut c = match python_command() {
+                    Ok(command) => command,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return 1;
+                    }
+                };
                 c.arg(path);
                 c.args(&args);
                 c
             } else {
-                let mut c = Command::new("bash");
+                #[cfg(windows)]
+                let bash = match resolve_git_bash() {
+                    Ok(bash) => bash,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return 1;
+                    }
+                };
+                #[cfg(not(windows))]
+                let bash = "bash";
+                let mut c = Command::new(bash);
                 c.arg(path);
                 c.args(&args);
                 c
@@ -376,7 +445,17 @@ pub fn cmd_run(db: &HcomDb, args: &RunArgs, ctx: Option<&CommandContext>) -> i32
                 }
             };
 
-            let mut cmd = Command::new("bash");
+            #[cfg(windows)]
+            let bash = match resolve_git_bash() {
+                Ok(bash) => bash,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return 1;
+                }
+            };
+            #[cfg(not(windows))]
+            let bash = "bash";
+            let mut cmd = Command::new(bash);
             cmd.arg(tmp.path());
             cmd.args(&args);
 
@@ -408,7 +487,13 @@ const SCRIPT_GUIDE: &str = r#"# Creating Custom Scripts
 ## Location
 
   User scripts:    ~/.hcom/scripts/
-  File types:      *.sh (bash), *.py (python3)
+  File types:      *.sh (bash), *.py (Python 3)
+
+*.sh scripts (including the bundled confess/debate/fatcow workflows) run via
+`bash`. On Windows, install Git Bash (already a common dependency for
+Windows dev setups, including npm-installed AI CLIs) so `bash` is on PATH.
+Python scripts use `PYTHON` when set; otherwise Windows tries `python`, then
+the Python launcher (`py -3`).
 
 User scripts shadow bundled scripts with the same name.
 Scripts are discovered automatically — drop a file and run `hcom run <name>`.
@@ -591,11 +676,12 @@ mod tests {
 
     #[test]
     fn test_embedded_scripts_available() {
-        assert_eq!(scripts::SCRIPTS.len(), 3);
+        assert_eq!(scripts::SCRIPTS.len(), 4);
         let names: Vec<&str> = scripts::SCRIPTS.iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"confess"));
         assert!(names.contains(&"debate"));
         assert!(names.contains(&"fatcow"));
+        assert!(names.contains(&"onidle"));
     }
 
     #[test]

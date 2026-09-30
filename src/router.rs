@@ -3,7 +3,6 @@
 //! All hooks and commands are handled natively in Rust.
 
 use std::env;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -42,15 +41,48 @@ const COMMANDS: &[&str] = &[
     "update",
 ];
 
-/// Tools that support launch commands (hcom [N] <tool>)
-const LAUNCH_TOOLS: &[&str] = &["claude", "codex", "gemini", "opencode", "f", "r"];
-
 fn is_command(name: &str) -> bool {
     COMMANDS.contains(&name)
 }
 
 fn is_launch_tool(name: &str) -> bool {
-    LAUNCH_TOOLS.contains(&name)
+    matches!(name, "f" | "r") || name.parse::<Tool>().is_ok_and(|tool| tool.spec().released)
+}
+
+fn released_tool_names() -> Vec<&'static str> {
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released)
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// Error for an unrecognized first token, with typo suggestions.
+///
+/// `hcom 2 claud` is reported as an unknown tool (not "unknown command '2'").
+fn unknown_command_message(cmd: &str, args: &[String]) -> String {
+    use crate::shared::suggest::did_you_mean;
+    let tools = released_tool_names();
+    if cmd.parse::<u32>().is_ok() {
+        // Flags like --go can sit between the count and the tool.
+        let (stripped, _) = extract_global_flags(args);
+        return match stripped.iter().skip(1).find(|a| !a.starts_with('-')) {
+            Some(tool) => format!(
+                "Unknown tool '{tool}'{}\nTools: {}",
+                did_you_mean(tool, tools.iter().copied()),
+                tools.join(", ")
+            ),
+            None => format!(
+                "Missing tool after count: hcom {cmd} <tool>\nTools: {}",
+                tools.join(", ")
+            ),
+        };
+    }
+    let candidates = COMMANDS.iter().chain(tools.iter()).copied();
+    format!(
+        "Unknown command '{cmd}'{}\nRun 'hcom --help' for usage.",
+        did_you_mean(cmd, candidates)
+    )
 }
 
 fn maybe_external_send_name_hint(
@@ -92,7 +124,23 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
             String::new(),
         ),
         Tool::OpenCode => crate::hooks::opencode::dispatch_opencode_hook(hook, args),
-        Tool::Adhoc => unreachable!("adhoc has no hooks"),
+        Tool::Kilo => crate::hooks::opencode::dispatch_opencode_hook(hook, args),
+        Tool::Pi => crate::hooks::pi::dispatch_pi_hook(hook, args),
+        Tool::Omp => crate::hooks::omp::dispatch_omp_hook(hook, args),
+        Tool::Antigravity => (
+            crate::hooks::gemini::dispatch_gemini_hook(hook),
+            String::new(),
+        ),
+        Tool::Cursor => (
+            crate::hooks::cursor::dispatch_cursor_hook_native(hook),
+            String::new(),
+        ),
+        Tool::Kimi => (crate::hooks::kimi::dispatch_kimi_hook(hook), String::new()),
+        Tool::Copilot => (
+            crate::hooks::copilot::dispatch_copilot_hook_native(hook),
+            String::new(),
+        ),
+        Tool::Grok | Tool::Adhoc => unreachable!("{} has no hooks", tool.as_str()),
     }
 }
 
@@ -115,6 +163,9 @@ pub enum Action {
     Version,
     /// Show help
     Help,
+    /// `hcom help <topic...>`: print that topic's help page. Never dispatches
+    /// the target, since not every target (scripts, relay-worker) honors --help.
+    TopicHelp { args: Vec<String> },
     /// Open TUI in new terminal window
     NewTerminal,
     /// Run relay-worker process
@@ -267,6 +318,13 @@ pub fn resolve_action(argv: &[String]) -> Action {
     // Global flags as commands
     match first {
         "--help" | "-h" => return Action::Help,
+        // `hcom help [cmd...]` == `hcom [cmd...] --help`
+        "help" if argv.len() == 1 => return Action::Help,
+        "help" => {
+            return Action::TopicHelp {
+                args: argv[1..].to_vec(),
+            };
+        }
         "--version" | "-v" => return Action::Version,
         "--new-terminal" => return Action::NewTerminal,
         _ => {}
@@ -313,14 +371,13 @@ pub fn resolve_action(argv: &[String]) -> Action {
         };
     }
     // Numeric count + tool: `hcom 3 claude`
-    if cmd_token.parse::<u32>().is_ok() {
-        if let Some(second) = stripped.get(1) {
-            if is_launch_tool(second.as_str()) {
-                return Action::Launch {
-                    args: argv.to_vec(),
-                };
-            }
-        }
+    if cmd_token.parse::<u32>().is_ok()
+        && let Some(second) = stripped.get(1)
+        && is_launch_tool(second.as_str())
+    {
+        return Action::Launch {
+            args: argv.to_vec(),
+        };
     }
 
     // --new-terminal can appear after flags: `hcom --name foo --new-terminal`
@@ -386,8 +443,10 @@ pub fn maybe_reexec_dev_root() {
 
     // Re-exec: replace this process with the dev root's binary
     let args: Vec<String> = env::args().collect();
-    let err = Command::new(&target_binary).args(&args[1..]).exec();
-    // exec() only returns on error
+    let mut cmd = Command::new(&target_binary);
+    cmd.args(&args[1..]);
+    let err = crate::sys::process::exec_replace(cmd);
+    // exec_replace only returns on error
     log_error(
         "router",
         "dev_root_reexec_failed",
@@ -408,11 +467,47 @@ fn is_config_dev_root_invocation(argv: &[String]) -> bool {
     )
 }
 
+/// `hcom update` must run from the binary the user invoked. Re-executing a
+/// configured dev-root binary would compare the checkout version and inspect
+/// the checkout executable path instead of updating the installed binary.
+fn is_update_invocation(argv: &[String]) -> bool {
+    let (positional, _, _) = extract_global_flags_full(argv);
+    match positional.as_slice() {
+        [first, ..] if first == "update" => true,
+        [first, second, ..] => first == "help" && second == "update",
+        _ => false,
+    }
+}
+
+/// Print help for `hcom help <topic...>` without running anything.
+fn print_topic_help(args: &[String]) -> i32 {
+    let (stripped, _, _) = extract_global_flags_full(args);
+    // `hcom help 3 claude` == `hcom help claude`
+    let words: Vec<String> = stripped
+        .into_iter()
+        .skip_while(|a| a.parse::<u32>().is_ok())
+        .collect();
+    let Some(name) = words.first().map(String::as_str) else {
+        crate::commands::help::print_help();
+        return 0;
+    };
+    let topic = if is_command(name) {
+        crate::commands::help::help_topic(name, &words[1..])
+    } else if is_launch_tool(name) || matches!(name, "resume" | "fork") {
+        name.to_string()
+    } else {
+        eprintln!("Error: {}", unknown_command_message(name, &words));
+        return 1;
+    };
+    crate::commands::help::print_command_help(&topic);
+    0
+}
+
 pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'static str)> {
-    if let Ok(r) = env::var("HCOM_DEV_ROOT") {
-        if !r.is_empty() {
-            return Some((PathBuf::from(r), "env"));
-        }
+    if let Ok(r) = env::var("HCOM_DEV_ROOT")
+        && !r.is_empty()
+    {
+        return Some((PathBuf::from(r), "env"));
     }
 
     read_dev_root_from_kv(db_path).map(|path| (path, "kv"))
@@ -479,8 +574,9 @@ pub fn dispatch() -> anyhow::Result<()> {
     let argv = &args[1..]; // strip binary name
 
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
-    // trap the user — the invoked binary owns its own dev_root setting.
-    if !is_config_dev_root_invocation(argv) {
+    // trap the user. Also keep `update` on the invoked (installed) binary;
+    // otherwise the checkout's version and path would drive update decisions.
+    if !is_config_dev_root_invocation(argv) && !is_update_invocation(argv) {
         maybe_reexec_dev_root();
     }
 
@@ -492,12 +588,15 @@ pub fn dispatch() -> anyhow::Result<()> {
     if !is_update_cmd
         && matches!(
             action,
-            Action::Command { .. } | Action::Launch { .. } | Action::Version | Action::Help
+            Action::Command { .. }
+                | Action::Launch { .. }
+                | Action::Version
+                | Action::Help
+                | Action::TopicHelp { .. }
         )
+        && let Some(notice) = crate::update::get_update_notice()
     {
-        if let Some(notice) = crate::update::get_update_notice() {
-            eprintln!("{notice}");
-        }
+        eprintln!("{notice}");
     }
 
     match action {
@@ -594,9 +693,8 @@ pub fn dispatch() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Action::Command { ref cmd, .. } => {
-            eprintln!("Error: Unknown command '{}'", cmd);
-            eprintln!("Run 'hcom --help' for usage.");
+        Action::Command { ref cmd, ref args } => {
+            eprintln!("Error: {}", unknown_command_message(cmd, args));
             std::process::exit(1);
         }
         Action::Version => {
@@ -604,6 +702,12 @@ pub fn dispatch() -> anyhow::Result<()> {
         }
         Action::Help => {
             crate::commands::help::print_help();
+        }
+        Action::TopicHelp { ref args } => {
+            let exit_code = print_topic_help(args);
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Action::NewTerminal => {
             let exit_code = launch_new_terminal();
@@ -652,6 +756,7 @@ fn launch_new_terminal() -> i32 {
         false, // not run_here (open new window)
         None,  // default terminal
         inside_ai,
+        None, // not launching a specific tool (hcom TUI itself)
     ) {
         Ok((crate::terminal::LaunchResult::Success, _)) => 0,
         Ok((crate::terminal::LaunchResult::Failed(msg), _)) => {
@@ -684,7 +789,8 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     // Per-command --help: native help text
     // ("run" handles --help itself for script-level help)
     if help_requested && cmd != "run" {
-        crate::commands::help::print_command_help(cmd);
+        let topic = crate::commands::help::help_topic(cmd, stripped.get(1..).unwrap_or_default());
+        crate::commands::help::print_command_help(&topic);
         return 0;
     }
 
@@ -716,9 +822,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let process_id = std::env::var("HCOM_PROCESS_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let codex_thread_id = std::env::var("CODEX_THREAD_ID")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let codex_thread_id = crate::shared::context::HcomContext::from_os().codex_thread_id;
     let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
     let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(
@@ -750,22 +854,6 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     {
         eprintln!("Error: {e}");
         return 1;
-    }
-
-    // Subagent context: require explicit --name for identity-gated commands inside Claude
-    if crate::identity::requires_identity(cmd)
-        && ctx.explicit_name.is_none()
-        && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-    {
-        if let Some(ref identity) = ctx.identity {
-            if crate::instances::in_subagent_context(&db, &identity.name) {
-                eprintln!(
-                    "Error: Subagent context active - explicit identity required\n\
-                     Use: hcom {cmd} --name parent (for parent) or --name <uuid> (for subagent)"
-                );
-                return 1;
-            }
-        }
     }
 
     // Set hookless command status (subagent/codex/adhoc)
@@ -856,9 +944,28 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::archive::cmd_archive(&db, &args, Some(&ctx))
         ),
-        "reset" => clap_dispatch!(crate::commands::reset::ResetArgs, cmd, &cmd_argv, |args| {
-            crate::commands::reset::cmd_reset(&db, &args, Some(&ctx))
-        }),
+        "reset" => match clap_parse!(crate::commands::reset::ResetArgs, cmd, &cmd_argv) {
+            Ok(args) => {
+                if let Some(exit_code) =
+                    crate::commands::reset::try_cmd_reset_preserving_db(&db, &args, Some(&ctx))
+                {
+                    exit_code
+                } else {
+                    return crate::commands::reset::cmd_reset(db, &args, Some(&ctx));
+                }
+            }
+            Err(e) => {
+                e.print().ok();
+                let code = if e.use_stderr() { 1 } else { 0 };
+                if let Err(e) =
+                    crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
+                {
+                    eprintln!("hcom: {e}");
+                    return 1;
+                }
+                return code;
+            }
+        },
         "hooks" => clap_dispatch!(crate::commands::hooks::HooksArgs, cmd, &cmd_argv, |args| {
             crate::commands::hooks::cmd_hooks(&db, &args, Some(&ctx))
         }),
@@ -884,12 +991,14 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Deliver pending messages AFTER command.
-    // Deliver pending messages AFTER command for hookless codex/adhoc instances.
+    // Deliver pending messages AFTER command for adhoc instances (no hooks).
     // This appends unread hcom messages to the command's stdout — keep in mind
     // when changing output contracts or adding machine-readable modes.
-    if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
-        print!("{output}");
+    // Skipped when the command claimed delivery (send, listen). A failed write
+    // leaves the messages unread and fails the command.
+    if let Err(e) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
+        eprintln!("hcom: {e}");
+        return if result == 0 { 1 } else { result };
     }
 
     result
@@ -905,17 +1014,51 @@ mod tests {
     }
 
     #[test]
+    fn hook_tools_are_derived_from_released_specs() {
+        let actual = crate::commands::hooks::hook_tools();
+        let expected: Vec<Tool> = crate::integration_spec::ALL
+            .iter()
+            .filter(|spec| spec.released)
+            .map(|spec| spec.tool)
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn launch_tools_covers_every_released_spec() {
+        // Launch recognition is derived from canonical Tool parsing; every
+        // released canonical name and alias must therefore route automatically.
+        for spec in crate::integration_spec::ALL {
+            if !spec.released {
+                continue;
+            }
+            assert!(
+                is_launch_tool(spec.name),
+                "router did not recognise released tool {}",
+                spec.name
+            );
+            for alias in spec.aliases {
+                assert!(
+                    is_launch_tool(alias),
+                    "router did not recognise alias {} for {}",
+                    alias,
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn read_dev_root_from_kv_returns_stored_value() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
+        let db = crate::db::HcomDb::open_at(&db_path).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO kv (key, value) VALUES (?1, ?2)",
+                rusqlite::params![DEV_ROOT_KV_KEY, "/tmp/dev-root"],
+            )
             .unwrap();
-        conn.execute(
-            "INSERT INTO kv (key, value) VALUES (?1, ?2)",
-            rusqlite::params![DEV_ROOT_KV_KEY, "/tmp/dev-root"],
-        )
-        .unwrap();
 
         assert_eq!(
             read_dev_root_from_kv(&db_path),
@@ -927,9 +1070,7 @@ mod tests {
     fn read_dev_root_from_kv_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)", [])
-            .unwrap();
+        crate::db::HcomDb::open_at(&db_path).unwrap();
 
         assert_eq!(read_dev_root_from_kv(&db_path), None);
     }
@@ -953,6 +1094,22 @@ mod tests {
         ])));
         assert!(!is_config_dev_root_invocation(&sv(&["list"])));
         assert!(!is_config_dev_root_invocation(&[]));
+    }
+
+    #[test]
+    fn is_update_invocation_matches_expected_shapes() {
+        assert!(is_update_invocation(&sv(&["update"])));
+        assert!(is_update_invocation(&sv(&["update", "--check"])));
+        assert!(is_update_invocation(&sv(&["--go", "update"])));
+        assert!(is_update_invocation(&sv(&[
+            "--name", "lovi", "update", "--check"
+        ])));
+        assert!(is_update_invocation(&sv(&["help", "update"])));
+        assert!(!is_update_invocation(&sv(&["config", "update"])));
+        assert!(!is_update_invocation(&sv(&[
+            "send", "@lovi", "--", "update"
+        ])));
+        assert!(!is_update_invocation(&[]));
     }
 
     // ── resolve_action tests ────────────────────────────────────────────
@@ -1091,6 +1248,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn launch_antigravity_direct() {
+        let action = resolve_action(&sv(&["antigravity"]));
+        assert_eq!(
+            action,
+            Action::Launch {
+                args: sv(&["antigravity"])
+            }
+        );
+    }
+
+    #[test]
+    fn launch_agy_direct() {
+        let action = resolve_action(&sv(&["agy"]));
+        assert_eq!(action, Action::Launch { args: sv(&["agy"]) });
+    }
+
+    #[test]
+    fn launch_agy_with_count() {
+        let action = resolve_action(&sv(&["3", "agy", "--some-flag"]));
+        assert_eq!(
+            action,
+            Action::Launch {
+                args: sv(&["3", "agy", "--some-flag"])
+            }
+        );
+    }
+
     // ── Global flags ────────────────────────────────────────────────────
 
     #[test]
@@ -1220,6 +1405,16 @@ mod tests {
     fn help_flag() {
         assert_eq!(resolve_action(&sv(&["--help"])), Action::Help);
         assert_eq!(resolve_action(&sv(&["-h"])), Action::Help);
+        assert_eq!(resolve_action(&sv(&["help"])), Action::Help);
+        assert_eq!(
+            resolve_action(&sv(&["help", "relay-worker"])),
+            Action::TopicHelp {
+                args: sv(&["relay-worker"])
+            }
+        );
+        assert_eq!(print_topic_help(&sv(&["relay-worker"])), 1);
+        assert_eq!(print_topic_help(&sv(&["events", "sub"])), 0);
+        assert_eq!(print_topic_help(&sv(&["3", "claude"])), 0);
     }
 
     #[test]
@@ -1294,19 +1489,26 @@ mod tests {
         assert!(is_hook("gemini-beforeagent"));
         assert!(is_hook("codex-sessionstart"));
         assert!(is_hook("opencode-start"));
+        assert!(is_hook("pi-start"));
+        assert!(is_hook("copilot-sessionstart"));
         assert!(!is_hook("send"));
         assert!(!is_hook("unknown"));
     }
 
     #[test]
     fn hooks_do_not_collide_with_commands_or_launch_tools() {
-        for tool in [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::OpenCode] {
+        for tool in [
+            Tool::Claude,
+            Tool::Gemini,
+            Tool::Codex,
+            Tool::OpenCode,
+            Tool::Copilot,
+            Tool::Pi,
+            Tool::Omp,
+        ] {
             for hook in tool.hooks() {
                 assert!(!COMMANDS.contains(hook), "{hook} collides with command");
-                assert!(
-                    !LAUNCH_TOOLS.contains(hook),
-                    "{hook} collides with launch tool"
-                );
+                assert!(!is_launch_tool(hook), "{hook} collides with launch tool");
             }
         }
     }

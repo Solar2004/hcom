@@ -13,7 +13,7 @@ use crate::launcher::{self, LaunchParams};
 use crate::log;
 
 use super::{
-    control_topic, crypto, device_short_id, is_relay_enabled, load_psk, read_device_uuid,
+    control_topic, crypto, device_short_id_for_db, is_relay_enabled, load_psk, read_device_uuid,
     safe_kv_get, safe_kv_set,
 };
 
@@ -21,6 +21,7 @@ use super::{
 /// the AEAD-sealed bytes; the underlying JSON layout is unchanged from the
 /// pre-encryption format so callers don't have to know about the cipher.
 fn build_control_payload(
+    db: &HcomDb,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
@@ -45,7 +46,7 @@ fn build_control_payload(
     };
 
     let device_id = read_device_uuid()?;
-    let short_id = device_short_id(&device_id);
+    let short_id = device_short_id_for_db(db, &device_id);
     let now = crate::shared::time::now_epoch_f64();
     let mut control_data = json!({
         "action": action,
@@ -75,6 +76,7 @@ fn build_control_payload(
 }
 
 pub fn build_rpc_control_payload(
+    db: &HcomDb,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
@@ -82,6 +84,7 @@ pub fn build_rpc_control_payload(
     params: &serde_json::Value,
 ) -> Option<(String, Vec<u8>)> {
     build_control_payload(
+        db,
         config,
         action,
         target_device_short_id,
@@ -91,6 +94,7 @@ pub fn build_rpc_control_payload(
 }
 
 fn send_control_via_ephemeral(
+    db: &HcomDb,
     config: &HcomConfig,
     client: &super::client::EphemeralClient,
     action: &str,
@@ -98,11 +102,17 @@ fn send_control_via_ephemeral(
     request_id: Option<&str>,
     params: &serde_json::Value,
 ) -> bool {
-    let (topic, payload_bytes) =
-        match build_control_payload(config, action, target_device_short_id, request_id, params) {
-            Some(v) => v,
-            None => return false,
-        };
+    let (topic, payload_bytes) = match build_control_payload(
+        db,
+        config,
+        action,
+        target_device_short_id,
+        request_id,
+        params,
+    ) {
+        Some(v) => v,
+        None => return false,
+    };
 
     let result = client.publish_and_wait(
         &topic,
@@ -143,6 +153,7 @@ fn send_control_via_ephemeral(
 
 /// Send an RPC control command using an ephemeral client.
 pub fn send_rpc_control_ephemeral(
+    db: &HcomDb,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
@@ -155,6 +166,7 @@ pub fn send_rpc_control_ephemeral(
     };
 
     let result = send_control_via_ephemeral(
+        db,
         config,
         &ephemeral,
         action,
@@ -168,6 +180,7 @@ pub fn send_rpc_control_ephemeral(
 }
 
 pub fn send_one_way_control_ephemeral(
+    db: &HcomDb,
     config: &HcomConfig,
     action: &str,
     target_device_short_id: &str,
@@ -179,6 +192,7 @@ pub fn send_one_way_control_ephemeral(
     };
 
     let result = send_control_via_ephemeral(
+        db,
         config,
         &ephemeral,
         action,
@@ -246,11 +260,46 @@ pub fn send_rpc_request_and_wait_with_db(
         return Err("relay worker not running - start with: hcom relay on".to_string());
     }
     ensure_remote_action_supported(db, target_device_short_id, action, target_name)?;
-    let request_id = uuid::Uuid::new_v4().to_string();
-    if !send_rpc_control_ephemeral(config, action, target_device_short_id, &request_id, params) {
-        return Err(format!("failed to send {} request", action));
+
+    let max_attempts = if action == rpc_action::TERM_SCREEN {
+        5
+    } else {
+        1
+    };
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        if !send_rpc_control_ephemeral(
+            db,
+            config,
+            action,
+            target_device_short_id,
+            &request_id,
+            params,
+        ) {
+            if attempt + 1 == max_attempts {
+                return Err(format!("failed to send {} request", action));
+            }
+            continue;
+        }
+
+        match wait_for_rpc_result_with_db(db, &request_id, timeout) {
+            Ok(result) => return Ok(result),
+            Err(e)
+                if action == rpc_action::TERM_SCREEN
+                    && attempt + 1 < max_attempts
+                    && e.starts_with("timed out waiting for rpc_result") =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    wait_for_rpc_result_with_db(db, &request_id, timeout)
+
+    Err(format!("failed to send {} request", action))
 }
 
 pub fn require_successful_rpc_result(response: Value) -> Result<Value, String> {
@@ -637,7 +686,6 @@ struct RemoteLaunchRequest {
     system_prompt: Option<String>,
     initial_prompt: Option<String>,
     background: bool,
-    pty: bool,
     terminal: Option<String>,
     cwd: Option<String>,
 }
@@ -657,7 +705,6 @@ impl RemoteLaunchRequest {
             system_prompt: optional_param(params, "system_prompt").map(ToString::to_string),
             initial_prompt: optional_param(params, "initial_prompt").map(ToString::to_string),
             background: bool_param(params, "background", false),
-            pty: bool_param(params, "pty", false),
             terminal: optional_param(params, "terminal").map(ToString::to_string),
             cwd: optional_param(params, "cwd").map(ToString::to_string),
         })
@@ -667,26 +714,21 @@ impl RemoteLaunchRequest {
 struct PreparedRemoteLaunch {
     args: Vec<String>,
     background: bool,
-    pty: bool,
 }
 
 fn prepare_remote_launch(
     request: &RemoteLaunchRequest,
     config: &HcomConfig,
 ) -> PreparedRemoteLaunch {
-    let (args, background, pty) = crate::commands::launch::prepare_launch_execution(
-        &request.tool,
+    let tool = crate::launcher::LaunchTool::from_str(&request.tool)
+        .unwrap_or_else(|_| panic!("validated remote launch tool: {}", request.tool));
+    let (args, background) = crate::commands::launch::prepare_launch_execution(
+        &tool,
         &request.args,
         config,
         request.background,
-        request.pty,
-        request.initial_prompt.as_deref(),
     );
-    PreparedRemoteLaunch {
-        args,
-        background,
-        pty,
-    }
+    PreparedRemoteLaunch { args, background }
 }
 
 struct RemoteResumeRequest {
@@ -723,7 +765,6 @@ fn handle_remote_launch(
     crate::commands::launch::validate_claude_headless_launch(
         &request.tool,
         prepared.background,
-        prepared.pty,
         &prepared.args,
         request.initial_prompt.as_deref(),
     )
@@ -736,10 +777,11 @@ fn handle_remote_launch(
             tool: request.tool.clone(),
             count: request.count,
             args: prepared.args,
+            persisted_args: None,
+            prior_session_id: None,
             tag: request.tag,
             system_prompt: request.system_prompt,
             initial_prompt: request.initial_prompt,
-            pty: prepared.pty,
             background: prepared.background,
             cwd: Some(cwd.clone()),
             env: None,
@@ -776,6 +818,7 @@ fn handle_remote_kill(
             crate::terminal::KillResult::PermissionDenied => "permission_denied",
         },
         "pane_closed": result.pane_closed,
+        "pane_retry_command": result.pane_retry_command,
         "preset_name": result.preset_name,
         "pane_id": result.pane_id,
         "ok": !matches!(result.kill_result, crate::terminal::KillResult::PermissionDenied),
@@ -894,7 +937,10 @@ fn handle_remote_relay_off(
     if super::worker::is_relay_worker_running() {
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(100));
-            let _ = super::worker::stop_relay_worker();
+            // Blocking + force-kill fallback: the graceful request is
+            // best-effort and may not reach a consoleless worker on Windows,
+            // and the watchdog won't auto-exit while local instances remain.
+            super::worker::stop_relay_worker_blocking();
         });
     }
     Ok(json!({
@@ -941,9 +987,28 @@ fn handle_remote_transcript(
     let json_mode = bool_param(params, "json", false);
     let full_mode = bool_param(params, "full", false);
     let detailed = bool_param(params, "detailed", false);
-    let content = crate::commands::transcript::render_instance_transcript_with_options_no_retry(
-        db, target, range, last_n, json_mode, full_mode, detailed,
-    )?;
+    let display_target = optional_param(params, "display_target").unwrap_or(target);
+    let content = match optional_param(params, "origin_device") {
+        Some(device) => {
+            crate::commands::transcript::render_remote_instance_transcript_with_options_no_retry(
+                db,
+                target,
+                display_target,
+                device,
+                &crate::commands::transcript::TranscriptRenderOpts {
+                    range,
+                    last_n,
+                    json_mode,
+                    full_mode,
+                    detailed,
+                    retry_codex: false,
+                },
+            )?
+        }
+        None => crate::commands::transcript::render_instance_transcript_with_options_no_retry(
+            db, target, range, last_n, json_mode, full_mode, detailed,
+        )?,
+    };
     Ok(json!({"target": target, "content": content}))
 }
 
@@ -1057,7 +1122,7 @@ fn handle_remote_sub_create(
     let caller = if caller_is_external {
         caller_input.to_string()
     } else {
-        crate::instances::resolve_display_name(db, caller_input)
+        crate::identity::resolve_display_name(db, caller_input)
             .or_else(|| {
                 db.conn()
                     .query_row(
@@ -1104,22 +1169,22 @@ fn handle_remote_sub_create(
 
     let on_hit = params.get("on_hit").and_then(|v| v.as_str());
     let outcome = if filters.is_empty() {
-        crate::commands::events::build_and_insert_sql_subscription(
+        crate::db::subscriptions::build_and_insert_sql_subscription(
             db, &sql_parts, &caller, once, on_hit,
         )?
     } else {
-        crate::commands::events::build_and_insert_filter_subscription(
+        crate::db::subscriptions::create_filter_subscription(
             db, &filters, &sql_parts, &caller, once, on_hit,
         )?
     };
 
     match outcome {
-        crate::commands::events::SubCreateOutcome::Created { id, .. } => Ok(json!({
+        crate::db::subscriptions::SubCreateOutcome::Created { id, .. } => Ok(json!({
             "id": id,
             "caller": caller,
             "already_existed": false,
         })),
-        crate::commands::events::SubCreateOutcome::AlreadyExists { id } => Ok(json!({
+        crate::db::subscriptions::SubCreateOutcome::AlreadyExists { id } => Ok(json!({
             "id": id,
             "caller": caller,
             "already_existed": true,
@@ -1279,6 +1344,7 @@ pub fn handle_control_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::test_helpers::isolated_test_env;
     use serde_json::json;
 
     fn test_db() -> HcomDb {
@@ -1373,14 +1439,18 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_build_rpc_control_payload_includes_request_id_and_params() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let psk = [0x55u8; 32];
         let config = HcomConfig {
             relay_id: "relay-1".to_string(),
             relay_psk: super::super::encode_psk(&psk),
             ..Default::default()
         };
+        let db = test_db();
         let (topic, sealed) = build_rpc_control_payload(
+            &db,
             &config,
             "launch",
             "WXYZ",
@@ -1430,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_remote_launch_supports_interactive_pty() {
+    fn test_prepare_remote_launch_supports_interactive() {
         let request = RemoteLaunchRequest::from_params(&json!({
             "tool": "codex",
             "count": 1,
@@ -1440,7 +1510,6 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(!prepared.background);
-        assert!(prepared.pty);
         assert_eq!(prepared.args, vec!["--model", "gpt-5.4"]);
     }
 
@@ -1455,13 +1524,36 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        assert!(!prepared.pty);
     }
 
     #[test]
-    fn test_prepare_remote_launch_claude_headless_with_hcom_prompt_injects_print() {
-        // Remote claude --headless --hcom-prompt "..." must go through the same
+    fn test_prepare_remote_launch_claude_print_normalizes() {
+        // Remote `claude -p` (explicit print mode) must go through the same
         // print-mode normalization as the local path.
+        let request = RemoteLaunchRequest::from_params(&json!({
+            "tool": "claude",
+            "count": 1,
+            "args": ["-p"],
+            "background": true,
+            "initial_prompt": "say hi in hcom",
+        }))
+        .unwrap();
+        let prepared = prepare_remote_launch(&request, &HcomConfig::default());
+        assert!(prepared.background);
+        assert!(prepared.args.iter().any(|arg| arg == "-p"));
+        assert!(
+            prepared
+                .args
+                .windows(2)
+                .any(|w| w == ["--output-format", "stream-json"])
+        );
+        assert!(prepared.args.iter().any(|arg| arg == "--verbose"));
+    }
+
+    #[test]
+    fn test_prepare_remote_launch_claude_headless_stays_pty() {
+        // Bare remote `claude --headless` (no -p) is the live PTY session — no -p
+        // is injected, no print-mode defaults, matching the local path.
         let request = RemoteLaunchRequest::from_params(&json!({
             "tool": "claude",
             "count": 1,
@@ -1472,41 +1564,34 @@ mod tests {
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        assert!(!prepared.pty);
-        let spec = crate::hooks::claude_args::resolve_claude_args(Some(&prepared.args), None);
         assert!(
-            spec.is_background,
-            "remote claude + --headless + --hcom-prompt must inject -p"
+            !prepared
+                .args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-p" | "--print"))
         );
-        assert!(spec.has_flag(&["--output-format"], &["--output-format="]));
-        assert!(spec.has_flag(&["--verbose"], &[]));
     }
 
     #[test]
-    fn test_remote_launch_rejects_bare_claude_headless() {
-        // Bare remote `claude --headless` with no prompt must be rejected, matching
-        // the local CLI path's validate_claude_headless_launch invariant. Without
-        // this, the remote handler would fall through to a detached plain-claude
-        // launch. (We only assert the prepared state + validator result here,
-        // without calling the full handle_remote_launch which needs a live DB.)
+    fn test_remote_launch_defers_claude_print_prompt_validation() {
         let request = RemoteLaunchRequest::from_params(&json!({
             "tool": "claude",
             "count": 1,
-            "args": [],
+            "args": ["-p"],
             "background": true,
         }))
         .unwrap();
         let prepared = prepare_remote_launch(&request, &HcomConfig::default());
         assert!(prepared.background);
-        let err = crate::commands::launch::validate_claude_headless_launch(
-            &request.tool,
-            prepared.background,
-            prepared.pty,
-            &prepared.args,
-            request.initial_prompt.as_deref(),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("requires a prompt/task"));
+        assert!(
+            crate::commands::launch::validate_claude_headless_launch(
+                &request.tool,
+                prepared.background,
+                &prepared.args,
+                request.initial_prompt.as_deref(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1579,10 +1664,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_handle_control_events_relay_off_disables_local_relay() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let config = HcomConfig {
-            relay: "mqtts://broker.emqx.io:8883".to_string(),
+            relay: "mqtt://127.0.0.1:1".to_string(),
             relay_id: "relay-1".to_string(),
             relay_psk: super::super::encode_psk(&[0x22; 32]),
             relay_enabled: true,

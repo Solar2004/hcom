@@ -9,38 +9,99 @@
 
 mod inject;
 pub mod screen;
+#[cfg(any(unix, windows))]
+mod shared;
+#[cfg(unix)]
 mod terminal;
+#[cfg(windows)]
+mod win;
 
+#[cfg(windows)]
+pub use win::Proxy;
+
+#[cfg(unix)]
 use anyhow::{Context, Result, bail};
+#[cfg(unix)]
 use nix::errno::Errno;
+#[cfg(unix)]
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
+#[cfg(unix)]
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+#[cfg(unix)]
 use nix::pty::openpty;
+#[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
-use nix::unistd::{Pid, read, write};
+#[cfg(unix)]
+use nix::unistd::{Pid, pipe, read, write};
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::process::{Child, Command, ExitStatus};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::mpsc;
+#[cfg(unix)]
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
+#[cfg(unix)]
 use inject::InjectServer;
+#[cfg(unix)]
 use screen::ScreenTracker;
+#[cfg(unix)]
 use terminal::TerminalGuard;
 
-use crate::config::Config;
-use crate::db::HcomDb;
-use crate::delivery::{DeliveryState, ScreenState, ToolConfig, run_delivery_loop};
-use crate::log::{log_error, log_info, log_warn};
-use crate::notify::NotifyServer;
-use crate::shared::status_icon;
+#[cfg(unix)]
+use crate::delivery::ScreenState;
+use crate::tool::Tool;
+
+/// Identity of the process wrapped by the PTY.
+///
+/// Arbitrary commands are supported for diagnostics and tests, but they must
+/// remain explicitly ad-hoc rather than inheriting a known integration's
+/// behavior when their command name does not parse as a [`Tool`].
+#[derive(Clone, Debug)]
+pub enum PtyTarget {
+    Known(Tool),
+    AdhocCommand(String),
+}
+
+impl PtyTarget {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Known(tool) => tool.as_str(),
+            Self::AdhocCommand(command) => command,
+        }
+    }
+
+    pub(super) fn known_tool(&self) -> Option<Tool> {
+        match self {
+            Self::Known(tool) => Some(*tool),
+            Self::AdhocCommand(_) => None,
+        }
+    }
+
+    pub(super) fn delivery_tool(&self) -> Tool {
+        match self {
+            Self::Known(tool) => *tool,
+            Self::AdhocCommand(_) => Tool::Adhoc,
+        }
+    }
+
+    pub(super) fn delivery_start_timeout(&self) -> Duration {
+        Duration::from_secs(self.delivery_tool().spec().pty.delivery_start_timeout_secs)
+    }
+}
 
 /// Tracks what type of incomplete escape sequence is pending on stdout.
 /// Used to defer title writes until the sequence completes across read boundaries.
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[cfg(unix)]
 enum PendingEscape {
     None,
     /// Incomplete CSI (ESC [) — complete when final byte (0x40-0x7E) appears
@@ -48,19 +109,87 @@ enum PendingEscape {
     /// Incomplete string sequence (OSC 3+, DCS, PM, APC) — complete when BEL (0x07)
     /// or ST (ESC \) appears. Title OSCs (0/1/2) are stripped by TitleOscFilter.
     StringSeq,
+    /// Incomplete single-shift (SS2 `ESC N` / SS3 `ESC O`) — consumes exactly one
+    /// following byte; complete as soon as any byte follows.
+    SingleShift,
+    /// Incomplete nF escape (`ESC` + intermediate bytes 0x20-0x2F, e.g. charset
+    /// designation `ESC ( B`) — complete when a final byte 0x30-0x7E appears.
+    NfSeq,
 }
 
 /// Check if it's safe to write title OSC to stdout.
 ///
-/// Three guards prevent corruption from interleaving with tool output:
-/// 1. `had_pty_output` — no PTY data this poll iteration (same-iteration guard)
-/// 2. `pending_utf8` — no incomplete UTF-8 multi-byte sequence (cross-iteration)
-/// 3. `pending_escape` — no incomplete CSI/OSC escape sequence on stdout
-///    (cross-iteration guard for escape sequences, which are all-ASCII
-///    and invisible to pending_utf8)
+/// The title OSC (1/2) is appended right after this iteration's coalesced PTY
+/// write, on the same single-threaded stdout (the delivery thread never writes
+/// stdout). OSC 1/2 set only window-title metadata — they don't touch the grid
+/// or cursor — so interleaving them *between complete sequences* mid-frame is
+/// safe. The only corruption risk is splitting an *incomplete* sequence, which
+/// these two guards rule out:
+/// - `pending_utf8` — no incomplete UTF-8 multi-byte sequence
+/// - `pending_escape` — buffer doesn't end inside an incomplete escape sequence
+///   (CSI, OSC/DCS/PM/APC string, single-shift, or nF) — see [`has_pending_escape`]
+///
+/// We deliberately do *not* gate on "no PTY output this iteration": a
+/// continuously-rendering TUI (e.g. pi during a turn) never yields a quiet
+/// iteration, which starved status-icon title updates entirely.
 #[inline]
-fn title_write_safe(had_pty_output: bool, pending_utf8: u8, pending_escape: PendingEscape) -> bool {
-    !had_pty_output && pending_utf8 == 0 && pending_escape == PendingEscape::None
+#[cfg(unix)]
+fn title_write_safe(pending_utf8: u8, pending_escape: PendingEscape) -> bool {
+    pending_utf8 == 0 && pending_escape == PendingEscape::None
+}
+
+/// Detect the submit edge from input text snapshots.
+///
+/// The prompt can briefly become undetectable while a TUI redraws, so treat
+/// non-empty -> None the same as non-empty -> empty. That preserves the
+/// cooldown across a Some("text") -> None -> Some("") transition.
+#[cfg(any(unix, windows))]
+fn prompt_submit_observed(
+    previous_input_text: Option<&str>,
+    current_input_text: Option<&str>,
+) -> bool {
+    let had_text = previous_input_text.is_some_and(|text| !text.is_empty());
+    let has_text_now = current_input_text.is_some_and(|text| !text.is_empty());
+    had_text && !has_text_now
+}
+
+/// Strip terminal focus in/out events (`CSI I` = `1b 5b 49`, `CSI O` = `1b 5b 4f`)
+/// from a forwarded stdin chunk. Returns `None` when there is nothing to strip,
+/// so the common keystroke path does not allocate.
+///
+/// GitHub Copilot CLI enables focus reporting (DECSET 1004) and *pauses draining
+/// its stdin on focus-out*. hcom drives copilot purely by injection, so once the
+/// pane is blurred that pause silently stalls message delivery until the user
+/// refocuses — and only a real terminal focus-in resumes it (an injected `CSI I`
+/// does not, because while paused copilot isn't reading stdin at all). Hiding
+/// focus events keeps copilot in its always-reading state, exactly like a pane
+/// that was never focused. Scoped to copilot at the call site.
+///
+/// Terminals emit these 3-byte events atomically, so a sequence split across
+/// reads is not tracked — it would pass through and cause at most one transient
+/// pause, self-corrected by the next focus event.
+#[cfg(unix)]
+fn strip_focus_events(buf: &[u8]) -> Option<Vec<u8>> {
+    if !buf.contains(&0x1b) {
+        return None;
+    }
+    let mut found = false;
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b
+            && i + 2 < buf.len()
+            && buf[i + 1] == b'['
+            && matches!(buf[i + 2], b'I' | b'O')
+        {
+            found = true;
+            i += 3;
+            continue;
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    found.then_some(out)
 }
 
 /// Check if data ends inside an incomplete escape sequence.
@@ -76,6 +205,7 @@ fn title_write_safe(had_pty_output: bool, pending_utf8: u8, pending_escape: Pend
 /// so those never appear in the filtered output. This function only sees
 /// ESC bytes that the filter passed through (non-title sequences).
 #[inline]
+#[cfg(unix)]
 fn has_pending_escape(data: &[u8]) -> PendingEscape {
     if data.is_empty() {
         return PendingEscape::None;
@@ -127,8 +257,8 @@ fn has_pending_escape(data: &[u8]) -> PendingEscape {
             }
             PendingEscape::StringSeq
         }
-        b'P' | b'^' | b'_' => {
-            // DCS / PM / APC: terminated by ST (ESC \)
+        b'P' | b'^' | b'_' | b'X' => {
+            // DCS / PM / APC / SOS: terminated by ST (ESC \)
             let content = &after[1..];
             let mut i = 0;
             while i < content.len() {
@@ -139,8 +269,27 @@ fn has_pending_escape(data: &[u8]) -> PendingEscape {
             }
             PendingEscape::StringSeq
         }
+        b'N' | b'O' => {
+            // SS2 / SS3 single-shift: consume exactly one following byte
+            if after.len() >= 2 {
+                PendingEscape::None
+            } else {
+                PendingEscape::SingleShift
+            }
+        }
+        0x20..=0x2F => {
+            // nF escape (e.g. charset designation `ESC ( B`, `ESC # 8`):
+            // ESC, one or more intermediate bytes 0x20-0x2F, then a final 0x30-0x7E.
+            for &b in after {
+                if !(0x20..=0x2F).contains(&b) {
+                    // Final byte (or an aborting control) — sequence resolved
+                    return PendingEscape::None;
+                }
+            }
+            PendingEscape::NfSeq
+        }
         _ => {
-            // Simple 2-byte escape (ESC + letter) — always complete
+            // Simple 2-byte escape (ESC + final byte 0x30-0x7E) — always complete
             PendingEscape::None
         }
     }
@@ -152,7 +301,10 @@ fn has_pending_escape(data: &[u8]) -> PendingEscape {
 /// has no new ESC, check whether a type-appropriate terminator appears:
 /// - CSI: any byte in 0x40-0x7E (the final byte)
 /// - StringSeq: BEL (0x07) — ST (ESC \) requires ESC, handled by caller
+/// - SingleShift: any single byte completes the shift
+/// - NfSeq: a final byte 0x30-0x7E
 #[inline]
+#[cfg(unix)]
 fn resolve_pending_escape(pending: PendingEscape, data: &[u8]) -> PendingEscape {
     match pending {
         PendingEscape::None => PendingEscape::None,
@@ -170,6 +322,22 @@ fn resolve_pending_escape(pending: PendingEscape, data: &[u8]) -> PendingEscape 
                 PendingEscape::StringSeq
             }
         }
+        PendingEscape::SingleShift => {
+            // Any single following byte completes the shift.
+            if data.is_empty() {
+                PendingEscape::SingleShift
+            } else {
+                PendingEscape::None
+            }
+        }
+        PendingEscape::NfSeq => {
+            // Complete once a final byte (0x30-0x7E) appears.
+            if data.iter().any(|&b| (0x30..=0x7E).contains(&b)) {
+                PendingEscape::None
+            } else {
+                PendingEscape::NfSeq
+            }
+        }
     }
 }
 
@@ -185,6 +353,7 @@ fn resolve_pending_escape(pending: PendingEscape, data: &[u8]) -> PendingEscape 
 /// - 3-byte: 1110xxxx 10xxxxxx 10xxxxxx (starts 0xE0-0xEF)
 /// - 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx (starts 0xF0-0xF7)
 #[inline]
+#[cfg(unix)]
 fn pending_utf8_bytes(data: &[u8]) -> u8 {
     if data.is_empty() {
         return 0;
@@ -259,6 +428,7 @@ fn pending_utf8_bytes(data: &[u8]) -> u8 {
 /// This filter only DISCARDS title bytes — real output passes through immediately.
 /// Max 3 prefix bytes (ESC, ], digit) held at buffer boundary for one poll cycle.
 #[derive(Clone, Copy, PartialEq)]
+#[cfg(unix)]
 enum TitleFilterState {
     Pass,
     SawEsc,
@@ -271,11 +441,13 @@ enum TitleFilterState {
     InTitleSawEsc,
 }
 
+#[cfg(unix)]
 struct TitleOscFilter {
     state: TitleFilterState,
     discard_count: usize,
 }
 
+#[cfg(unix)]
 impl TitleOscFilter {
     fn new() -> Self {
         Self {
@@ -371,114 +543,38 @@ impl TitleOscFilter {
 }
 
 // Signal flags (set by signal handlers, checked in main loop)
+#[cfg(unix)]
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static SIGINT_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
+#[cfg(unix)]
 static SIGHUP_RECEIVED: AtomicBool = AtomicBool::new(false);
 
-// Exit reason flag (for cleanup to know context)
-// false = normal exit (closed), true = signal exit (killed)
-// Pub so delivery.rs can check it during cleanup
-pub static EXIT_WAS_KILLED: AtomicBool = AtomicBool::new(false);
+// Exit reason flag lives in `delivery` so the delivery loop compiles without
+// the PTY wrapper; the proxy sets it here.
+#[cfg(unix)]
+use crate::delivery::EXIT_WAS_KILLED;
 
+#[cfg(unix)]
 pub extern "C" fn handle_sigwinch(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::Release);
 }
 
+#[cfg(unix)]
 pub extern "C" fn handle_sigint(_: libc::c_int) {
     SIGINT_RECEIVED.store(true, Ordering::Release);
 }
 
+#[cfg(unix)]
 pub extern "C" fn handle_sigterm(_: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::Release);
 }
 
+#[cfg(unix)]
 extern "C" fn handle_sighup(_: libc::c_int) {
     SIGHUP_RECEIVED.store(true, Ordering::Release);
-}
-
-/// Build minimal launch_context JSON from env vars available in the PTY process.
-/// Captures process_id and late-bound terminal metadata needed by kill.
-/// The start hook captures the full context (git_branch, tty, env snapshot) later.
-fn build_early_launch_context() -> String {
-    use serde_json::{Map, Value};
-
-    let mut ctx = Map::new();
-
-    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID") {
-        if !pid.is_empty() {
-            ctx.insert("process_id".into(), Value::String(pid));
-        }
-    }
-
-    // Kitty socket path for close-on-kill (needed when launching from outside kitty)
-    if let Ok(listen) = std::env::var("KITTY_LISTEN_ON") {
-        if !listen.is_empty() {
-            ctx.insert("kitty_listen_on".into(), Value::String(listen));
-        }
-    }
-
-    // Capture pane_id from terminal env vars for same-window launches.
-    let pane_id_vars: &[&str] = &[
-        "WEZTERM_PANE",
-        "TMUX_PANE",
-        "KITTY_WINDOW_ID",
-        "ZELLIJ_PANE_ID",
-    ];
-    for &var in pane_id_vars {
-        if let Ok(val) = std::env::var(var) {
-            if !val.is_empty() {
-                ctx.insert("pane_id".into(), Value::String(val));
-                break;
-            }
-        }
-    }
-
-    // Read terminal_id from temp file written by parent's launch stdout capture.
-    // This is the ID returned by `kitten @ launch` (or similar) and serves as
-    // fallback for pane_id when the terminal env var isn't available.
-    //
-    // Race condition: parent writes this file after `kitten @ launch` returns
-    // (~500ms after child starts), but we run within ~10-100ms of spawn.
-    // Retry with backoff only when pane_id not already captured from env vars
-    // (tmux/wezterm set env vars directly, no file needed).
-    if let Some(process_id) = ctx.get("process_id").and_then(|v| v.as_str()) {
-        let id_file = crate::paths::hcom_dir()
-            .join(".tmp")
-            .join("terminal_ids")
-            .join(process_id);
-        let needs_id = !ctx.contains_key("pane_id");
-        let max_attempts: usize = if needs_id { 10 } else { 1 };
-        let mut terminal_id_value = String::new();
-
-        for attempt in 0..max_attempts {
-            if let Ok(contents) = std::fs::read_to_string(&id_file) {
-                let trimmed = contents.trim().to_string();
-                if !trimmed.is_empty() {
-                    terminal_id_value = trimmed;
-                    break;
-                }
-            }
-            if attempt + 1 < max_attempts {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-
-        if !terminal_id_value.is_empty() {
-            ctx.insert(
-                "terminal_id".into(),
-                Value::String(terminal_id_value.clone()),
-            );
-            if !ctx.contains_key("pane_id") {
-                ctx.insert("pane_id".into(), Value::String(terminal_id_value));
-            }
-        }
-        // Don't delete the file here — capture_context in the SessionStart hook
-        // reads it to persist terminal_id into DB launch_context. If we delete
-        // early, the hook finds exists=false and terminal_id is lost from DB.
-    }
-
-    Value::Object(ctx).to_string()
 }
 
 /// Configuration for the PTY proxy
@@ -487,10 +583,11 @@ pub struct ProxyConfig {
     pub ready_pattern: Vec<u8>,
     /// Instance name for logging and database tracking
     pub instance_name: Option<String>,
-    /// Tool name (claude, gemini, codex)
-    pub tool: String,
+    /// Known integration or explicit ad-hoc command.
+    pub target: PtyTarget,
     /// Extra environment variables to set in the child process
     pub env_vars: Vec<(String, String)>,
+    pub grok_acp: Option<crate::delivery::grok::Launch>,
 }
 
 impl Default for ProxyConfig {
@@ -498,13 +595,15 @@ impl Default for ProxyConfig {
         Self {
             ready_pattern: b"? for shortcuts".to_vec(),
             instance_name: None,
-            tool: "claude".to_string(),
+            target: PtyTarget::Known(Tool::Claude),
             env_vars: vec![],
+            grok_acp: None,
         }
     }
 }
 
 /// PTY proxy that manages the child process and I/O forwarding
+#[cfg(unix)]
 pub struct Proxy {
     config: ProxyConfig,
     pty_master: OwnedFd,
@@ -513,9 +612,12 @@ pub struct Proxy {
     screen: ScreenTracker,
     inject_server: InjectServer,
     last_user_input: Instant,
-    user_activity_cooldown_ms: u64,
     /// Shared delivery state (for delivery thread)
     delivery_state: Arc<RwLock<ScreenState>>,
+    /// True while launch outcome is still Pending. Cleared by the delivery
+    /// loop once it observes a terminal outcome so this proxy can stop
+    /// computing launch-only signals (e.g. `visible_tail`).
+    launch_phase_active: Arc<AtomicBool>,
     /// Running flag for delivery thread
     running: Arc<AtomicBool>,
     /// Last resize time for debouncing (fix #3)
@@ -528,8 +630,15 @@ pub struct Proxy {
     current_name: Arc<RwLock<String>>,
     /// Current status (shared with delivery thread, updated on status change)
     current_status: Arc<RwLock<String>>,
+    /// Read side used to interrupt the proxy poll when title state changes.
+    title_notify_read: OwnedFd,
+    /// Write side shared with the delivery thread's title wake callback.
+    title_notify_write: Arc<OwnedFd>,
+    /// Startup timeline, measured from the child's spawn.
+    startup_trace: shared::StartupTrace,
 }
 
+#[cfg(unix)]
 impl Proxy {
     /// Spawn a new PTY process
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
@@ -541,6 +650,7 @@ impl Proxy {
         terminal::setup_signal_handlers()?;
 
         // Spawn child process
+        let spawn_started = Instant::now();
         let slave_fd = pty.slave.as_raw_fd();
         let master_fd = pty.master.as_raw_fd();
 
@@ -562,7 +672,13 @@ impl Proxy {
                         return Err(io::Error::last_os_error());
                     }
                     // Set controlling terminal
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) == -1 {
+                    #[cfg(target_os = "linux")]
+                    let tiocsctty = libc::TIOCSCTTY;
+                    #[cfg(target_os = "android")]
+                    let tiocsctty = libc::TIOCSCTTY as libc::c_int;
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    let tiocsctty = libc::TIOCSCTTY as libc::c_ulong;
+                    if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
                     // Redirect stdio to slave
@@ -588,16 +704,24 @@ impl Proxy {
                 .spawn()
                 .context("spawn failed")?
         };
+        let spawned_at = Instant::now();
+        shared::log_spawned(
+            config.instance_name.as_deref(),
+            Some(child.id()),
+            spawned_at.duration_since(spawn_started),
+            command,
+        );
+        let startup_trace = shared::StartupTrace::new(spawned_at, config.instance_name.as_deref());
 
         // Write PID and launch context to database for hcom kill
-        if let Some(ref instance_name) = config.instance_name {
-            if let Ok(db) = crate::db::HcomDb::open() {
-                let _ = db.update_instance_pid(instance_name, child.id());
+        if let Some(ref instance_name) = config.instance_name
+            && let Ok(db) = crate::db::HcomDb::open()
+        {
+            let _ = db.update_instance_pid(instance_name, child.id());
 
-                // Capture minimal launch context early so kill can close the terminal pane.
-                // The start hook may later overwrite with richer context (git_branch, tty, env).
-                let _ = db.store_launch_context(instance_name, &build_early_launch_context());
-            }
+            // Capture minimal launch context early so kill can close the terminal pane.
+            // The start hook may later overwrite with richer context (git_branch, tty, env).
+            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
         }
 
         // Close slave in parent
@@ -617,8 +741,6 @@ impl Proxy {
         // Start injection server (port is registered to DB by delivery thread)
         let inject_server = InjectServer::new()?;
 
-        let user_activity_cooldown_ms = 500; // 0.5s for all tools (dim detection enables this for Claude)
-
         // Initialize shared state for terminal title (updated by delivery thread).
         // Query tag from DB to show full display name (tag-name) from the start.
         let initial_display_name = {
@@ -636,6 +758,9 @@ impl Proxy {
         };
         let current_name = Arc::new(RwLock::new(initial_display_name));
         let current_status = Arc::new(RwLock::new("listening".to_string()));
+        let (title_notify_read, title_notify_write) = pipe().context("title notify pipe failed")?;
+        set_nonblocking(&title_notify_read)?;
+        set_nonblocking(&title_notify_write)?;
 
         Ok(Self {
             config,
@@ -645,14 +770,17 @@ impl Proxy {
             screen,
             inject_server,
             last_user_input: Instant::now(),
-            user_activity_cooldown_ms,
             delivery_state: Arc::new(RwLock::new(ScreenState::default())),
+            launch_phase_active: Arc::new(AtomicBool::new(true)),
             running: Arc::new(AtomicBool::new(true)),
             last_resize: None,
             delivery_handle: None,
             notify_port: Arc::new(AtomicU16::new(0)),
             current_name,
             current_status,
+            title_notify_read,
+            title_notify_write: Arc::new(title_notify_write),
+            startup_trace,
         })
     }
 
@@ -672,6 +800,15 @@ impl Proxy {
         // Track last written title to detect changes (delivery thread updates Arcs)
         let mut last_written_name = String::new();
         let mut last_written_status = String::new();
+        // Terminal-title behavior. Read once — a session's config doesn't change
+        // under it. In `Off` we neither strip the tool's titles nor write our own;
+        // in `Combined` we append the tool's live title (read from `self.screen`,
+        // which this thread owns — no extra Arc needed).
+        let title_mode = crate::config::HcomConfig::load(None)
+            .map(|c| crate::shared::TitleMode::from_config(&c.title_mode))
+            .unwrap_or(crate::shared::TitleMode::Combined);
+        let title_enabled = title_mode != crate::shared::TitleMode::Off;
+        let mut last_written_child = String::new();
 
         // Track incomplete UTF-8 sequences to defer title writes.
         // When PTY output ends with partial multi-byte character, writing our title OSC
@@ -685,10 +822,6 @@ impl Proxy {
         // Stateful title OSC filter — strips tool's title sequences across read boundaries
         let mut title_filter = TitleOscFilter::new();
 
-        // Title writes deferred to iterations with NO PTY output, preventing interleaving
-        // with any incomplete escape sequence (CSI, OSC, UTF-8, etc.).
-        let mut had_pty_output: bool;
-
         // Whether to include stdin in the poll set. Set to false when stdin is a non-TTY
         // that reaches EOF (e.g. /dev/null in headless mode), to avoid busy-waiting.
         let mut poll_stdin = true;
@@ -701,20 +834,12 @@ impl Proxy {
         // iteration after, so at most one poll cycle of latency for new connections.
         let mut listener_backoff = false;
 
-        // For Claude in accept-edits mode, ready pattern may be hidden.
-        // Start delivery after timeout if ready pattern not seen.
-        use crate::tool::Tool;
-        use std::str::FromStr;
-
-        let delivery_start_timeout = match Tool::from_str(&self.config.tool) {
-            Ok(Tool::Claude) | Ok(Tool::Codex) => Duration::from_secs(5), // Ready pattern unreliable (Claude: accept-edits, Codex: narrow terminals)
-            Ok(Tool::OpenCode) => Duration::from_secs(5), // Empty ready_pattern fires immediately; 5s fallback
-            _ => Duration::from_secs(60),                 // Gemini: ready pattern always visible
-        };
+        // Start delivery after the integration's explicit fallback timeout if
+        // its ready pattern is hidden or never appears. Ad-hoc commands use the
+        // explicit Adhoc PTY profile rather than inheriting a known tool's value.
+        let delivery_start_timeout = self.config.target.delivery_start_timeout();
 
         loop {
-            had_pty_output = false;
-
             // Handle signals
             if SIGWINCH_RECEIVED.swap(false, Ordering::AcqRel) {
                 self.forward_winsize()?;
@@ -756,6 +881,12 @@ impl Proxy {
                 poll_fds.push(PollFd::new(stdin_borrowed, PollFlags::POLLIN));
             }
 
+            let title_notify_idx = poll_fds.len();
+            poll_fds.push(PollFd::new(
+                self.title_notify_read.as_fd(),
+                PollFlags::POLLIN,
+            ));
+
             // Include the inject listener unless we're in backoff (macOS spurious POLLIN).
             // Reset backoff here so it applies for exactly one iteration.
             let include_listener = !listener_backoff;
@@ -791,27 +922,58 @@ impl Proxy {
             }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
+                    if !ready_signaled {
+                        self.startup_trace.check_not_ready();
+                    }
                     // Timeout - still update delivery state for time-based checks
                     if ready_signaled {
-                        self.update_delivery_state();
+                        shared::update_delivery_state(
+                            &self.delivery_state,
+                            &self.screen,
+                            &self.config.target,
+                            &self.launch_phase_active,
+                            &|a| self.publish_approval(a),
+                        );
                     }
                     // Start delivery thread on timeout if startup_time exceeded
                     // (child may produce no output after initial render, so the
                     // child-output path at line ~621 may never run)
                     if !delivery_started && startup_time.elapsed() > delivery_start_timeout {
                         self.screen.dump_screen(
-                            &self.config.tool,
+                            self.config.target.name(),
                             self.inject_server.port(),
                             "Starting delivery thread (poll timeout)",
                         );
-                        self.start_delivery_thread()?;
+                        match shared::start_delivery_thread(
+                            self.config.instance_name.as_deref(),
+                            self.running.clone(),
+                            self.delivery_state.clone(),
+                            self.launch_phase_active.clone(),
+                            self.inject_server.port(),
+                            self.config.target.clone(),
+                            self.notify_port.clone(),
+                            self.current_name.clone(),
+                            self.current_status.clone(),
+                            Some(title_wake_callback(self.title_notify_write.clone())),
+                            self.config.grok_acp.clone(),
+                        )? {
+                            shared::DeliveryStart::Started(h) => {
+                                self.delivery_handle = Some(h);
+                            }
+                            shared::DeliveryStart::Disabled => {}
+                            shared::DeliveryStart::Pending(_h, _init_rx) => {
+                                // Preserve the Unix behavior a delivery-init
+                                // timeout has always had here: abort the session.
+                                bail!("delivery start timed out");
+                            }
+                        }
                         delivery_started = true;
                     }
                     // Check runtime debug flag toggle
                     self.screen.check_debug_flag();
                     // Periodic debug dump every 5 seconds
                     self.screen.check_periodic_dump(
-                        &self.config.tool,
+                        self.config.target.name(),
                         self.inject_server.port(),
                         "Periodic dump (main loop)",
                     );
@@ -821,7 +983,13 @@ impl Proxy {
                 Err(Errno::EINTR) => {
                     // Interrupted - still update delivery state
                     if ready_signaled {
-                        self.update_delivery_state();
+                        shared::update_delivery_state(
+                            &self.delivery_state,
+                            &self.screen,
+                            &self.config.target,
+                            &self.launch_phase_active,
+                            &|a| self.publish_approval(a),
+                        );
                     }
                     continue;
                 }
@@ -860,7 +1028,9 @@ impl Proxy {
                                 eagain_retries = 0; // reset on successful read
                                 let data = &buf[..n];
                                 raw_chunks.push(data.to_vec());
-                                let (filtered, had_title) = if stdout_is_tty {
+                                // In Off mode, don't strip the tool's own titles —
+                                // let them reach the terminal untouched.
+                                let (filtered, had_title) = if stdout_is_tty && title_enabled {
                                     title_filter.filter(data)
                                 } else {
                                     (data.to_vec(), false)
@@ -903,7 +1073,6 @@ impl Proxy {
                     // Single write of all coalesced data
                     if !coalesced.is_empty() {
                         write_all(&stdout_fd, &coalesced)?;
-                        had_pty_output = true;
                         pending_utf8 = pending_utf8_bytes(&coalesced);
                         pending_escape = if coalesced.contains(&0x1b) {
                             has_pending_escape(&coalesced)
@@ -918,28 +1087,61 @@ impl Proxy {
 
                     // Process raw chunks for screen tracking
                     for raw in &raw_chunks {
+                        self.startup_trace.on_output(raw);
                         self.screen.process(raw);
                     }
                     if !raw_chunks.is_empty() {
-                        self.update_delivery_state();
+                        shared::update_delivery_state(
+                            &self.delivery_state,
+                            &self.screen,
+                            &self.config.target,
+                            &self.launch_phase_active,
+                            &|a| self.publish_approval(a),
+                        );
                         if !ready_signaled && self.screen.is_ready() {
                             ready_signaled = true;
                             self.screen.dump_screen(
-                                &self.config.tool,
+                                self.config.target.name(),
                                 self.inject_server.port(),
                                 "Ready pattern detected",
                             );
+                        }
+                        if !ready_signaled {
+                            self.startup_trace.check_not_ready();
                         }
                         if !delivery_started {
                             let should_start =
                                 ready_signaled || startup_time.elapsed() > delivery_start_timeout;
                             if should_start {
                                 self.screen.dump_screen(
-                                    &self.config.tool,
+                                    self.config.target.name(),
                                     self.inject_server.port(),
                                     "Starting delivery thread",
                                 );
-                                self.start_delivery_thread()?;
+                                match shared::start_delivery_thread(
+                                    self.config.instance_name.as_deref(),
+                                    self.running.clone(),
+                                    self.delivery_state.clone(),
+                                    self.launch_phase_active.clone(),
+                                    self.inject_server.port(),
+                                    self.config.target.clone(),
+                                    self.notify_port.clone(),
+                                    self.current_name.clone(),
+                                    self.current_status.clone(),
+                                    Some(title_wake_callback(self.title_notify_write.clone())),
+                                    self.config.grok_acp.clone(),
+                                )? {
+                                    shared::DeliveryStart::Started(h) => {
+                                        self.delivery_handle = Some(h);
+                                    }
+                                    shared::DeliveryStart::Disabled => {}
+                                    shared::DeliveryStart::Pending(_h, _init_rx) => {
+                                        // Preserve the Unix behavior a
+                                        // delivery-init timeout has always had
+                                        // here: abort the session.
+                                        bail!("delivery start timed out");
+                                    }
+                                }
                                 delivery_started = true;
                             }
                         }
@@ -958,64 +1160,84 @@ impl Proxy {
             }
 
             // Handle stdin (only if we're still polling it)
-            if poll_stdin {
-                if let Some(revents) = poll_fds[1].revents() {
-                    if revents.contains(PollFlags::POLLNVAL) {
-                        // Some headless launch paths can inherit a stdin fd that poll()
-                        // reports as invalid instead of readable EOF. Drop it from the
-                        // poll set to avoid an immediate-return busy loop.
-                        poll_stdin = false;
-                    } else if revents.contains(PollFlags::POLLHUP) {
-                        // Terminal disconnected - exit cleanly
-                        if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
-                        // Non-TTY stdin (e.g. /dev/null or a closed pipe) is not a
-                        // terminal-disconnect signal for headless PTY launches.
-                        poll_stdin = false;
-                    } else if revents.contains(PollFlags::POLLIN) {
-                        match nix_read(&stdin_fd, &mut buf) {
-                            Ok(0) => {
-                                // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
-                                // When running headless, stdin may be /dev/null or a pipe,
-                                // which is always at EOF but does not mean the terminal is gone.
-                                if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
-                                    .unwrap_or(false)
-                                {
-                                    break;
-                                }
-                                // Not a TTY — stop polling stdin to avoid busy-waiting on permanent EOF
-                                poll_stdin = false;
+            if poll_stdin && let Some(revents) = poll_fds[1].revents() {
+                if revents.contains(PollFlags::POLLNVAL) {
+                    // Some headless launch paths can inherit a stdin fd that poll()
+                    // reports as invalid instead of readable EOF. Drop it from the
+                    // poll set to avoid an immediate-return busy loop.
+                    poll_stdin = false;
+                } else if revents.contains(PollFlags::POLLHUP) {
+                    // Terminal disconnected - exit cleanly
+                    if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                    // Non-TTY stdin (e.g. /dev/null or a closed pipe) is not a
+                    // terminal-disconnect signal for headless PTY launches.
+                    poll_stdin = false;
+                } else if revents.contains(PollFlags::POLLIN) {
+                    match nix_read(&stdin_fd, &mut buf) {
+                        Ok(0) => {
+                            // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
+                            // When running headless, stdin may be /dev/null or a pipe,
+                            // which is always at EOF but does not mean the terminal is gone.
+                            if nix::unistd::isatty(unsafe { BorrowedFd::borrow_raw(stdin_raw) })
+                                .unwrap_or(false)
+                            {
+                                break;
                             }
-                            Ok(n) => {
+                            // Not a TTY — stop polling stdin to avoid busy-waiting on permanent EOF
+                            poll_stdin = false;
+                        }
+                        Ok(n) => {
+                            let focus_filtered = strip_focus_events(&buf[..n]);
+                            let user_input = focus_filtered.as_deref().unwrap_or(&buf[..n]);
+                            let has_user_input = !user_input.is_empty();
+
+                            if has_user_input {
                                 self.last_user_input = Instant::now();
-                                self.screen.clear_approval();
-                                // Update delivery state for user activity
-                                if let Ok(mut state) = self.delivery_state.write() {
-                                    state.last_user_input = Instant::now();
-                                    state.approval = false;
+                                // Genuine keystrokes answering a title-detected approval
+                                // clear it immediately. Cursor's approval is screen-scraped
+                                // and authoritative-by-prompt, so it clears only when the
+                                // prompt actually leaves the screen.
+                                let cursor_scrape = self.config.target.name() == "cursor";
+                                if !cursor_scrape {
+                                    self.screen.clear_approval();
                                 }
+                                shared::note_user_keystroke(
+                                    &self.config.target,
+                                    &self.delivery_state,
+                                    &|a| self.publish_approval(a),
+                                );
+                            }
+                            // Copilot pauses stdin processing on terminal focus-out
+                            // (it enables DECSET 1004). Since hcom drives it via
+                            // injection, that pause silently stalls delivery until the
+                            // pane is refocused — so hide focus events from it.
+                            if self.config.target.name() == "copilot"
+                                && let Some(filtered) = focus_filtered
+                            {
+                                write_all(&self.pty_master, &filtered)?;
+                            } else {
                                 write_all(&self.pty_master, &buf[..n])?;
                             }
-                            Err(Errno::EAGAIN) => {}
-                            Err(e) => bail!("read from stdin failed: {}", e),
                         }
+                        Err(Errno::EAGAIN) => {}
+                        Err(e) => bail!("read from stdin failed: {}", e),
                     }
                 }
             }
 
             // Handle inject server accept
-            if let Some(idx) = inject_listener_idx {
-                if let Some(revents) = poll_fds[idx].revents() {
-                    if revents.contains(PollFlags::POLLIN) {
-                        // If accept() returns WouldBlock (false), skip the listener next
-                        // iteration to break the macOS spurious-POLLIN busy-loop.
-                        if !self.inject_server.accept()? {
-                            listener_backoff = true;
-                        }
-                    }
+            if let Some(idx) = inject_listener_idx
+                && let Some(revents) = poll_fds[idx].revents()
+                && revents.contains(PollFlags::POLLIN)
+            {
+                // If accept() returns WouldBlock (false), skip the listener next
+                // iteration to break the macOS spurious-POLLIN busy-loop.
+                if !self.inject_server.accept()? {
+                    listener_backoff = true;
                 }
             }
 
@@ -1027,38 +1249,66 @@ impl Proxy {
                 .map_or_else(|| poll_fds.len() - client_raw_fds.len(), |idx| idx + 1);
             for i in (0..client_raw_fds.len()).rev() {
                 let poll_idx = clients_base + i;
-                if let Some(revents) = poll_fds[poll_idx].revents() {
-                    if revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP) {
-                        match self.inject_server.read_client(i)? {
-                            inject::InjectResult::Inject(text) => {
-                                write_all(&self.pty_master, text.as_bytes())?;
+                if let Some(revents) = poll_fds[poll_idx].revents()
+                    && (revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP))
+                {
+                    match self.inject_server.read_client(i)? {
+                        inject::InjectResult::Inject(text) => {
+                            write_all(&self.pty_master, text.as_bytes())?;
+                            // Injected keystrokes reach the PTY master directly and
+                            // bypass the interactive stdin handler. When one answers a
+                            // pending approval, publish the cleared edge synchronously
+                            // here — while the row is still blocked — instead of leaving
+                            // it to the scrape falling edge, which races (and loses to)
+                            // lifecycle hooks and drops the `pty:approval_cleared` event.
+                            if shared::clear_injected_approval_state(
+                                &self.config.target,
+                                &self.delivery_state,
+                                &|a| self.publish_approval(a),
+                            ) {
+                                self.screen.clear_approval();
                             }
-                            inject::InjectResult::Query(client) => match client.command {
-                                inject::QueryCommand::Screen => {
-                                    let dump = self.screen.get_screen_dump(
-                                        &self.config.tool,
-                                        self.inject_server.port(),
-                                    );
-                                    client.respond(&dump);
-                                }
-                                inject::QueryCommand::Unknown => {
-                                    client.respond("error: unknown command\n");
-                                }
-                            },
-                            inject::InjectResult::Pending => {}
                         }
+                        inject::InjectResult::Query(client) => match client.command {
+                            inject::QueryCommand::Screen => {
+                                let dump = self.screen.get_screen_dump(
+                                    self.config.target.name(),
+                                    self.inject_server.port(),
+                                );
+                                client.respond(&dump);
+                            }
+                            inject::QueryCommand::Unknown => {
+                                client.respond("error: unknown command\n");
+                            }
+                        },
+                        inject::InjectResult::Pending => {}
                     }
                 }
             }
 
-            // Check for title changes (delivery thread updates shared Arcs)
-            // Writing here ensures title OSC is serialized with PTY output, preventing interleaving
-            //
-            // Only write title when this iteration had NO PTY output. This prevents
-            // interleaving with any incomplete escape sequence (CSI, UTF-8, etc.).
-            // pending_utf8 catches cross-iteration incomplete UTF-8 (e.g., title-only
-            // read after a read that ended with partial multi-byte char).
-            if stdout_is_tty && title_write_safe(had_pty_output, pending_utf8, pending_escape) {
+            // Drain title notifications. The shared status is read below; the
+            // pipe only interrupts poll and coalesces repeated transitions.
+            if poll_fds[title_notify_idx]
+                .revents()
+                .is_some_and(|events| events.contains(PollFlags::POLLIN))
+            {
+                let mut title_notifications = [0u8; 64];
+                loop {
+                    match read(&self.title_notify_read, &mut title_notifications) {
+                        Ok(0) | Err(Errno::EAGAIN) => break,
+                        Ok(_) | Err(Errno::EINTR) => continue,
+                        Err(error) => bail!("read title notification failed: {error}"),
+                    }
+                }
+            }
+
+            // Check for title changes (delivery thread updates shared Arcs).
+            // Writing here serializes the title OSC with PTY output on the same
+            // thread. We append it right after this iteration's coalesced write,
+            // but only when that write left no incomplete UTF-8 or escape sequence
+            // (`title_write_safe`) — splitting one would corrupt the stream.
+            // pending_utf8/pending_escape carry that state across read boundaries.
+            if stdout_is_tty && title_enabled && title_write_safe(pending_utf8, pending_escape) {
                 let (name, status) = {
                     let n = self
                         .current_name
@@ -1074,12 +1324,30 @@ impl Proxy {
                         .unwrap_or_default();
                     (n, s)
                 };
-                if !name.is_empty() && (name != last_written_name || status != last_written_status)
+                // The wrapped tool's live title (Combined only). Owned by this
+                // thread via self.screen, so no lock — read fresh each iteration
+                // and fold into the change check so a new child title re-emits.
+                let child = if title_mode == crate::shared::TitleMode::Combined {
+                    self.screen.child_title().unwrap_or("")
+                } else {
+                    ""
+                };
+                if !name.is_empty()
+                    && (name != last_written_name
+                        || status != last_written_status
+                        || child != last_written_child)
                 {
-                    let icon = status_icon(&status);
-                    let title = format!("{} {} [{}]", icon, name, self.config.tool);
-                    let escape = format!("\x1b]1;{}\x07\x1b]2;{}\x07", title, title);
+                    let child_opt = (!child.is_empty()).then_some(child);
+                    let escape = shared::build_title_escape(
+                        &name,
+                        &status,
+                        self.config.target.name(),
+                        title_mode,
+                        child_opt,
+                    );
                     write_all(&stdout_fd, escape.as_bytes())?;
+                    last_written_child.clear();
+                    last_written_child.push_str(child);
                     last_written_name = name;
                     last_written_status = status;
                 }
@@ -1094,78 +1362,47 @@ impl Proxy {
             }
         }
 
-        // PTY exited before delivery started — finalize placeholder as launch_failed.
-        if !delivery_started && !EXIT_WAS_KILLED.load(Ordering::Acquire) {
-            self.finalize_early_launch_failure();
+        // Reap first so EOF/HUP races cannot make try_wait() miss a fast child
+        // exit. drain_and_wait_child also feeds trailing PTY bytes into the
+        // screen model, preserving the tool's final error for launch failure
+        // diagnostics even after the terminal pane closes.
+        let exit_code = self.drain_and_wait_child()?;
+
+        if !EXIT_WAS_KILLED.load(Ordering::Acquire) {
+            let tail = self.screen.visible_tail(8, 1000);
+            shared::finalize_launch_failure_after_exit(
+                self.config.instance_name.as_deref(),
+                tail.as_deref(),
+                &self.launch_phase_active,
+                startup_time.elapsed(),
+                exit_code,
+            );
         }
 
-        // Stop delivery thread
+        // Stop delivery after precise child-exit finalization. The shared
+        // launch_phase flag prevents delivery cleanup from emitting a generic
+        // duplicate failure after this path records the real evidence.
         self.running.store(false, Ordering::Release);
 
-        // Kill child process group (child is session leader via setsid(), so PID = PGID)
-        // This ensures claude and all its children are killed, not just the launch script
-        let pgid = Pid::from_raw(-(self.child.id() as i32));
-        let _ = kill(pgid, Signal::SIGTERM);
-
-        self.drain_and_wait_child()
+        Ok(exit_code)
     }
 
-    fn finalize_early_launch_failure(&mut self) {
-        let Some(instance_name) = self.config.instance_name.as_deref() else {
-            return;
-        };
-
-        let exit_status = match self.child.try_wait() {
-            Ok(Some(status)) => status,
-            _ => return,
-        };
-
-        let Ok(db) = HcomDb::open() else {
-            return;
-        };
-        let Ok(Some(instance)) = db.get_instance_full(instance_name) else {
-            return;
-        };
-
-        if instance.session_id.is_some()
-            || instance.status_context != "new"
-            || (instance.status != crate::shared::ST_INACTIVE && instance.status != "pending")
-        {
-            return;
-        }
-
-        let exit_code = exit_code_from_status(exit_status);
-        let fallback = format!("process exited before startup completed (exit code {exit_code})");
-        let Some(detail) = crate::instance_lifecycle::finalize_launch_failure_detail(
-            &db,
-            &instance,
-            Some(&fallback),
-        ) else {
-            return;
-        };
-
-        let launcher = std::env::var("HCOM_LAUNCHED_BY").ok();
-        let batch_id = std::env::var("HCOM_LAUNCH_BATCH_ID").ok();
-        if let (Some(launcher), Some(batch_id)) = (launcher, batch_id) {
-            if !launcher.is_empty() && launcher != "unknown" && !batch_id.is_empty() {
-                let _ = db.notify_batch_failure(&launcher, &batch_id, instance_name, &detail);
-            }
-        }
-
-        if let Ok(process_id) = std::env::var("HCOM_PROCESS_ID") {
-            if !process_id.is_empty() {
-                let _ = db.delete_process_binding(&process_id);
-            }
-        }
+    /// Publish an approval-status edge for this proxy's instance.
+    fn publish_approval(&self, waiting: bool) {
+        shared::publish_approval_status(
+            waiting,
+            self.config.instance_name.as_deref(),
+            &self.current_status,
+        );
     }
 
     fn forward_winsize(&mut self) -> Result<()> {
         // Fix #3: Debounce resize signals by 50ms to avoid races during rapid resize
         const RESIZE_DEBOUNCE_MS: u64 = 50;
-        if let Some(last) = self.last_resize {
-            if last.elapsed().as_millis() < RESIZE_DEBOUNCE_MS as u128 {
-                return Ok(()); // Skip if too recent
-            }
+        if let Some(last) = self.last_resize
+            && last.elapsed().as_millis() < RESIZE_DEBOUNCE_MS as u128
+        {
+            return Ok(()); // Skip if too recent
         }
         self.last_resize = Some(Instant::now());
 
@@ -1198,17 +1435,57 @@ impl Proxy {
     /// shutdown. If nobody reads the PTY master, the kernel buffer fills and the
     /// child blocks on write() — deadlocking with our waitpid(). We drain the
     /// master in a poll loop with non-blocking try_wait, escalating to SIGKILL
-    /// after a timeout.
+    /// after a timeout. Drained bytes are still processed by ScreenTracker so
+    /// launch failures retain the child's final stderr/stdout.
     fn drain_and_wait_child(&mut self) -> Result<i32> {
         let mut buf = [0u8; 65536];
         let deadline = Instant::now() + Duration::from_secs(5);
 
         loop {
+            let mut saw_eof = false;
+            loop {
+                match nix_read(&self.pty_master, &mut buf) {
+                    Ok(0) => {
+                        saw_eof = true;
+                        break;
+                    }
+                    Ok(n) => self.screen.process(&buf[..n]),
+                    Err(Errno::EAGAIN) => break,
+                    Err(Errno::EIO) => {
+                        saw_eof = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+
             // Non-blocking child check
             match self.child.try_wait() {
-                Ok(Some(status)) => return Ok(exit_code_from_status(status)),
+                Ok(Some(status)) => {
+                    // A final PTY fragment can become readable just after
+                    // waitpid observes exit. Give it a few milliseconds.
+                    for _ in 0..3 {
+                        match nix_read(&self.pty_master, &mut buf) {
+                            Ok(n) if n > 0 => self.screen.process(&buf[..n]),
+                            Ok(_) | Err(Errno::EIO) => break,
+                            Err(Errno::EAGAIN) => {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    return Ok(exit_code_from_status(status));
+                }
                 Ok(None) => {} // Still running
                 Err(e) => bail!("wait failed: {}", e),
+            }
+
+            if saw_eof {
+                return self
+                    .child
+                    .wait()
+                    .map(exit_code_from_status)
+                    .map_err(|e| anyhow::anyhow!("wait failed: {e}"));
             }
 
             // Timeout — escalate to SIGKILL
@@ -1228,218 +1505,12 @@ impl Proxy {
                 return Ok(1);
             }
 
-            // Drain PTY master (non-blocking, discard output)
-            match nix_read(&self.pty_master, &mut buf) {
-                Ok(0) => {
-                    // EOF — child closed its side, do blocking wait
-                    match self.child.wait() {
-                        Ok(status) => return Ok(exit_code_from_status(status)),
-                        Err(e) => bail!("wait failed: {}", e),
-                    }
-                }
-                Ok(_) => {} // Drained some data, loop again
-                Err(Errno::EAGAIN) => {
-                    // Nothing to read — sleep briefly before next try_wait
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(Errno::EIO) => {
-                    // PTY gone — child side closed, do blocking wait
-                    match self.child.wait() {
-                        Ok(status) => return Ok(exit_code_from_status(status)),
-                        Err(e) => bail!("wait failed: {}", e),
-                    }
-                }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-        }
-    }
-
-    /// Update shared delivery state from screen tracker
-    fn update_delivery_state(&self) {
-        if let Ok(mut state) = self.delivery_state.write() {
-            state.ready = self.screen.is_ready();
-            state.approval = self.screen.is_waiting_approval();
-            let input_text = self.screen.get_input_box_text(&self.config.tool);
-            state.prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
-            state.input_text = input_text;
-            state.last_output = self.screen.last_output_instant();
-            state.cols = self.screen.cols();
-        }
-    }
-
-    /// Start the delivery thread (and transcript watcher for Codex)
-    ///
-    /// Returns Ok(()) if delivery thread initialized successfully (DB opened, notify server created).
-    /// Returns Err if initialization failed.
-    fn start_delivery_thread(&mut self) -> Result<()> {
-        let instance_name = match &self.config.instance_name {
-            Some(name) => name.clone(),
-            None => {
-                // Try to get from environment (fallback for testing without explicit config)
-                Config::get().instance_name.unwrap_or_default()
-            }
-        };
-
-        if instance_name.is_empty() {
-            // No instance name - skip delivery (hybrid mode or testing)
-            crate::log::log_warn(
-                "native",
-                "delivery.skip.no_instance_name",
-                "No instance name - delivery disabled. Set config.instance_name or HCOM_INSTANCE_NAME env var.",
-            );
-            return Ok(());
-        }
-
-        // Create oneshot channel for init result
-        let (init_tx, init_rx) = mpsc::channel();
-
-        let running = self.running.clone();
-        let delivery_state = self.delivery_state.clone();
-        let inject_port = self.inject_server.port();
-        let tool = self.config.tool.clone();
-        let user_activity_cooldown_ms = self.user_activity_cooldown_ms;
-        let notify_port_shared = self.notify_port.clone();
-        let shared_name = self.current_name.clone();
-        let shared_status = self.current_status.clone();
-
-        // For Codex: spawn transcript watcher thread
-        use crate::tool::Tool;
-        use std::str::FromStr;
-
-        if let Ok(Tool::Codex) = Tool::from_str(&tool) {
-            let watcher_running = self.running.clone();
-            let watcher_name = instance_name.clone();
-            std::thread::spawn(move || {
-                crate::transcript::run_transcript_watcher(
-                    watcher_running,
-                    watcher_name,
-                    Duration::from_secs(5),
-                );
-            });
-        }
-
-        let handle = std::thread::spawn(move || {
-            log_info(
-                "native",
-                "delivery.start",
-                &format!("Starting delivery thread for {}", instance_name),
-            );
-
-            // Initialize delivery components with dependency injection
-            let (mut db, notify) = match initialize_delivery_components(
-                &instance_name,
-                HcomDb::open,
-                NotifyServer::new,
-            ) {
-                Ok((db, notify)) => {
-                    log_info(
-                        "native",
-                        "delivery.init.success",
-                        &format!("Initialized delivery for {}", instance_name),
-                    );
-                    // Store port for shutdown wakeup
-                    notify_port_shared.store(notify.port(), Ordering::Release);
-                    log_info(
-                        "native",
-                        "notify.registered",
-                        &format!("Registered notify port {}", notify.port()),
-                    );
-                    // Register inject port for screen queries
-                    if let Err(e) = db.register_inject_port(&instance_name, inject_port) {
-                        log_warn(
-                            "native",
-                            "inject.register_fail",
-                            &format!("Failed to register inject port: {}", e),
-                        );
-                    }
-
-                    // Signal successful initialization to parent
-                    let _ = init_tx.send(Ok(()));
-                    (db, notify)
-                }
-                Err(e) => {
-                    log_error(
-                        "native",
-                        "delivery.init.fail",
-                        &format!("Failed to initialize delivery: {}", e),
-                    );
-                    let _ = init_tx.send(Err(e));
-                    return;
-                }
-            };
-
-            // Create delivery state wrapper
-            let state = DeliveryState {
-                screen: delivery_state,
-                inject_port,
-                user_activity_cooldown_ms,
-            };
-
-            // Get tool config
-            let tool_kind = Tool::from_str(&tool).unwrap_or(Tool::Claude);
-            let config = ToolConfig::for_tool(tool_kind);
-
-            // Run delivery loop (pass shared state for main loop's OSC override)
-            run_delivery_loop(
-                running,
-                &mut db,
-                &notify,
-                &state,
-                &instance_name,
-                &config,
-                Some(shared_name),
-                Some(shared_status),
-            );
-
-            log_info(
-                "native",
-                "delivery.stop",
-                &format!("Delivery thread stopped for {}", instance_name),
-            );
-        });
-
-        self.delivery_handle = Some(handle);
-
-        // Wait for initialization result (with timeout to avoid blocking forever)
-        match init_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => {
-                log_info(
-                    "native",
-                    "delivery.init.success",
-                    "Delivery thread initialized successfully",
-                );
-                Ok(())
-            }
-            Ok(Err(e)) => {
-                log_error(
-                    "native",
-                    "delivery.init.fail",
-                    &format!("Delivery thread init failed: {}", e),
-                );
-                Err(e)
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                log_error(
-                    "native",
-                    "delivery.init.timeout",
-                    "Delivery thread init timed out after 5s",
-                );
-                bail!("Delivery thread initialization timed out")
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                log_error(
-                    "native",
-                    "delivery.init.disconnect",
-                    "Delivery thread init channel disconnected",
-                );
-                bail!("Delivery thread initialization channel disconnected")
-            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }
 
+#[cfg(unix)]
 impl Drop for Proxy {
     fn drop(&mut self) {
         use crate::log::log_info;
@@ -1495,6 +1566,7 @@ impl Drop for Proxy {
     }
 }
 
+#[cfg(unix)]
 fn exit_code_from_status(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if let Some(code) = status.code() {
@@ -1506,6 +1578,7 @@ fn exit_code_from_status(status: ExitStatus) -> i32 {
     }
 }
 
+#[cfg(unix)]
 fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     let flags = fcntl(fd.as_fd(), FcntlArg::F_GETFL).context("fcntl F_GETFL failed")?;
     let flags = OFlag::from_bits_truncate(flags);
@@ -1514,6 +1587,16 @@ fn set_nonblocking<Fd: AsFd>(fd: &Fd) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn title_wake_callback(write_fd: Arc<OwnedFd>) -> crate::delivery::TitleWake {
+    Arc::new(move || {
+        // A full pipe means a wake is already pending. The proxy always reads
+        // the authoritative shared title state after it wakes.
+        let _ = write(write_fd.as_ref(), &[1]);
+    })
+}
+
+#[cfg(unix)]
 fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     let mut written = 0;
     while written < data.len() {
@@ -1530,6 +1613,7 @@ fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
 }
@@ -1537,15 +1621,17 @@ fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
 /// Initialize delivery components with dependency injection for testing
 ///
 /// Returns (db, notify) on success, Err on failure
+#[cfg(any(unix, windows))]
 fn initialize_delivery_components<DbF, NotifyF>(
     instance_name: &str,
     db_factory: DbF,
     notify_factory: NotifyF,
-) -> Result<(crate::db::HcomDb, crate::notify::NotifyServer)>
+) -> anyhow::Result<(crate::db::HcomDb, crate::notify::NotifyServer)>
 where
-    DbF: FnOnce() -> Result<crate::db::HcomDb>,
-    NotifyF: FnOnce() -> Result<crate::notify::NotifyServer>,
+    DbF: FnOnce() -> anyhow::Result<crate::db::HcomDb>,
+    NotifyF: FnOnce() -> anyhow::Result<crate::notify::NotifyServer>,
 {
+    use anyhow::Context as _;
     // Open database
     let db = db_factory().context("Failed to open database")?;
 
@@ -1559,13 +1645,23 @@ where
     Ok((db, notify))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
-    use super::initialize_delivery_components;
+    use super::{
+        PtyTarget, initialize_delivery_components, prompt_submit_observed, strip_focus_events,
+    };
     use anyhow::anyhow;
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn adhoc_pty_target_stays_adhoc_for_delivery() {
+        let target = PtyTarget::AdhocCommand("bash".to_string());
+        assert_eq!(target.name(), "bash");
+        assert_eq!(target.known_tool(), None);
+        assert_eq!(target.delivery_tool(), crate::tool::Tool::Adhoc);
+    }
 
     fn setup_test_db(with_notify_endpoints: bool) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1577,19 +1673,11 @@ mod tests {
             std::process::id(),
             test_id
         ));
-        let conn = Connection::open(&db_path).unwrap();
 
         if with_notify_endpoints {
-            conn.execute_batch(
-                "CREATE TABLE notify_endpoints (
-                    instance TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    port INTEGER NOT NULL,
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY (instance, kind)
-                );",
-            )
-            .unwrap();
+            crate::db::HcomDb::open_at(&db_path).unwrap();
+        } else {
+            let _ = Connection::open(&db_path).unwrap();
         }
 
         db_path
@@ -1597,6 +1685,45 @@ mod tests {
 
     fn cleanup_test_db(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prompt_submit_observed_when_text_clears() {
+        assert!(prompt_submit_observed(Some("run tests"), Some("")));
+    }
+
+    #[test]
+    fn strip_focus_events_removes_focus_in_and_out() {
+        assert_eq!(strip_focus_events(b"\x1b[O").unwrap(), b"");
+        assert_eq!(strip_focus_events(b"\x1b[I").unwrap(), b"");
+        // Embedded between real keystrokes.
+        assert_eq!(strip_focus_events(b"ab\x1b[Ocd").unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn strip_focus_events_passes_through_non_focus_input() {
+        // No ESC at all: nothing to strip (fast path returns None).
+        assert!(strip_focus_events(b"hello\r").is_none());
+        // Other escape sequences (arrow up = CSI A) must be preserved untouched.
+        assert!(strip_focus_events(b"\x1b[A").is_none());
+        // A trailing partial CSI is left intact (continuation handled by next read).
+        assert!(strip_focus_events(b"\x1b[").is_none());
+    }
+
+    #[test]
+    fn prompt_submit_observed_when_text_temporarily_undetected() {
+        assert!(prompt_submit_observed(Some("run tests"), None));
+    }
+
+    #[test]
+    fn prompt_submit_observed_ignores_startup_empty_edge() {
+        assert!(!prompt_submit_observed(None, Some("")));
+        assert!(!prompt_submit_observed(Some(""), Some("")));
+    }
+
+    #[test]
+    fn prompt_submit_observed_ignores_text_edits() {
+        assert!(!prompt_submit_observed(Some("run"), Some("run tests")));
     }
 
     #[test]
@@ -1799,33 +1926,41 @@ mod tests {
     use super::{PendingEscape, has_pending_escape, resolve_pending_escape, title_write_safe};
 
     #[test]
-    fn test_title_write_blocked_by_pty_output() {
-        assert!(!title_write_safe(true, 0, PendingEscape::None));
+    fn test_title_write_allowed_during_clean_output() {
+        // A continuously-rendering tool (pi) only ever yields clean-boundary
+        // writes; the title must be writable on those, not gated on a quiet
+        // iteration. Clean boundary == no pending utf8/escape.
+        assert!(title_write_safe(0, PendingEscape::None));
     }
 
     #[test]
     fn test_title_write_blocked_by_pending_utf8() {
-        assert!(!title_write_safe(false, 1, PendingEscape::None));
+        assert!(!title_write_safe(1, PendingEscape::None));
     }
 
     #[test]
     fn test_title_write_blocked_by_pending_csi() {
-        assert!(!title_write_safe(false, 0, PendingEscape::Csi));
+        assert!(!title_write_safe(0, PendingEscape::Csi));
     }
 
     #[test]
     fn test_title_write_blocked_by_pending_string_seq() {
-        assert!(!title_write_safe(false, 0, PendingEscape::StringSeq));
+        assert!(!title_write_safe(0, PendingEscape::StringSeq));
     }
 
     #[test]
-    fn test_title_write_safe_when_all_clear() {
-        assert!(title_write_safe(false, 0, PendingEscape::None));
+    fn test_title_write_blocked_by_pending_single_shift() {
+        assert!(!title_write_safe(0, PendingEscape::SingleShift));
+    }
+
+    #[test]
+    fn test_title_write_blocked_by_pending_nf_seq() {
+        assert!(!title_write_safe(0, PendingEscape::NfSeq));
     }
 
     #[test]
     fn test_title_write_blocked_by_multiple_conditions() {
-        assert!(!title_write_safe(true, 2, PendingEscape::Csi));
+        assert!(!title_write_safe(2, PendingEscape::Csi));
     }
 
     // ---- has_pending_escape tests ----
@@ -1908,6 +2043,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_pending_escape_incomplete_single_shift() {
+        // SS2 (ESC N) / SS3 (ESC O) with no following byte yet
+        assert_eq!(has_pending_escape(b"text\x1bN"), PendingEscape::SingleShift);
+        assert_eq!(has_pending_escape(b"text\x1bO"), PendingEscape::SingleShift);
+    }
+
+    #[test]
+    fn test_pending_escape_complete_single_shift() {
+        // The shifted character completes the sequence
+        assert_eq!(has_pending_escape(b"\x1bNx"), PendingEscape::None);
+        assert_eq!(has_pending_escape(b"\x1bOx"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_incomplete_nf() {
+        // nF charset designation mid-sequence (intermediate, no final yet)
+        assert_eq!(has_pending_escape(b"text\x1b("), PendingEscape::NfSeq);
+        assert_eq!(has_pending_escape(b"text\x1b#"), PendingEscape::NfSeq);
+    }
+
+    #[test]
+    fn test_pending_escape_complete_nf() {
+        // ESC ( B (designate ASCII to G0), ESC # 8 (DEC alignment test)
+        assert_eq!(has_pending_escape(b"\x1b(B"), PendingEscape::None);
+        assert_eq!(has_pending_escape(b"\x1b#8"), PendingEscape::None);
+    }
+
     // ---- resolve_pending_escape (cross-chunk) tests ----
 
     #[test]
@@ -1970,6 +2133,34 @@ mod tests {
         assert_eq!(
             resolve_pending_escape(PendingEscape::StringSeq, b"https://example"),
             PendingEscape::StringSeq
+        );
+    }
+
+    #[test]
+    fn test_resolve_single_shift_completes_on_any_byte() {
+        // The shifted char arrives in the next chunk (split between ESC N and char)
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::SingleShift, b"xrest"),
+            PendingEscape::None
+        );
+        // Empty continuation keeps it pending
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::SingleShift, b""),
+            PendingEscape::SingleShift
+        );
+    }
+
+    #[test]
+    fn test_resolve_nf_continuation() {
+        // Intermediates only — stays pending
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::NfSeq, b"  "),
+            PendingEscape::NfSeq
+        );
+        // Final byte (0x30-0x7E) completes it
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::NfSeq, b"B"),
+            PendingEscape::None
         );
     }
 

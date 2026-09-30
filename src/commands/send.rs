@@ -2,23 +2,25 @@
 
 use std::io::{IsTerminal, Read as IoRead};
 
+use crate::cli_context::InlineBatch;
 use crate::db::HcomDb;
+use crate::db::subscriptions::create_request_watches;
 use crate::identity;
-use crate::instance_lifecycle;
-use crate::instances;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
     validate_intent, validate_message,
 };
-use crate::shared::{CommandContext, SENDER, SenderIdentity, SenderKind, status_icon};
+use crate::shared::{
+    CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
+};
 
 const SEND_AFTER_HELP: &str = "\
 Target matching:
-    @luna                          base name (matches luna, api-luna)
+    @luna                          exact base name
     @api-luna                      exact full name
-    @api-                          prefix: all with tag 'api'
-    @luna:BOXE                     remote agent on another device
-  Underscore blocks prefix: @luna does NOT match luna_reviewer_1
+    @api-                          all local agents with exact tag 'api'
+    @luna:BOXE                     exact or uniquely prefixed remote agent
+  Partial local names are rejected to avoid accidental fan-out.
 
 Inline bundle (attach structured context):
     --title <text>                 Create and attach bundle inline
@@ -102,6 +104,10 @@ pub struct SendArgs {
     /// Suppress output
     #[arg(long)]
     pub quiet: bool,
+
+    /// Print result as a single-line JSON object instead of human-readable output
+    #[arg(long)]
+    pub json: bool,
 
     // ── Inline bundle ──
     /// Bundle title (creates inline bundle)
@@ -213,9 +219,16 @@ impl SendArgs {
 }
 
 /// Get formatted recipient feedback showing who received the message.
-fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
+///
+/// `thread` is set when delivery was limited to that thread's members.
+fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String], thread: Option<&str>) -> String {
     if delivered_to.is_empty() {
-        return format!("Sent to: {SENDER}");
+        return match thread {
+            Some(thread) => {
+                format!("Sent to: {SENDER} only (no other members of thread '{thread}' are active)")
+            }
+            None => format!("Sent to: {SENDER} only (no other agents are active)"),
+        };
     }
     if delivered_to.len() > 10 {
         return format!("Sent to {} agents", delivered_to.len());
@@ -225,7 +238,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     for name in delivered_to {
         if let Ok(Some(data)) = db.get_instance_full(name) {
             let icon = status_icon(&data.status);
-            let display = instances::get_display_name(db, name);
+            let display = identity::get_display_name(db, name);
             parts.push(format!("{icon} {display}"));
         } else {
             parts.push(format!("◌ {name}"));
@@ -234,22 +247,23 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     format!("Sent to: {}", parts.join(", "))
 }
 
-///
-/// Validates message, computes scope, logs event, notifies all instances.
-/// Returns delivered_to list (base names).
-pub fn send_message(
-    db: &HcomDb,
-    identity: &SenderIdentity,
-    message: &str,
-    envelope: Option<&MessageEnvelope>,
-    explicit_targets: Option<&[String]>,
-) -> Result<Vec<String>, String> {
-    validate_message(message)?;
+struct ResolvedDelivery {
+    original_scope: MessageScope,
+    effective_scope: MessageScope,
+    effective_mentions: Vec<String>,
+    delivered_to: Vec<String>,
+    is_thread_resolved: bool,
+}
 
-    // Get participating instances
-    let rows: Vec<InstanceInfo> = db
+fn deliverable_instances(db: &HcomDb) -> Result<Vec<InstanceInfo>, String> {
+    let rows = db
         .conn()
-        .prepare("SELECT name, tag FROM instances")
+        .prepare(
+            "SELECT name, tag FROM instances
+             WHERE status != 'stopped'
+               AND status_context != 'launch_failed'
+               AND NOT (status = 'inactive' AND status_context LIKE 'exit:%')",
+        )
         .map_err(|e| format!("DB error: {e}"))?
         .query_map([], |row| {
             Ok(InstanceInfo {
@@ -259,11 +273,24 @@ pub fn send_message(
         })
         .map_err(|e| format!("DB error: {e}"))?
         .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Vec<_>>();
+    Ok(rows)
+}
+
+fn resolve_delivery(
+    db: &HcomDb,
+    identity: &SenderIdentity,
+    message: &str,
+    envelope: Option<&MessageEnvelope>,
+    explicit_targets: Option<&[String]>,
+) -> Result<ResolvedDelivery, String> {
+    // Deliverable agents: exclude session-stopped (exit:*) and launch_failed placeholders.
+    // Adhoc instances use inactive:tool:* between commands — still @mentionable.
+    let rows = deliverable_instances(db)?;
 
     // Compute scope and routing. Thread-only sends keep their original message
     // semantics; membership only affects the delivery target set.
-    let scope_result = compute_scope(message, &rows, explicit_targets.map(|t| t as &[String]))?;
+    let scope_result = compute_scope(message, &rows, explicit_targets)?;
     let thread_delivery_members =
         if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
             if scope_result.scope == MessageScope::Broadcast {
@@ -292,30 +319,84 @@ pub fn send_message(
         thread_delivery_members.clone()
     };
 
-    // Build scope data for should_deliver_message
-    let scope_str = effective_scope.as_str();
-    let mentions_json: Vec<serde_json::Value> = effective_mentions
-        .iter()
-        .map(|m| serde_json::json!(m))
-        .collect();
-    let mut scope_data = serde_json::json!({
-        "scope": scope_str,
-    });
-    if !effective_mentions.is_empty() {
-        scope_data["mentions"] = serde_json::json!(mentions_json);
-    }
-    // Add group_id if identity has one
-    if let Some(gid) = identity.group_id() {
-        scope_data["group_id"] = serde_json::json!(gid);
-    }
-
-    let delivered_to: Vec<String> = rows
+    let scope_data = build_scope_data(identity, effective_scope, &effective_mentions);
+    let delivered_to = rows
         .iter()
         .filter(|inst| {
             should_deliver_message(&scope_data, &inst.name, &identity.name).unwrap_or(false)
         })
         .map(|inst| inst.name.clone())
         .collect();
+
+    Ok(ResolvedDelivery {
+        original_scope: scope_result.scope,
+        effective_scope,
+        effective_mentions,
+        delivered_to,
+        is_thread_resolved,
+    })
+}
+
+fn build_scope_data(
+    identity: &SenderIdentity,
+    scope: MessageScope,
+    mentions: &[String],
+) -> serde_json::Value {
+    let mut scope_data = serde_json::json!({
+        "scope": scope.as_str(),
+    });
+    if !mentions.is_empty() {
+        scope_data["mentions"] = serde_json::json!(mentions);
+    }
+    if let Some(gid) = identity.group_id() {
+        scope_data["group_id"] = serde_json::json!(gid);
+    }
+    scope_data
+}
+
+fn print_broadcast_preview(db: &HcomDb, delivered_to: &[String]) {
+    let count = delivered_to.len();
+    let names: Vec<String> = delivered_to
+        .iter()
+        .map(|name| {
+            if let Ok(Some(data)) = db.get_instance_full(name) {
+                let icon = status_icon(&data.status);
+                let display = identity::get_display_name(db, name);
+                format!("{icon} {display}")
+            } else {
+                format!("◌ {name}")
+            }
+        })
+        .collect();
+    let recipient_list = if count <= 12 {
+        names.join(", ")
+    } else {
+        format!("{} ... (+{} more)", names[..10].join(", "), count - 10)
+    };
+
+    println!("\n== BROADCAST SEND PREVIEW ==");
+    println!("This message has no @targets, so it would broadcast to {count} agents.");
+    println!("Recipients:\n  {recipient_list}\n");
+    println!("Did you mean to send this to everyone?");
+    println!("Broadcasts can wake many terminals and spend many agents' context/tools.");
+    println!("\nAdd --go after send and run again to proceed:");
+    println!("  hcom send --go ...\n");
+}
+
+///
+/// Validates message, computes scope, logs event, notifies all instances.
+/// Returns the logged event ID and delivered_to list (base names).
+pub fn send_message(
+    db: &HcomDb,
+    identity: &SenderIdentity,
+    message: &str,
+    envelope: Option<&MessageEnvelope>,
+    explicit_targets: Option<&[String]>,
+) -> Result<(i64, Vec<String>), String> {
+    validate_message(message)?;
+
+    let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
+    let scope_str = delivery.effective_scope.as_str();
 
     // Build event data
     let mut data = serde_json::json!({
@@ -327,12 +408,12 @@ pub fn send_message(
         },
         "scope": scope_str,
         "text": message,
-        "delivered_to": delivered_to,
+        "delivered_to": delivery.delivered_to.clone(),
     });
 
     // Add scope extra data (mentions)
-    if !effective_mentions.is_empty() {
-        data["mentions"] = serde_json::json!(effective_mentions);
+    if !delivery.effective_mentions.is_empty() {
+        data["mentions"] = serde_json::json!(delivery.effective_mentions);
     }
 
     if let Some(env) = envelope {
@@ -346,14 +427,14 @@ pub fn send_message(
                 data["reply_to_local"] = serde_json::json!(local_id);
 
                 // Ack-on-ack loop prevention
-                if env.intent.as_ref().map(|i| i.as_str()) == Some("ack") {
-                    if let Some(parent_intent) = get_intent_from_event(db, local_id) {
-                        if parent_intent == "ack" {
-                            return Err("Ack-on-ack loop detected. Message blocked.".to_string());
-                        }
-                        if parent_intent == "inform" {
-                            return Err("Cannot ack an inform - informational messages don't need acknowledgment.".to_string());
-                        }
+                if env.intent.as_ref().map(|i| i.as_str()) == Some("ack")
+                    && let Some(parent_intent) = get_intent_from_event(db, local_id)
+                {
+                    if parent_intent == "ack" {
+                        return Err("Ack-on-ack loop detected. Message blocked.".to_string());
+                    }
+                    if parent_intent == "inform" {
+                        return Err("Cannot ack an inform - informational messages don't need acknowledgment.".to_string());
                     }
                 }
             }
@@ -374,7 +455,7 @@ pub fn send_message(
     };
 
     // Log event to DB
-    let _event_id = db
+    let event_id = db
         .log_event("message", &routing_instance, &data)
         .map_err(|e| format!("Failed to write message to database: {e}"))?;
 
@@ -384,45 +465,73 @@ pub fn send_message(
             db.add_thread_memberships(
                 thread,
                 matches!(identity.kind, SenderKind::Instance).then_some(identity.name.as_str()),
-                &delivered_to,
+                &delivery.delivered_to,
             );
         }
 
         if env.intent.as_ref().map(|i| i.as_str()) == Some("request")
             && matches!(identity.kind, SenderKind::Instance)
-            && effective_scope == MessageScope::Mentions
-            && !is_thread_resolved
+            && delivery.effective_scope == MessageScope::Mentions
+            && !delivery.is_thread_resolved
         {
-            create_request_watches(db, &identity.name, _event_id, &delivered_to);
+            create_request_watches(db, &identity.name, event_id, &delivery.delivered_to);
         }
     }
 
     // Notify all instances (wake delivery loops)
-    instance_lifecycle::notify_all_instances(db);
+    crate::notify::wake_all(db);
 
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
 
-    Ok(delivered_to)
+    Ok((event_id, delivery.delivered_to))
 }
 
-/// Resolve reply_to to local event ID. Returns None if not found.
+/// Resolve reply_to to local event ID. Returns None if not found or ambiguous.
 fn resolve_reply_to_local(db: &HcomDb, reply_to: &str) -> Option<i64> {
-    // reply_to can be "42" or "42:BOXE" (remote)
-    let local_part = reply_to.split(':').next()?;
-    let id: i64 = local_part.parse().ok()?;
+    let reply_to = reply_to.trim();
+    if reply_to.is_empty() {
+        return None;
+    }
 
-    // Verify event exists and is a message
-    let exists: bool = db
-        .conn()
-        .query_row(
-            "SELECT 1 FROM events WHERE id = ? AND type = 'message'",
-            rusqlite::params![id],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
+    if let Some((origin_str, device_short)) = crate::relay::control::split_device_suffix(reply_to) {
+        let origin_id: i64 = origin_str.parse().ok()?;
 
-    if exists { Some(id) } else { None }
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT id FROM events WHERE type = 'message' \
+                 AND json_type(data, '$._relay.id') = 'integer' \
+                 AND json_extract(data, '$._relay.id') = ? \
+                 AND json_extract(data, '$._relay.short') = ? \
+                 LIMIT 2",
+            )
+            .ok()?;
+
+        let matching_ids: Vec<i64> = stmt
+            .query_map(rusqlite::params![origin_id, device_short], |row| row.get(0))
+            .ok()?
+            .flatten()
+            .collect();
+
+        if matching_ids.len() == 1 {
+            Some(matching_ids[0])
+        } else {
+            None
+        }
+    } else {
+        let local_id: i64 = reply_to.parse().ok()?;
+        let exists: bool = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM events WHERE id = ? AND type = 'message'",
+                rusqlite::params![local_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if exists { Some(local_id) } else { None }
+    }
 }
 
 /// Get thread from an event (for --reply-to thread inheritance).
@@ -449,39 +558,13 @@ fn get_intent_from_event(db: &HcomDb, event_id: i64) -> Option<String> {
         .flatten()
 }
 
-/// Create request-watch subscriptions for each recipient.
-fn create_request_watches(db: &HcomDb, sender: &str, request_event_id: i64, recipients: &[String]) {
-    let last_id = db.get_last_event_id();
-    let now = crate::shared::time::now_epoch_f64();
-
-    for recipient in recipients {
-        let sub_id = format!("reqwatch-{request_event_id}-{recipient}");
-        let sub_key = format!("events_sub:{sub_id}");
-
-        let sql = "(type='status' AND instance=? AND status_val='listening') OR (type='life' AND instance=? AND life_action='stopped')";
-
-        let sub_data = serde_json::json!({
-            "id": sub_id,
-            "caller": sender,
-            "sql": sql,
-            "params": [recipient, recipient],
-            "filters": {
-                "request_watch": true,
-                "request_id": request_event_id,
-                "target": recipient,
-            },
-            "once": true,
-            "last_id": last_id,
-            "created": now,
-        });
-
-        let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-    }
-}
-
 /// Resolve message from one of 5 source modes.
-/// Returns (message_text, had_explicit_source).
-fn resolve_message(args: &SendArgs) -> Result<String, String> {
+/// Returns `(message_text, stripped_name_flag)` where `stripped_name_flag` is true
+/// if a trailing `--name <agent>` token was silently stripped from the message.
+fn resolve_message(
+    args: &SendArgs,
+    auto_sender_name: Option<&str>,
+) -> Result<(String, bool), String> {
     let has_separator = args.has_separator();
 
     // Mutual exclusivity
@@ -500,16 +583,26 @@ fn resolve_message(args: &SendArgs) -> Result<String, String> {
 
     // 1. -- separator
     if has_separator {
-        let text = args.message.join(" ");
+        let stripped = auto_sender_name.is_some_and(|name| {
+            args.message.len() >= 2
+                && args.message[args.message.len() - 2] == "--name"
+                && args.message.last().is_some_and(|value| value == name)
+        });
+        let message_tokens = if stripped {
+            &args.message[..args.message.len() - 2]
+        } else {
+            &args.message
+        };
+        let text = message_tokens.join(" ");
         if text.is_empty() {
             return Err("No message after --".to_string());
         }
-        return Ok(text);
+        return Ok((text, stripped));
     }
 
     // 2. --stdin
     if args.stdin {
-        return read_stdin();
+        return read_stdin().map(|s| (s, false));
     }
 
     // 3. --file
@@ -520,7 +613,7 @@ fn resolve_message(args: &SendArgs) -> Result<String, String> {
             std::env::current_dir().unwrap_or_default().join(path)
         };
         return match std::fs::read_to_string(&resolved) {
-            Ok(content) if !content.is_empty() => Ok(content),
+            Ok(content) if !content.is_empty() => Ok((content, false)),
             Ok(_) => Err(format!("File is empty: {path}")),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(format!("File not found: {path}"))
@@ -540,12 +633,12 @@ fn resolve_message(args: &SendArgs) -> Result<String, String> {
         if s.is_empty() {
             return Err("Base64 decoded to empty string".to_string());
         }
-        return Ok(s);
+        return Ok((s, false));
     }
 
     // 5. Auto-pipe (stdin is a pipe, no explicit source)
     if !std::io::stdin().is_terminal() {
-        return read_stdin();
+        return read_stdin().map(|s| (s, false));
     }
 
     // No message source found
@@ -622,6 +715,46 @@ fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) 
     (targets, None)
 }
 
+/// After a failed send, say which requested targets are stopped (and when) so
+/// the sender can resume them instead of guessing at typos.
+fn print_stopped_target_hints(db: &HcomDb, explicit_targets: &[String], message: &str) {
+    let targets = if explicit_targets.is_empty() {
+        crate::shared::constants::extract_mentions(message)
+    } else {
+        explicit_targets.to_vec()
+    };
+    for target in targets {
+        if let Some(stopped) = identity::last_stopped(db, &target) {
+            eprintln!(
+                "  @{target} {} — resume: hcom r {}",
+                stopped.summary(),
+                stopped.display_name()
+            );
+        }
+    }
+}
+
+/// Reject `hcom send hi` / `hcom send luna`: a lone bare word with no `@` and
+/// no `--` is as likely a target missing its `@` as a broadcast, and guessing
+/// broadcast interrupts every agent. Quoted phrases stay broadcasts.
+fn ambiguous_bare_word_error(db: &HcomDb, targets: &[String], word: &str) -> Option<String> {
+    if !targets.is_empty() || word.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    let mut msg =
+        format!("Error: '{word}' is ambiguous: a target needs '@', a broadcast needs '--'");
+    if identity::resolve_display_name_or_stopped(db, word).is_some() {
+        msg.push_str(&format!(
+            "\nDid you mean @{word}? hcom send @{word} -- <message>"
+        ));
+    } else {
+        msg.push_str(&format!(
+            "\n  Direct:    hcom send @name -- {word}\n  Broadcast: hcom send -- {word}"
+        ));
+    }
+    Some(msg)
+}
+
 /// Main entry point for `hcom send` command.
 ///
 /// Returns exit code (0 = success, 1 = error).
@@ -646,20 +779,17 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     if from_name.is_some() {
         let actor_from_ctx = ctx.and_then(|c| c.identity.clone());
         let actor = actor_from_ctx
-            .or_else(|| identity::resolve_identity(db, None, None, None, None, None, None).ok());
+            .or_else(|| identity::resolve_identity(db, None, None, None, None, None).ok());
         match actor {
             Some(ref actor) if matches!(actor.kind, SenderKind::Instance) => {
-                if let Some(ref data) = actor.instance_data {
-                    if data
+                if let Some(ref data) = actor.instance_data
+                    && data
                         .get("parent_name")
                         .and_then(|v| v.as_str())
                         .is_some_and(|s| !s.is_empty())
-                    {
-                        eprintln!(
-                            "Error: Subagents cannot use --from/-b (external sender spoofing)"
-                        );
-                        return 1;
-                    }
+                {
+                    eprintln!("Error: Subagents cannot use --from/-b (external sender spoofing)");
+                    return 1;
                 }
             }
             _ => {}
@@ -700,15 +830,16 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     // Ack requires reply_to
     if envelope.intent.as_ref().map(|i| i.as_str()) == Some("ack") && envelope.reply_to.is_none() {
         eprintln!("Error: Intent 'ack' requires --reply-to <id>");
+        eprintln!("<id> is the number in received messages like [request #id]");
         return 1;
     }
 
     if let Some(ref reply_to) = envelope.reply_to {
         if let Some(local_id) = resolve_reply_to_local(db, reply_to) {
-            if envelope.thread.is_none() {
-                if let Some(parent_thread) = get_thread_from_event(db, local_id) {
-                    envelope.thread = Some(parent_thread);
-                }
+            if envelope.thread.is_none()
+                && let Some(parent_thread) = get_thread_from_event(db, local_id)
+            {
+                envelope.thread = Some(parent_thread);
             }
         } else {
             eprintln!("Error: Invalid --reply-to: event not found or not a message");
@@ -732,7 +863,14 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     //   - Pure @targets → explicit targets
     let (effective_targets, compat_message) =
         if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
-            process_positionals(&args.positionals)
+            let (targets, message) = process_positionals(&args.positionals);
+            if let Some(word) = message.as_deref()
+                && let Some(err) = ambiguous_bare_word_error(db, &targets, word)
+            {
+                eprintln!("{err}");
+                return 1;
+            }
+            (targets, message)
         } else {
             // With -- separator or explicit source: validate @targets
             let mut validated = Vec::new();
@@ -756,11 +894,18 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         };
 
     // ── Resolve message ──
-    let mut message = if let Some(msg) = compat_message {
-        msg
+    let (mut message, name_was_stripped) = if let Some(msg) = compat_message {
+        (msg, false)
     } else {
-        match resolve_message(args) {
-            Ok(m) => m,
+        let auto_sender_name = if from_name.is_none() && explicit_name.is_none() {
+            ctx.and_then(|c| c.identity.as_ref())
+                .filter(|id| matches!(id.kind, SenderKind::Instance))
+                .map(|id| id.name.as_str())
+        } else {
+            None
+        };
+        match resolve_message(args, auto_sender_name) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("Error: {e}");
                 return 1;
@@ -784,7 +929,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     } else if let Some(id) = ctx.and_then(|c| c.identity.as_ref()) {
         id.clone()
     } else if let Some(name) = explicit_name {
-        match identity::resolve_identity(db, Some(name), None, None, None, None, None) {
+        match identity::resolve_identity(db, Some(name), None, None, None, None) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -792,7 +937,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             }
         }
     } else {
-        match identity::resolve_identity(db, None, None, None, None, None, None) {
+        match identity::resolve_identity(db, None, None, None, None, None) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -801,13 +946,63 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
-    // Guard: Block sends from vanilla Claude before opt-in
-    if matches!(sender_identity.kind, SenderKind::Instance)
-        && sender_identity.instance_data.is_none()
-        && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
+    // Self-delivery is always filtered out, so an all-self target list would
+    // otherwise "succeed" with no recipients.
+    if !effective_targets.is_empty()
+        && effective_targets.iter().all(|t| {
+            // Routing treats bigboss:DEVICE as bigboss (device-agnostic identity).
+            let base = match t.split_once(':') {
+                Some((base, _)) if base == SENDER => base,
+                _ => t.as_str(),
+            };
+            identity::resolve_display_name(db, base)
+                .as_deref()
+                .unwrap_or(base)
+                == sender_identity.name
+        })
     {
-        eprintln!("Error: Cannot send without identity.");
-        eprintln!("Run 'hcom start' first, then use 'hcom send'.");
+        eprintln!(
+            "Error: @{} is you ({}); agents don't receive their own messages",
+            effective_targets[0], sender_identity.name
+        );
+        return 1;
+    }
+
+    let targets_to_pass: Option<&[String]> =
+        if args.has_separator() || !effective_targets.is_empty() {
+            Some(&effective_targets)
+        } else {
+            None
+        };
+
+    let preview_has_envelope =
+        envelope.intent.is_some() || envelope.reply_to.is_some() || envelope.thread.is_some();
+    let preview_delivery = match resolve_delivery(
+        db,
+        &sender_identity,
+        &message,
+        if preview_has_envelope {
+            Some(&envelope)
+        } else {
+            None
+        },
+        targets_to_pass,
+    ) {
+        Ok(delivery) => delivery,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            print_stopped_target_hints(db, &effective_targets, &message);
+            return 1;
+        }
+    };
+
+    if is_inside_ai_tool()
+        && !ctx.map(|c| c.go).unwrap_or(false)
+        && preview_delivery.original_scope == MessageScope::Broadcast
+        && !preview_delivery.is_thread_resolved
+        && preview_delivery.delivered_to.len() > 3
+    {
+        print_broadcast_preview(db, &preview_delivery.delivered_to);
         return 1;
     }
 
@@ -915,14 +1110,8 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         || envelope.reply_to.is_some()
         || envelope.thread.is_some()
         || envelope.bundle_id.is_some();
-    let targets_to_pass: Option<&[String]> =
-        if args.has_separator() || !effective_targets.is_empty() {
-            Some(&effective_targets)
-        } else {
-            None
-        };
 
-    let delivered_to = match send_message(
+    let (event_id, delivered_to) = match send_message(
         db,
         &sender_identity,
         &message,
@@ -935,93 +1124,131 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
     };
+    // From here send owns the receiver's inline delivery: it delivers the batch
+    // or deliberately leaves it unread (--quiet, --json, failed write). A send
+    // that failed earlier leaves it to the router.
+    crate::cli_context::claim_inline_delivery();
 
     // ── Feedback ──
+    if args.json {
+        let out = serde_json::json!({
+            "event_id": event_id,
+            "delivered_to": delivered_to,
+        });
+        println!("{}", serde_json::to_string(&out).unwrap());
+        crate::relay::worker::ensure_worker(true);
+        return 0;
+    }
+
     if args.quiet {
         crate::relay::worker::ensure_worker(true);
         return 0;
     }
 
-    let feedback = get_recipient_feedback(db, &delivered_to);
+    let feedback = get_recipient_feedback(
+        db,
+        &delivered_to,
+        envelope
+            .thread
+            .as_deref()
+            .filter(|_| preview_delivery.is_thread_resolved),
+    );
 
-    // Show unread messages if instance context (full delivery with cursor advance)
-    if matches!(sender_identity.kind, SenderKind::Instance) {
-        let messages = db.get_unread_messages(&sender_identity.name);
-        if !messages.is_empty() {
-            // Advance cursor
-            if let Some(last) = messages.last() {
-                if let Some(id) = last.event_id {
-                    let mut updates = serde_json::Map::new();
-                    updates.insert("last_event_id".into(), serde_json::json!(id));
-                    instances::update_instance_position(db, &sender_identity.name, &updates);
-                }
-            }
+    // Deliver the receiver's unread messages inline. With --from the outgoing
+    // author is external, but an invoking adhoc instance still receives.
+    // The router skips its own delivery for send, so --quiet leaves messages unread.
+    // Not Grok: hcom queues each batch as a Grok prompt, possibly already
+    // (not yet running), so showing it here too would deliver it twice. Its
+    // messages arrive once, as prompts.
+    let queue_delivered = sender_identity
+        .instance_data
+        .as_ref()
+        .and_then(|data| data.get("tool"))
+        .and_then(|tool| tool.as_str())
+        == Some(crate::tool::Tool::Grok.as_str());
+    let receiver = if queue_delivered {
+        None
+    } else if matches!(sender_identity.kind, SenderKind::Instance) {
+        Some((&sender_identity, false))
+    } else {
+        ctx.and_then(crate::cli_context::inline_receiver)
+            .map(|actor| (actor, true))
+    };
+    let batch = receiver.and_then(|(r, _)| InlineBatch::take(db, &r.name));
+    let noted_remaining = batch.as_ref().is_some_and(|b| b.remaining > 0);
+    if let (Some((receiver, set_status)), Some(batch)) = (receiver, batch) {
+        let subagent_names: std::collections::HashSet<String> = db
+            .conn()
+            .prepare("SELECT name FROM instances WHERE parent_name = ?")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map(rusqlite::params![&receiver.name], |row| row.get(0))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (sub_msgs, main_msgs): (Vec<_>, Vec<_>) = batch
+            .messages
+            .iter()
+            .partition(|msg| subagent_names.contains(&msg.from));
 
-            // Separate subagent messages from main messages
-            let subagent_names: std::collections::HashSet<String> = db
-                .conn()
-                .prepare("SELECT name FROM instances WHERE parent_name = ?")
-                .ok()
-                .map(|mut stmt| {
-                    stmt.query_map(rusqlite::params![&sender_identity.name], |row| row.get(0))
-                        .ok()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|r| r.ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let mut main_msgs = Vec::new();
-            let mut sub_msgs = Vec::new();
-            for msg in &messages {
-                if subagent_names.contains(&msg.from) {
-                    sub_msgs.push(msg);
-                } else {
-                    main_msgs.push(msg);
-                }
-            }
-
-            const MAX_MSGS: usize = 50;
-
-            print!("{feedback}");
-            if !main_msgs.is_empty() {
-                let capped: Vec<&_> = main_msgs.iter().take(MAX_MSGS).copied().collect();
-                let formatted = format_messages_for_hook(db, &capped, &sender_identity.name);
-                println!("\n{formatted}");
-            }
-            if !sub_msgs.is_empty() {
-                let capped: Vec<&_> = sub_msgs.iter().take(MAX_MSGS).copied().collect();
-                let formatted = format_messages_for_hook(db, &capped, &sender_identity.name);
-                println!("\n[Subagent messages]\n{formatted}");
-            }
-            if main_msgs.is_empty() && sub_msgs.is_empty() {
-                println!();
-            }
-        } else {
-            println!("{feedback}");
+        let mut output = feedback.clone();
+        if !main_msgs.is_empty() {
+            output.push_str(&format!(
+                "\n{}",
+                format_messages_for_hook(db, &main_msgs, &receiver.name)
+            ));
+        }
+        if !sub_msgs.is_empty() {
+            output.push_str(&format!(
+                "\n[Subagent messages]\n{}",
+                format_messages_for_hook(db, &sub_msgs, &receiver.name)
+            ));
+        }
+        output.push('\n');
+        output.push_str(&batch.remaining_note(&receiver.name));
+        if let Err(e) = batch.emit(db, &receiver.name, &output, set_status) {
+            eprintln!("Message sent, but {e}");
+            crate::relay::worker::ensure_worker(true);
+            return 1;
         }
     } else {
         println!("{feedback}");
     }
 
-    // Adhoc unread delivery: for --name instances, show unread preview
-    if explicit_name.is_some() && matches!(sender_identity.kind, SenderKind::Instance) {
-        let messages = db.get_unread_messages(&sender_identity.name);
-        if !messages.is_empty() {
-            println!("\n{}", "─".repeat(40));
-            println!("[hcom] new message(s)");
-            println!("{}", "─".repeat(40));
-            println!("\nRun: hcom listen --name {}", sender_identity.name);
-        }
+    // ── Trailing --name hint ──
+    if name_was_stripped {
+        let sender_name = &sender_identity.name;
+        println!();
+        println!(
+            "[hcom] Note: '--name {sender_name}' was stripped from the end of your message body."
+        );
+        println!("  Correct syntax (--name goes BEFORE --):");
+        println!("    hcom send --name {sender_name} @target -- your message");
+        println!("  To send '--name {sender_name}' as literal text, don't put it at the very end.");
+    }
+
+    // Messages that arrived after the batch was taken are not in the output or
+    // the remaining note. Say so, or an adhoc caller won't know until its next command.
+    if let Some((receiver, _)) = receiver
+        && !noted_remaining
+        && !db.get_unread_messages(&receiver.name).is_empty()
+    {
+        println!(
+            "[hcom] new message(s) arrived — run: hcom listen --name {}",
+            receiver.name
+        );
     }
 
     // Show intent tip
-    if let Some(ref intent) = envelope.intent {
-        if matches!(sender_identity.kind, SenderKind::Instance) {
-            let tip_key = format!("send:intent:{}", intent.as_str());
-            crate::core::tips::maybe_show_tip(db, &sender_identity.name, &tip_key, false);
-        }
+    if let Some(ref intent) = envelope.intent
+        && matches!(sender_identity.kind, SenderKind::Instance)
+    {
+        let tip_key = format!("send:intent:{}", intent.as_str());
+        crate::core::tips::maybe_show_tip(db, &sender_identity.name, &tip_key, false);
     }
 
     crate::relay::worker::ensure_worker(true);
@@ -1035,13 +1262,16 @@ fn format_messages_for_hook(
     messages: &[&crate::db::Message],
     instance_name: &str,
 ) -> String {
-    let recipient_display = instances::get_display_name(db, instance_name);
+    let recipient_display = identity::get_display_name(db, instance_name);
 
     if messages.len() == 1 {
         let msg = messages[0];
-        let sender_display = instances::get_display_name(db, &msg.from);
-        let prefix =
-            cli_context_build_prefix(msg.intent.as_deref(), msg.thread.as_deref(), msg.event_id);
+        let sender_display = identity::get_display_name(db, &msg.from);
+        let prefix = crate::cli_context::format_envelope_prefix(
+            msg.intent.as_deref(),
+            msg.thread.as_deref(),
+            msg.reply_id().as_deref(),
+        );
         format!(
             "{prefix} {sender_display} → {recipient_display}: {}",
             msg.text
@@ -1050,11 +1280,11 @@ fn format_messages_for_hook(
         let parts: Vec<String> = messages
             .iter()
             .map(|msg| {
-                let sender_display = instances::get_display_name(db, &msg.from);
-                let prefix = cli_context_build_prefix(
+                let sender_display = identity::get_display_name(db, &msg.from);
+                let prefix = crate::cli_context::format_envelope_prefix(
                     msg.intent.as_deref(),
                     msg.thread.as_deref(),
-                    msg.event_id,
+                    msg.reply_id().as_deref(),
                 );
                 format!(
                     "{prefix} {sender_display} → {recipient_display}: {}",
@@ -1066,30 +1296,19 @@ fn format_messages_for_hook(
     }
 }
 
-fn cli_context_build_prefix(
-    intent: Option<&str>,
-    thread: Option<&str>,
-    event_id: Option<i64>,
-) -> String {
-    let id_ref = event_id.map(|id| format!("#{id}")).unwrap_or_default();
-    let prefix = match (intent, thread) {
-        (Some(i), Some(t)) => format!("{i}:{t}"),
-        (Some(i), None) => i.to_string(),
-        (None, Some(t)) => format!("thread:{t}"),
-        (None, None) => "new message".to_string(),
-    };
-    if id_ref.is_empty() {
-        format!("[{prefix}]")
-    } else {
-        format!("[{prefix} {id_ref}]")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use serial_test::serial;
     use std::path::PathBuf;
+
+    type TestEnv = (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        crate::hooks::test_helpers::EnvGuard,
+    );
 
     #[test]
     fn parse_basic_send() {
@@ -1259,6 +1478,44 @@ mod tests {
     }
 
     #[test]
+    fn resolve_message_strips_redundant_trailing_auto_name_tokens() {
+        let mut args =
+            SendArgs::try_parse_from(["send", "@luna", "--", "message", "--name", "beru"]).unwrap();
+        args.had_separator = true;
+
+        assert_eq!(resolve_message(&args, Some("beru")).unwrap().0, "message");
+    }
+
+    #[test]
+    fn resolve_message_keeps_quoted_name_suffix_inside_one_argument() {
+        let mut args = SendArgs::try_parse_from([
+            "send",
+            "@luna",
+            "--",
+            "I always end commands with --name beru",
+        ])
+        .unwrap();
+        args.had_separator = true;
+
+        assert_eq!(
+            resolve_message(&args, Some("beru")).unwrap().0,
+            "I always end commands with --name beru"
+        );
+    }
+
+    #[test]
+    fn resolve_message_keeps_trailing_name_for_different_sender() {
+        let mut args =
+            SendArgs::try_parse_from(["send", "@luna", "--", "message", "--name", "nova"]).unwrap();
+        args.had_separator = true;
+
+        assert_eq!(
+            resolve_message(&args, Some("beru")).unwrap().0,
+            "message --name nova"
+        );
+    }
+
+    #[test]
     fn parse_extends_flag() {
         let args = SendArgs::try_parse_from([
             "send",
@@ -1283,10 +1540,13 @@ mod tests {
         assert!(msg.is_none());
     }
 
-    fn setup_test_db() -> (HcomDb, PathBuf) {
+    fn setup_test_db() -> (HcomDb, PathBuf, TestEnv) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+        // send_message() reaches the process-global relay notification path,
+        // so its ambient HCOM_DIR must live as long as the test DB.
+        let env = crate::hooks::test_helpers::isolated_test_env();
         let temp_dir = std::env::temp_dir();
         let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let db_path = temp_dir.join(format!(
@@ -1295,9 +1555,8 @@ mod tests {
             test_id
         ));
 
-        let db = HcomDb::open_raw(&db_path).unwrap();
-        db.init_db().unwrap();
-        (db, db_path)
+        let db = HcomDb::open_at(&db_path).unwrap();
+        (db, db_path, env)
     }
 
     fn cleanup_test_db(path: PathBuf) {
@@ -1309,8 +1568,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_message_threads_seed_and_reuse_memberships() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0)",
@@ -1329,7 +1589,7 @@ mod tests {
             ..Default::default()
         };
 
-        let delivered = send_message(
+        let (_, delivered) = send_message(
             &db,
             &sender,
             "hello",
@@ -1345,15 +1605,16 @@ mod tests {
             vec!["nova".to_string(), "miso".to_string(), "luna".to_string()]
         );
 
-        let delivered = send_message(&db, &sender, "round 2", Some(&envelope), None).unwrap();
+        let (_, delivered) = send_message(&db, &sender, "round 2", Some(&envelope), None).unwrap();
         assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
 
         cleanup_test_db(path);
     }
 
     #[test]
+    #[serial]
     fn send_message_thread_without_members_errors() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
@@ -1379,8 +1640,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_message_external_sender_does_not_auto_subscribe_to_thread() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, created_at) VALUES ('nova', 1000.0)",
@@ -1399,7 +1661,7 @@ mod tests {
             ..Default::default()
         };
 
-        let delivered = send_message(
+        let (_, delivered) = send_message(
             &db,
             &sender,
             "hello",
@@ -1414,8 +1676,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn send_message_thread_request_does_not_create_request_watch_rows() {
-        let (db, path) = setup_test_db();
+        let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
                 "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
@@ -1447,7 +1710,7 @@ mod tests {
             thread: Some("ops".into()),
             ..Default::default()
         };
-        let delivered =
+        let (_, delivered) =
             send_message(&db, &sender, "status?", Some(&request_envelope), None).unwrap();
         assert_eq!(delivered, vec!["nova".to_string()]);
 
@@ -1475,6 +1738,75 @@ mod tests {
             .unwrap();
         assert_eq!(scope, "mentions");
         assert!(mentions_json.contains("nova"));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_mention_excludes_inactive_instances() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('luna', 'listening', '', 1000.0),
+                        ('vine', 'inactive', 'exit:unknown', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+
+        let err =
+            send_message(&db, &sender, "ping", None, Some(&["vine".to_string()])).unwrap_err();
+        assert!(err.contains("@vine"), "err={err}");
+        assert!(err.contains("Available:"), "err={err}");
+        assert!(
+            err.contains("luna"),
+            "listening agent should be listed: {err}"
+        );
+        let available_line = err.lines().find(|l| l.contains("Available:")).unwrap_or("");
+        assert!(
+            !available_line.contains("vine"),
+            "inactive agent must not appear in Available: {err}"
+        );
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn send_mention_excludes_exit_no_tool_call_inactive() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('luna', 'listening', '', 1000.0),
+                        ('dove', 'inactive', 'exit:no_tool_call', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+
+        let err =
+            send_message(&db, &sender, "ping", None, Some(&["dove".to_string()])).unwrap_err();
+        assert!(err.contains("@dove"), "err={err}");
+        let available_line = err.lines().find(|l| l.contains("Available:")).unwrap_or("");
+        assert!(
+            !available_line.contains("dove"),
+            "soft-stopped agent must not appear in Available: {err}"
+        );
 
         cleanup_test_db(path);
     }
@@ -1509,5 +1841,498 @@ mod tests {
         let (targets, msg) = process_positionals(&["@luna".to_string(), "hello".to_string()]);
         assert_eq!(targets, vec!["luna"]);
         assert_eq!(msg.as_deref(), Some("hello"));
+    }
+
+    fn insert_imported_remote_message(
+        db: &HcomDb,
+        local_id: i64,
+        origin_id: serde_json::Value,
+        short: &str,
+        text: &str,
+        thread: Option<&str>,
+        intent: Option<&str>,
+    ) {
+        let relay_obj = serde_json::json!({
+            "id": origin_id,
+            "short": short,
+            "device": format!("dev-uuid-{short}"),
+        });
+        let mut data = serde_json::json!({
+            "from": format!("remote:{short}"),
+            "text": text,
+            "_relay": relay_obj,
+        });
+        if let Some(t) = thread {
+            data["thread"] = serde_json::json!(t);
+        }
+        if let Some(i) = intent {
+            data["intent"] = serde_json::json!(i);
+        }
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (?, 'message', 'remote-inst', '2026-09-04T00:00:00Z', ?)",
+                rusqlite::params![local_id, data.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_remote_different_local_id() {
+        let (db, path, _env) = setup_test_db();
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "remote msg",
+            None,
+            None,
+        );
+
+        let resolved = resolve_reply_to_local(&db, "42:BOXE");
+        assert_eq!(resolved, Some(100));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_remote_colliding_local_id() {
+        let (db, path, _env) = setup_test_db();
+        let local_data = serde_json::json!({ "text": "unrelated local message" });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (42, 'message', 'local-inst', '2026-09-04T00:00:00Z', ?)",
+                [local_data.to_string()],
+            )
+            .unwrap();
+
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "remote msg",
+            None,
+            None,
+        );
+
+        // 42:BOXE must resolve to the remote event (100), never the colliding local event (42)
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE"), Some(100));
+        // local 42 without suffix must resolve to the local event (42)
+        assert_eq!(resolve_reply_to_local(&db, "42"), Some(42));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_two_devices_same_origin_id() {
+        let (db, path, _env) = setup_test_db();
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "msg 1",
+            None,
+            None,
+        );
+        insert_imported_remote_message(
+            &db,
+            200,
+            serde_json::json!(42),
+            "WAVE",
+            "msg 2",
+            None,
+            None,
+        );
+
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE"), Some(100));
+        assert_eq!(resolve_reply_to_local(&db, "42:WAVE"), Some(200));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_canonical_device_suffix_grammar() {
+        let (db, path, _env) = setup_test_db();
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "remote msg",
+            None,
+            None,
+        );
+
+        // Exact 4-char uppercase ASCII succeeds
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE"), Some(100));
+
+        // Lowercase, mixed-case, prefixes, or non-4-char suffixes must fail closed
+        assert_eq!(resolve_reply_to_local(&db, "42:boxe"), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:Boxe"), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:BO"), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:BOX"), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXES"), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:NOPE"), None);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_rejects_non_integer_json_id() {
+        let (db, path, _env) = setup_test_db();
+        // Origin ID stored as JSON string instead of JSON integer
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!("42"),
+            "BOXE",
+            "malformed",
+            None,
+            None,
+        );
+
+        // Must fail closed because json_type is not 'integer'
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE"), None);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_duplicate_same_short_origin_fails_closed() {
+        let (db, path, _env) = setup_test_db();
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "msg 1",
+            None,
+            None,
+        );
+        insert_imported_remote_message(
+            &db,
+            101,
+            serde_json::json!(42),
+            "BOXE",
+            "msg 2",
+            None,
+            None,
+        );
+
+        // Multiple rows with origin=42 and short=BOXE must fail closed
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE"), None);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cmd_send_remote_reply_inherits_thread_at_command_boundary() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('sender', 1000.0), ('target', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // Remote request at local row 100 with origin 42 and thread "thread-remote-99"
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "remote req",
+            Some("thread-remote-99"),
+            Some("request"),
+        );
+
+        // Execute send through the full cmd_send entrypoint without specifying --thread
+        let mut args = SendArgs::try_parse_from([
+            "send",
+            "@target",
+            "--from",
+            "sender",
+            "--intent",
+            "ack",
+            "--reply-to",
+            "42:BOXE",
+            "--",
+            "pong message",
+        ])
+        .unwrap();
+        args.had_separator = true;
+
+        let exit_code = cmd_send(&db, &args, None);
+        assert_eq!(exit_code, 0, "cmd_send should succeed");
+
+        // Verify sent event data at command boundary
+        let (reply_to, reply_to_local, thread): (Option<String>, Option<i64>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.reply_to'), json_extract(data, '$.reply_to_local'), json_extract(data, '$.thread')
+                 FROM events WHERE type = 'message' AND id != 100 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(reply_to.as_deref(), Some("42:BOXE"));
+        assert_eq!(reply_to_local, Some(100));
+        assert_eq!(thread.as_deref(), Some("thread-remote-99"));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cmd_send_unresolved_remote_reply_exits_one() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('sender', 1000.0), ('target', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "remote req",
+            None,
+            None,
+        );
+
+        let count_before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+
+        // Unknown device
+        let mut args_unknown = SendArgs::try_parse_from([
+            "send",
+            "@target",
+            "--from",
+            "sender",
+            "--reply-to",
+            "42:NOPE",
+            "--",
+            "hi",
+        ])
+        .unwrap();
+        args_unknown.had_separator = true;
+        assert_eq!(cmd_send(&db, &args_unknown, None), 1);
+
+        // Non-canonical lowercase device
+        let mut args_lower = SendArgs::try_parse_from([
+            "send",
+            "@target",
+            "--from",
+            "sender",
+            "--reply-to",
+            "42:boxe",
+            "--",
+            "hi",
+        ])
+        .unwrap();
+        args_lower.had_separator = true;
+        assert_eq!(cmd_send(&db, &args_lower, None), 1);
+
+        // Non-existent origin ID
+        let mut args_nonexistent = SendArgs::try_parse_from([
+            "send",
+            "@target",
+            "--from",
+            "sender",
+            "--reply-to",
+            "999:BOXE",
+            "--",
+            "hi",
+        ])
+        .unwrap();
+        args_nonexistent.had_separator = true;
+        assert_eq!(cmd_send(&db, &args_nonexistent, None), 1);
+
+        let count_after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_before, count_after);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cmd_send_ambiguous_remote_reply_exits_one_and_emits_no_message() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('sender', 1000.0), ('target', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // Two distinct local rows with identical origin ID (42) and short device ("BOXE")
+        insert_imported_remote_message(
+            &db,
+            101,
+            serde_json::json!(42),
+            "BOXE",
+            "remote msg 1",
+            None,
+            None,
+        );
+        insert_imported_remote_message(
+            &db,
+            102,
+            serde_json::json!(42),
+            "BOXE",
+            "remote msg 2",
+            None,
+            None,
+        );
+
+        let count_before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+
+        let mut args_ambiguous = SendArgs::try_parse_from([
+            "send",
+            "@target",
+            "--from",
+            "sender",
+            "--reply-to",
+            "42:BOXE",
+            "--",
+            "hi",
+        ])
+        .unwrap();
+        args_ambiguous.had_separator = true;
+
+        assert_eq!(cmd_send(&db, &args_ambiguous, None), 1);
+
+        let count_after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count_before, count_after);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_send_message_remote_ack_loop_prevention_with_differing_ids() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // 1. Remote inform: local id = 110, origin id = 10 (distinct IDs)
+        insert_imported_remote_message(
+            &db,
+            110,
+            serde_json::json!(10),
+            "BOXE",
+            "remote info",
+            None,
+            Some("inform"),
+        );
+
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+
+        let ack_to_inform = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Ack),
+            reply_to: Some("10:BOXE".into()),
+            ..Default::default()
+        };
+
+        let err = send_message(&db, &sender, "ack", Some(&ack_to_inform), None).unwrap_err();
+        assert!(err.contains("Cannot ack an inform"));
+
+        // 2. Remote ack: local id = 120, origin id = 20 (distinct IDs)
+        insert_imported_remote_message(
+            &db,
+            120,
+            serde_json::json!(20),
+            "BOXE",
+            "remote ack",
+            None,
+            Some("ack"),
+        );
+
+        let ack_to_ack = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Ack),
+            reply_to: Some("20:BOXE".into()),
+            ..Default::default()
+        };
+
+        let err = send_message(&db, &sender, "ack", Some(&ack_to_ack), None).unwrap_err();
+        assert!(err.contains("Ack-on-ack loop detected"));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_malformed_tokens_fail_closed() {
+        let (db, path, _env) = setup_test_db();
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            "BOXE",
+            "remote msg",
+            None,
+            None,
+        );
+
+        assert_eq!(resolve_reply_to_local(&db, ""), None);
+        assert_eq!(resolve_reply_to_local(&db, "   "), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:"), None);
+        assert_eq!(resolve_reply_to_local(&db, ":BOXE"), None);
+        assert_eq!(resolve_reply_to_local(&db, "42:BOXE:EXTRA"), None);
+        assert_eq!(resolve_reply_to_local(&db, "abc:BOXE"), None);
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_reply_to_local_only_unchanged() {
+        let (db, path, _env) = setup_test_db();
+        let local_data = serde_json::json!({ "text": "local message" });
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) VALUES (42, 'message', 'local-inst', '2026-09-04T00:00:00Z', ?)",
+                [local_data.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(resolve_reply_to_local(&db, "42"), Some(42));
+        assert_eq!(resolve_reply_to_local(&db, "999"), None);
+        assert_eq!(resolve_reply_to_local(&db, "notanumber"), None);
+
+        cleanup_test_db(path);
     }
 }

@@ -1,12 +1,17 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot). Grok has none (see `delivery/grok.rs`).
 
+pub mod antigravity;
 pub mod claude;
-pub mod claude_args;
 pub mod codex;
 pub mod common;
+pub mod copilot;
+pub mod cursor;
 pub mod family;
 pub mod gemini;
+pub mod kimi;
 pub mod opencode;
+pub mod pi;
+pub mod runtime;
 pub mod utils;
 
 use serde_json::Value;
@@ -15,11 +20,43 @@ use serde_json::Value;
 #[cfg(test)]
 pub mod test_helpers {
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    // Process-global serialization for tests that mutate HCOM_DIR/HOME.
+    // Env vars are process-wide; without this, parallel tests trample each
+    // other (e.g. one test's config write lands in another's tempdir).
+    // Recover from poison so a panic in one test doesn't cascade-fail the
+    // next — the shared state is just "one set of env vars at a time."
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn acquire_env_lock() -> MutexGuard<'static, ()> {
+        TEST_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     /// RAII guard that saves/restores HCOM_DIR and HOME env vars, and resets Config.
     pub struct EnvGuard {
         saved_hcom: Option<String>,
         saved_home: Option<String>,
+        saved_cursor_config_dir: Option<String>,
+        saved_xdg_config_home: Option<String>,
+        saved_xdg_data_home: Option<String>,
+        saved_codex_home: Option<String>,
+        saved_gemini_cli_home: Option<String>,
+        saved_kilo_config_dir: Option<String>,
+        saved_kimi_code_home: Option<String>,
+        saved_copilot_home: Option<String>,
+        saved_test_codex_cli_version: Option<String>,
+        saved_pi_coding_agent_dir: Option<String>,
+        saved_pi_coding_agent_session_dir: Option<String>,
+        saved_pi_config_dir: Option<String>,
+        saved_omp_profile: Option<String>,
+        saved_pi_profile: Option<String>,
+        // Declared last so it drops AFTER Drop::drop restores env vars,
+        // releasing the lock only once this test's env state is gone.
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl Default for EnvGuard {
@@ -30,9 +67,26 @@ pub mod test_helpers {
 
     impl EnvGuard {
         pub fn new() -> Self {
+            let lock = acquire_env_lock();
             Self {
                 saved_hcom: std::env::var("HCOM_DIR").ok(),
                 saved_home: std::env::var("HOME").ok(),
+                saved_cursor_config_dir: std::env::var("CURSOR_CONFIG_DIR").ok(),
+                saved_xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
+                saved_xdg_data_home: std::env::var("XDG_DATA_HOME").ok(),
+                saved_codex_home: std::env::var("CODEX_HOME").ok(),
+                saved_gemini_cli_home: std::env::var("GEMINI_CLI_HOME").ok(),
+                saved_kilo_config_dir: std::env::var("KILO_CONFIG_DIR").ok(),
+                saved_kimi_code_home: std::env::var("KIMI_CODE_HOME").ok(),
+                saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
+                saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
+                saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
+                saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
+                    .ok(),
+                saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
+                saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
+                saved_pi_profile: std::env::var("PI_PROFILE").ok(),
+                _lock: lock,
             }
         }
     }
@@ -48,6 +102,62 @@ pub mod test_helpers {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
                 }
+                match &self.saved_cursor_config_dir {
+                    Some(v) => std::env::set_var("CURSOR_CONFIG_DIR", v),
+                    None => std::env::remove_var("CURSOR_CONFIG_DIR"),
+                }
+                match &self.saved_xdg_config_home {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+                match &self.saved_xdg_data_home {
+                    Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+                match &self.saved_codex_home {
+                    Some(v) => std::env::set_var("CODEX_HOME", v),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+                match &self.saved_gemini_cli_home {
+                    Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
+                    None => std::env::remove_var("GEMINI_CLI_HOME"),
+                }
+                match &self.saved_kilo_config_dir {
+                    Some(v) => std::env::set_var("KILO_CONFIG_DIR", v),
+                    None => std::env::remove_var("KILO_CONFIG_DIR"),
+                }
+                match &self.saved_kimi_code_home {
+                    Some(v) => std::env::set_var("KIMI_CODE_HOME", v),
+                    None => std::env::remove_var("KIMI_CODE_HOME"),
+                }
+                match &self.saved_copilot_home {
+                    Some(v) => std::env::set_var("COPILOT_HOME", v),
+                    None => std::env::remove_var("COPILOT_HOME"),
+                }
+                match &self.saved_test_codex_cli_version {
+                    Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
+                    None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
+                }
+                match &self.saved_pi_coding_agent_dir {
+                    Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+                    None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+                }
+                match &self.saved_pi_coding_agent_session_dir {
+                    Some(v) => std::env::set_var("PI_CODING_AGENT_SESSION_DIR", v),
+                    None => std::env::remove_var("PI_CODING_AGENT_SESSION_DIR"),
+                }
+                match &self.saved_pi_config_dir {
+                    Some(v) => std::env::set_var("PI_CONFIG_DIR", v),
+                    None => std::env::remove_var("PI_CONFIG_DIR"),
+                }
+                match &self.saved_omp_profile {
+                    Some(v) => std::env::set_var("OMP_PROFILE", v),
+                    None => std::env::remove_var("OMP_PROFILE"),
+                }
+                match &self.saved_pi_profile {
+                    Some(v) => std::env::set_var("PI_PROFILE", v),
+                    None => std::env::remove_var("PI_PROFILE"),
+                }
             }
             crate::config::Config::reset();
             crate::config::Config::init();
@@ -62,9 +172,16 @@ pub mod test_helpers {
         let test_home = dir.path().to_path_buf();
         let hcom_dir = test_home.join(".hcom");
         std::fs::create_dir_all(&hcom_dir).unwrap();
+        // Claim this tempdir as a disposable root so Config trusts it (temp-tree
+        // geography alone is not enough — see paths::test_roots).
+        crate::paths::test_roots::register(&test_home);
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            // CODEX_HOME overrides HOME; inheriting it would write test hooks
+            // into the user's real Codex configuration.
+            std::env::remove_var("CODEX_HOME");
+            std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
         }
         crate::config::Config::reset();
         crate::config::Config::init();
@@ -74,10 +191,10 @@ pub mod test_helpers {
 
 // Re-export key types.
 pub use common::{
-    deliver_pending_messages, finalize_session, find_last_bind_marker, get_pending_instances,
-    init_hook_context, inject_bootstrap_once, poll_messages, stop_instance,
+    deliver_pending_messages, finalize_session, init_hook_context, inject_bootstrap_once,
+    poll_messages, stop_instance,
 };
-pub use family::{bind_vanilla_instance, extract_tool_detail};
+pub use family::extract_tool_detail;
 pub use utils::{HOOK_REGISTRY, HookCategory, HookInfo};
 
 /// Delivery cursor/status update to apply after hook output is written.
@@ -87,6 +204,10 @@ pub struct DeliveryAck {
     pub last_event_id: i64,
     pub status_context: String,
     pub msg_ts: String,
+    /// Also flip `name_announced` on commit. Used for a subagent's first
+    /// activation delivery, so the one-shot bootstrap is only consumed once
+    /// the message that carries it is confirmed written to stdout.
+    pub mark_announced: bool,
 }
 
 /// Normalized hook payload — unified across all tools.
@@ -102,7 +223,7 @@ pub struct HookPayload {
     pub transcript_path: Option<String>,
     /// Hook name (e.g., "Stop", "PostToolUse", "PreToolUse").
     pub hook_name: String,
-    /// Tool type string ("claude", "gemini", "codex", "opencode").
+    /// Tool type string ("claude", "gemini", "codex", "opencode", "kilo", "pi", "omp", "antigravity", "cursor", "kimi", "copilot", "grok").
     pub tool: String,
     /// Tool name from hook (e.g., "Bash", "Write" for PostToolUse).
     pub tool_name: String,
@@ -130,10 +251,10 @@ impl HookPayload {
     /// Extract an optional string from the first matching key.
     fn opt_str_field(raw: &Value, keys: &[&str]) -> Option<String> {
         for key in keys {
-            if let Some(s) = raw.get(*key).and_then(|v| v.as_str()) {
-                if !s.is_empty() {
-                    return Some(s.to_string());
-                }
+            if let Some(s) = raw.get(*key).and_then(|v| v.as_str())
+                && !s.is_empty()
+            {
+                return Some(s.to_string());
             }
         }
         None
@@ -213,6 +334,37 @@ impl HookPayload {
         }
     }
 
+    /// Build from Antigravity hook JSON.
+    ///
+    /// Antigravity stdin format (nested toolCall):
+    ///   { "conversationId", "transcriptPath", "stepIdx",
+    ///     "toolCall": { "name", "args": { ... } },
+    ///     "workspacePaths", "artifactDirectoryPath" }
+    pub fn from_antigravity(raw: Value, hook_name: &str) -> Self {
+        let tool_call = raw.get("toolCall").cloned().unwrap_or_default();
+        let tool_name = tool_call
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let tool_input = tool_call
+            .get("args")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
+
+        Self {
+            session_id: Self::opt_str_field(&raw, &["conversationId"]),
+            transcript_path: Self::opt_str_field(&raw, &["transcriptPath"]),
+            hook_name: hook_name.to_string(),
+            tool: "antigravity".to_string(),
+            tool_name,
+            tool_input,
+            tool_result: String::new(),
+            notification_type: None,
+            raw,
+        }
+    }
+
     /// Build from native Codex hook JSON.
     ///
     /// Codex hooks pass JSON on stdin with snake_case fields such as:
@@ -236,6 +388,98 @@ impl HookPayload {
                 None => String::new(),
             },
             notification_type: None,
+            raw,
+        }
+    }
+
+    /// Build from Kimi Code CLI hook JSON.
+    ///
+    /// Kimi hooks pass JSON on stdin with snake_case fields such as:
+    ///   { "session_id", "hook_event_name", "tool_name", "tool_input",
+    ///     "tool_output", "prompt", "source", "cwd" }
+    pub fn from_kimi(hook_type: &str, raw: Value) -> Self {
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id"]),
+            transcript_path: None,
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name"])
+            } else {
+                hook_type.to_string()
+            },
+            tool: "kimi".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name"]),
+            tool_input: Self::obj_field(&raw, &["tool_input"]),
+            tool_result: match raw.get("tool_output") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
+            notification_type: Self::opt_str_field(&raw, &["notification_type", "sink"]),
+            raw,
+        }
+    }
+
+    /// Build from native Cursor Agent hook JSON.
+    ///
+    /// Cursor hooks use snake_case and include a common conversation ID on
+    /// every agent hook. `sessionStart` also includes the same value as
+    /// `session_id`.
+    pub fn from_cursor_native(hook_type: &str, raw: Value) -> Self {
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id", "conversation_id"]),
+            transcript_path: Self::opt_str_field(&raw, &["transcript_path"]),
+            hook_name: hook_type.to_string(),
+            tool: "cursor".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name"]),
+            tool_input: Self::obj_field(&raw, &["tool_input"]),
+            tool_result: match raw.get("tool_output") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            },
+            notification_type: None,
+            raw,
+        }
+    }
+
+    /// Build from GitHub Copilot CLI native hook JSON.
+    ///
+    /// PascalCase hook names yield mostly snake_case payloads. `Notification`
+    /// is mixed-cased in current Copilot builds, so accept both styles.
+    pub fn from_copilot_native(hook_type: &str, raw: Value) -> Self {
+        let tool_result = raw
+            .get("tool_result")
+            .or_else(|| raw.get("toolResult"))
+            .and_then(|v| {
+                v.get("text_result_for_llm")
+                    .or_else(|| v.get("textResultForLlm"))
+                    .or_else(|| v.get("output"))
+                    .or_else(|| v.get("text"))
+                    .or(Some(v))
+            })
+            .map(|v| {
+                v.as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .unwrap_or_default();
+
+        Self {
+            session_id: Self::opt_str_field(&raw, &["session_id", "sessionId"]),
+            transcript_path: Self::opt_str_field(&raw, &["transcript_path", "transcriptPath"]),
+            hook_name: if hook_type.is_empty() {
+                Self::str_field(&raw, &["hook_event_name", "hookEventName"])
+            } else {
+                hook_type.to_string()
+            },
+            tool: "copilot".to_string(),
+            tool_name: Self::str_field(&raw, &["tool_name", "toolName"]),
+            tool_input: Self::obj_field(&raw, &["tool_input", "toolInput"]),
+            tool_result,
+            notification_type: Self::opt_str_field(
+                &raw,
+                &["notification_type", "notificationType"],
+            ),
             raw,
         }
     }
@@ -278,6 +522,8 @@ pub enum HookResult {
     Block {
         /// Reason text (formatted messages for delivery).
         reason: String,
+        /// Delivery ack to commit after stdout is successfully written.
+        delivery_ack: Option<DeliveryAck>,
     },
 
     /// Update the tool input before execution (exit 0, updatedInput field).
@@ -342,6 +588,36 @@ mod tests {
     }
 
     #[test]
+    fn test_hook_payload_from_antigravity() {
+        let raw = serde_json::json!({
+            "conversationId": "6f000787-c5d3-4485-b266-142a15f7d79d",
+            "transcriptPath": "/tmp/transcript.jsonl",
+            "toolCall": {
+                "name": "run_command",
+                "args": { "CommandLine": "echo hi", "Cwd": "/tmp" }
+            }
+        });
+        let payload = HookPayload::from_antigravity(raw, "gemini-beforetool");
+        assert_eq!(
+            payload.session_id.as_deref(),
+            Some("6f000787-c5d3-4485-b266-142a15f7d79d")
+        );
+        assert_eq!(payload.tool, "antigravity");
+        assert_eq!(payload.tool_name, "run_command");
+        assert_eq!(payload.tool_input["CommandLine"], "echo hi");
+        assert_eq!(payload.hook_name, "gemini-beforetool");
+    }
+
+    #[test]
+    fn test_hook_payload_from_antigravity_no_toolcall() {
+        let raw = serde_json::json!({"conversationId": "abc-123"});
+        let payload = HookPayload::from_antigravity(raw, "gemini-sessionstart");
+        assert_eq!(payload.tool_name, "");
+        assert!(payload.tool_input.is_object());
+        assert_eq!(payload.hook_name, "gemini-sessionstart");
+    }
+
+    #[test]
     fn test_hook_payload_from_codex() {
         // Matches native Codex stdin payload
         let raw = serde_json::json!({
@@ -370,6 +646,19 @@ mod tests {
         assert_eq!(payload.session_id.as_deref(), Some("oc-111"));
         assert_eq!(payload.tool, "opencode");
         assert_eq!(payload.tool_name, "bash");
+    }
+
+    #[test]
+    fn test_hook_payload_from_copilot_mixed_notification() {
+        let raw = serde_json::json!({
+            "sessionId": "cop-1",
+            "hook_event_name": "Notification",
+            "notification_type": "agent_idle"
+        });
+        let payload = HookPayload::from_copilot_native("Notification", raw);
+        assert_eq!(payload.session_id.as_deref(), Some("cop-1"));
+        assert_eq!(payload.tool, "copilot");
+        assert_eq!(payload.notification_type.as_deref(), Some("agent_idle"));
     }
 
     #[test]
@@ -471,11 +760,16 @@ mod tests {
     fn test_hook_result_block() {
         let result = HookResult::Block {
             reason: "<hcom>message here</hcom>".into(),
+            delivery_ack: None,
         };
         assert_eq!(result.exit_code(), 2);
         match &result {
-            HookResult::Block { reason } => {
+            HookResult::Block {
+                reason,
+                delivery_ack,
+            } => {
                 assert_eq!(reason, "<hcom>message here</hcom>");
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Block"),
         }
@@ -495,3 +789,4 @@ mod tests {
         }
     }
 }
+pub mod omp;

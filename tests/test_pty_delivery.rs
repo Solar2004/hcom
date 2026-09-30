@@ -1,22 +1,22 @@
-//! PTY delivery integration test.
+//! PTY delivery live integration test.
 //!
-//! Launches a real AI tool instance in tmux, tests message delivery and gate blocking.
+//! Launches a real AI tool instance in a terminal, tests message delivery and gate blocking.
 //! Records full screen state at each phase for regression detection.
 //!
 //! Requires:
-//! - tmux installed and available
-//! - Target tool CLI installed (claude/gemini/codex/opencode)
+//! - tmux installed and available by default, or another terminal preset via HCOM_TEST_TERMINAL
+//! - Target tool CLI installed (claude/gemini/codex/opencode/kilo/pi/omp/antigravity/cursor/kimi/copilot)
 //!
-//! Phases (claude/gemini/codex):
-//! 1. Launch tool via `hcom 1 <tool>` with HCOM_TERMINAL=tmux
+//! Phases (claude/gemini/codex/antigravity/cursor/copilot):
+//! 1. Launch tool via `hcom 1 <tool>` with HCOM_TERMINAL=<terminal>
 //! 2. Wait for ready event, capture and validate full screen state
 //! 3. Send message → verify delivery via events, capture post-delivery screen
 //! 4. Inject uncommitted text → verify gate blocks delivery, capture screen
 //! 5. Submit text → verify blocked message delivers
 //! 6. Cleanup
 //!
-//! Phases (opencode — PTY bootstrap injection):
-//! 1. Launch opencode in tmux, wait for ready event
+//! Phases (opencode/kilo/pi — PTY bootstrap injection):
+//! 1. Launch tool in tmux, wait for ready event
 //! 2. Send message → verify PTY bootstrap injection triggers plugin binding + delivery
 //! 3. Send second message → verify plugin-based delivery (no PTY inject)
 //! 4. Cleanup
@@ -24,6 +24,13 @@
 //! Run (must use --test-threads=1 — tests launch real agents and interfere in parallel):
 //!     cargo test -p hcom --test test_pty_delivery -- --ignored --nocapture --test-threads=1
 //!     cargo test -p hcom --test test_pty_delivery test_pty_claude -- --ignored --nocapture --test-threads=1
+//!     HCOM_TEST_TERMINAL=kitty cargo test -p hcom --test test_pty_delivery test_pty_claude -- --ignored --nocapture --test-threads=1
+//!
+//! Why `#[ignore]`:
+//! These tests are not part of `cargo test` deliberately. They launch real agent
+//! CLIs in a real terminal, need each upstream tool installed on PATH,
+//! take minutes per case, run actual agents (cost). They are
+//! meant for manual runs ie version-bump. They are not literally 'ignored', just run when needed.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -58,13 +65,32 @@ macro_rules! logln {
 
 // ── Constants ──────────────────────────────────────────────────────────
 
-/// Ready patterns — must match src/tool.rs ready_pattern()
+/// Ready patterns — must match `IntegrationSpec.ready_pattern`. This test is
+/// an integration test against the hcom binary so it can't import the crate;
+/// the patterns are short and rarely change, drift is caught by the test
+/// itself when the expected pattern fails to appear on screen.
 fn ready_pattern(tool: &str) -> &'static str {
     match tool {
         "claude" => "? for shortcuts",
         "codex" => "\u{203a} ",
         "gemini" => "Type your message",
         "opencode" => "ctrl+p commands",
+        // Kilo is an OpenCode-family fork: same TUI footer.
+        "kilo" => "ctrl+p commands",
+        "pi" => "/ commands",
+        // OMP (Oh My Pi) has no reliable on-screen ready marker: its only chrome
+        // candidates live in the preset/theme-configurable status line. Launch
+        // readiness is proven by the hcom extension bind instead
+        // (`launch_ready_on_plugin_bind`), so the spec ready_pattern is empty and
+        // is_ready() is always true — same handling as cursor here. See OMP spec.
+        "omp" => "",
+        "antigravity" => "? for shortcuts",
+        // Cursor has no stable ASCII ready footer (spec ready_pattern is empty,
+        // so is_ready() is always true); readiness is asserted via ready/
+        // prompt_empty directly. has_ready_pattern() gates the pattern check off
+        // for cursor so it isn't run vacuously against an empty needle.
+        "cursor" => "",
+        "copilot" => "/ commands",
         _ => panic!("Unknown tool: {tool}"),
     }
 }
@@ -75,6 +101,9 @@ fn prompt_marker(tool: &str) -> &'static str {
         "claude" => "❯",
         "codex" => "›",
         "gemini" => " > ",
+        "antigravity" => ">",
+        "cursor" => "→",
+        "copilot" => "❯",
         _ => panic!("No prompt marker for {tool}"),
     }
 }
@@ -84,7 +113,10 @@ fn frame_marker(tool: &str) -> Option<&'static str> {
     match tool {
         "claude" => Some("─"),
         "codex" => None,
-        "gemini" => Some("▀"),
+        "gemini" => None,
+        "antigravity" => Some("─"),
+        "cursor" => None,
+        "copilot" => None,
         _ => None,
     }
 }
@@ -95,6 +127,12 @@ fn gate_block_context(tool: &str) -> &'static str {
         "claude" => "tui:prompt-has-text",
         "codex" => "tui:prompt-has-text",
         "gemini" => "tui:not-ready",
+        "antigravity" => "tui:prompt-has-text",
+        // cursor: require_prompt_empty=true, so uncommitted text settles to
+        // prompt_has_text (may transiently report user-active first; validate
+        // only warns on mismatch).
+        "cursor" => "tui:prompt-has-text",
+        "copilot" => "tui:prompt-has-text",
         _ => panic!("No gate block context for {tool}"),
     }
 }
@@ -102,6 +140,26 @@ fn gate_block_context(tool: &str) -> &'static str {
 /// Whether this tool gates on ready pattern
 fn require_ready(tool: &str) -> bool {
     matches!(tool, "gemini")
+}
+
+/// Timeout for the Phase 2 clean-prompt delivery wait.
+///
+/// hcom delivers to an idle agent by injecting only the `<hcom>` trigger (see
+/// `delivery.rs` build_wake_inject_text — Claude/Codex/Cursor all trigger-only);
+/// the message body is then surfaced by a hook *during the agent's turn*. For
+/// Claude/Codex/Gemini that hook fires fast, so 20s is ample. Cursor instead
+/// delivers when the turn ends (stop → followup_message) or on its first tool
+/// call (postToolUse → additional_context), so its first delivery is bounded by
+/// a full model turn on `--model auto` — empirically 9–25s. Use the same 60s
+/// budget Phase 4 already gives a turn-bounded delivery rather than letting a
+/// slow-but-healthy turn read as failure. The assertion stays strict: it still
+/// requires the real `deliver:` event, not merely the injected trigger.
+fn clean_prompt_delivery_timeout(tool: &str) -> Duration {
+    match tool {
+        // Turn-bounded delivery: agentStop/followup_message fires at end of a full model turn
+        "cursor" | "copilot" => Duration::from_secs(60),
+        _ => Duration::from_secs(20),
+    }
 }
 
 const SCREEN_FIELDS: &[&str] = &[
@@ -116,11 +174,59 @@ const SENDER: &str = "ptytest";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
+fn configure_test_terminal_env() -> String {
+    let terminal = std::env::var("HCOM_TEST_TERMINAL")
+        .or_else(|_| std::env::var("HCOM_TERMINAL"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "tmux".to_string());
+
+    // SAFETY: Integration tests run serially (serial_lock guards callers).
+    unsafe {
+        std::env::set_var("HCOM_TERMINAL", &terminal);
+        std::env::set_var("HCOM_TAG", "ptytest");
+    }
+
+    terminal
+}
+
 fn hcom(cmd: &str) -> Output {
     Command::new("hcom")
         .args(shell_words::split(cmd).unwrap())
         .output()
         .expect("failed to execute hcom")
+}
+
+fn base_name_from_instance_name(instance_name: &str) -> String {
+    let tag = std::env::var("HCOM_TAG").unwrap_or_default();
+    let prefix = format!("{tag}-");
+    instance_name
+        .strip_prefix(&prefix)
+        .unwrap_or(instance_name)
+        .to_string()
+}
+
+fn parse_launch_base_name(out: &Output) -> Option<String> {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout.lines().find_map(|line| {
+        let names = line.trim().strip_prefix("Names: ")?;
+        let first = names.split_whitespace().next()?;
+        Some(base_name_from_instance_name(first))
+    })
+}
+
+fn assert_launch_process_started(out: &Output) -> Option<String> {
+    let base_name = parse_launch_base_name(out);
+    if out.status.success() || (out.status.code() == Some(2) && base_name.is_some()) {
+        return base_name;
+    }
+
+    panic!(
+        "Launch failed (status {:?})\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn hcom_check(cmd: &str) -> String {
@@ -181,6 +287,52 @@ fn poll_until<T>(
             "Timeout ({timeout:?}) waiting for: {description}"
         );
         thread::sleep(interval);
+    }
+}
+
+/// Wait until the agent is *stably* idle: the most recent status event is
+/// `listening` and no newer status event has appeared for `settle`.
+///
+/// A single `listening` event is terminal for claude/codex/gemini/antigravity,
+/// but not for cursor: its `stop` hook delivers via `followup_message`, which
+/// cursor auto-resubmits as the next user turn, so a delivery is followed by
+/// another active→listening cycle. Phase 3's premise — "while the PTY prompt
+/// holds uncommitted text, the queued message is not delivered" — only holds if
+/// the agent has *no turn in flight*. With a turn still running, the hook
+/// channel (postToolUse / stop), which by design bypasses the PTY prompt-empty
+/// gate, can legitimately deliver mid-turn and the test would misread that
+/// hook-channel delivery as a PTY gate failure. Draining to stable idle first
+/// keeps Phase 3 honest: it isolates the PTY-inject path it actually asserts on.
+fn wait_for_stable_idle(base_name: &str, settle: Duration, timeout: Duration, log: &TestLog) {
+    let start = Instant::now();
+    let mut last_status_id = -1i64;
+    let mut stable_since = Instant::now();
+    loop {
+        let latest_status = get_events(base_name, 30, false)
+            .into_iter()
+            .filter(|ev| ev["type"].as_str() == Some("status"))
+            .filter_map(|ev| ev["id"].as_i64().map(|id| (id, ev)))
+            .max_by_key(|(id, _)| *id);
+        if let Some((id, ev)) = latest_status {
+            if id != last_status_id {
+                last_status_id = id;
+                stable_since = Instant::now();
+            }
+            let listening = ev["data"]["status"].as_str() == Some("listening");
+            if listening && stable_since.elapsed() >= settle {
+                logln!(
+                    log,
+                    "  OK: Agent stably idle for {:?} (last status id={id})",
+                    settle
+                );
+                return;
+            }
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "Timeout ({timeout:?}) waiting for stable idle (base={base_name}, last status id={last_status_id})"
+        );
+        thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -300,8 +452,21 @@ fn validate_screen_schema(screen: &serde_json::Value) {
     );
 }
 
+/// Returns true if this tool has an ASCII ready-pattern footer to match.
+/// Cursor signals readiness via prompt-empty instead (spec ready_pattern is
+/// empty), so there is no pattern to assert — callers check `ready`/`prompt_empty`
+/// directly rather than running a pattern match that would pass on `contains("")`.
+fn has_ready_pattern(tool: &str) -> bool {
+    !ready_pattern(tool).is_empty()
+}
+
 fn validate_ready_pattern(screen: &serde_json::Value, tool: &str) {
     let pattern = ready_pattern(tool);
+    assert!(
+        !pattern.is_empty(),
+        "validate_ready_pattern called for {tool}, which has no ready pattern; \
+         guard the call with has_ready_pattern() so the check isn't vacuous"
+    );
     let screen_text: String = screen["lines"]
         .as_array()
         .unwrap()
@@ -332,13 +497,13 @@ fn validate_prompt_consistency(screen: &serde_json::Value) {
 }
 
 fn validate_tool_ui_elements(screen: &serde_json::Value, tool: &str) {
-    let screen_text: String = screen["lines"]
+    let lines = screen["lines"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|l| l.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let screen_text = lines.join("\n");
 
     let marker = prompt_marker(tool);
     assert!(
@@ -354,6 +519,84 @@ fn validate_tool_ui_elements(screen: &serde_json::Value, tool: &str) {
         );
         eprintln!("  OK: Frame marker '{frame}' present");
     }
+
+    if tool == "gemini" {
+        validate_gemini_prompt_frame(&lines);
+        eprintln!("  OK: Gemini prompt frame present around prompt line");
+    }
+}
+
+fn screen_has_text(screen: &serde_json::Value, needle: &str) -> bool {
+    screen["lines"]
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|line| line.contains(needle))
+        })
+        .unwrap_or(false)
+}
+
+fn initial_screen_ready(screen: &serde_json::Value, tool: &str) -> bool {
+    if screen["ready"].as_bool() != Some(true) {
+        return false;
+    }
+    if tool == "gemini" && screen_has_text(screen, "Executing Hook:") {
+        return false;
+    }
+    true
+}
+
+fn plugin_initial_screen_ready(screen: &serde_json::Value, tool: &str) -> bool {
+    if tool != "pi" && tool != "omp" {
+        return initial_screen_ready(screen, tool);
+    }
+
+    // Pi/OMP are plugin-backed: the launch-ready event (Pi's `/ commands` footer
+    // for Pi, the extension bind for OMP) is the readiness contract, not scraped
+    // chrome. Here we only need a rendered screen to continue with bootstrap/
+    // plugin delivery assertions.
+    // (Original note on Pi's viewport scroll retained below.)
+    // Pi's `/ commands` footer is visible at launch long enough for the PTY
+    // wrapper to emit life.ready, but in the default tmux 24-line viewport the
+    // startup help and tmux warning can push that footer out of the retained
+    // screen before this test polls `term --json`. For plugin-backed Pi the
+    // launch-ready event is the readiness contract; here we only need a
+    // rendered screen to continue with bootstrap/plugin delivery assertions.
+    screen["lines"].as_array().is_some_and(|lines| {
+        lines
+            .iter()
+            .any(|line| line.as_str().is_some_and(|s| !s.trim().is_empty()))
+    })
+}
+
+fn is_gemini_border_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let count = trimmed.chars().count();
+    count >= 10
+        && trimmed
+            .chars()
+            .all(|c| matches!(c, '─' | '▀' | '▄' | '╭' | '╮' | '╰' | '╯'))
+        && trimmed.chars().any(|c| matches!(c, '─' | '▀' | '▄'))
+}
+
+fn validate_gemini_prompt_frame(lines: &[&str]) {
+    let Some(prompt_idx) = lines.iter().rposition(|line| {
+        line.find(" > ")
+            .or_else(|| line.find(" * "))
+            .is_some_and(|pos| pos <= 3)
+    }) else {
+        panic!("Gemini prompt line not found — tool TUI may have changed (breaks screen.rs)");
+    };
+
+    let has_top = prompt_idx > 0 && is_gemini_border_line(lines[prompt_idx - 1]);
+    let has_bottom = prompt_idx + 1 < lines.len() && is_gemini_border_line(lines[prompt_idx + 1]);
+
+    assert!(
+        has_top && has_bottom,
+        "Gemini prompt line was not framed by adjacent border rows — tool TUI may have changed (breaks screen.rs)"
+    );
 }
 
 fn validate_delivery_events(instance: &str, baseline_id: i64, sender: &str, log: &TestLog) {
@@ -441,15 +684,11 @@ fn validate_gate_block(instance: &str, tool: &str, after_id: i64, log: &TestLog)
 fn run_pty_test(tool: &str) {
     let _serial = serial_lock();
 
-    // SAFETY: Integration tests run serially (serial_lock above).
-    unsafe {
-        std::env::set_var("HCOM_TERMINAL", "tmux");
-        std::env::set_var("HCOM_TAG", "ptytest");
-    }
+    let terminal = configure_test_terminal_env();
     let log = TestLog::new(tool);
 
     logln!(log, "{}", "=".repeat(60));
-    logln!(log, "PTY Delivery Test: {tool}");
+    logln!(log, "PTY Delivery Test: {tool} via {terminal}");
     logln!(log, "{}", "=".repeat(60));
 
     // Record last event ID before launch
@@ -468,52 +707,61 @@ fn run_pty_test(tool: &str) {
     };
 
     // ── Phase 1: Launch ──────────────────────────────────────────
-    logln!(log, "\n[Phase 1] Launching {tool} in tmux...");
+    logln!(log, "\n[Phase 1] Launching {tool} in {terminal}...");
     let t0 = Instant::now();
 
     let model_flag = match tool {
         "claude" => " --model haiku",
         "codex" => " --model gpt-5.4-mini",
         "gemini" => " --model gemini-2.5-flash-lite",
+        // `auto` is the only model guaranteed to launch across cursor plan tiers
+        // (named models error on free plans).
+        "cursor" => " --model auto",
+        // copilot: no flag — its default model is probably cheap.
         _ => "",
     };
     let out = hcom(&format!("--go 1 {tool}{model_flag}"));
-    assert!(
-        out.status.success(),
-        "Launch failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let launched_base_name = assert_launch_process_started(&out);
+    if out.status.code() == Some(2) {
+        logln!(
+            log,
+            "  INFO: launch command still starting after inline wait; continuing with screen poll"
+        );
+    }
 
-    logln!(log, "  Waiting for ready event...");
+    logln!(log, "  Waiting for launched instance...");
 
     let mut guard = InstanceGuard { base_name: None };
 
-    let base_name: String = poll_until(
-        || {
-            let out = hcom("events --action ready --last 5");
-            if !out.status.success() {
-                return None;
-            }
-            for line in String::from_utf8_lossy(&out.stdout).lines().rev() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
+    let base_name: String = if let Some(base_name) = launched_base_name {
+        base_name
+    } else {
+        poll_until(
+            || {
+                let out = hcom("events --action ready --last 5");
+                if !out.status.success() {
+                    return None;
                 }
-                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
-                    if ev["type"].as_str() == Some("life")
+                for line in String::from_utf8_lossy(&out.stdout).lines().rev() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line)
+                        && ev["type"].as_str() == Some("life")
                         && ev["data"]["action"].as_str() == Some("ready")
                         && ev["id"].as_i64().unwrap_or(0) > pre_launch_id
                     {
                         return ev["instance"].as_str().map(|s| s.to_string());
                     }
                 }
-            }
-            None
-        },
-        "ready event from launched instance",
-        Duration::from_secs(60),
-        Duration::from_secs(2),
-    );
+                None
+            },
+            "ready event from launched instance",
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        )
+    };
 
     guard.base_name = Some(base_name.clone());
     let tag = std::env::var("HCOM_TAG").unwrap_or_default();
@@ -533,7 +781,7 @@ fn run_pty_test(tool: &str) {
     let screen: serde_json::Value = poll_until(
         || {
             let s = get_screen(&base_name)?;
-            if s["ready"].as_bool() == Some(true) {
+            if plugin_initial_screen_ready(&s, tool) {
                 Some(s)
             } else {
                 None
@@ -548,12 +796,19 @@ fn run_pty_test(tool: &str) {
     logln!(log, "\n[Validate] Initial screen state for {tool}...");
     validate_screen_schema(&screen);
     logln!(log, "  OK: Schema valid");
-    validate_ready_pattern(&screen, tool);
-    logln!(
-        log,
-        "  OK: Ready pattern '{}' consistent",
-        ready_pattern(tool)
-    );
+    if has_ready_pattern(tool) {
+        validate_ready_pattern(&screen, tool);
+        logln!(
+            log,
+            "  OK: Ready pattern '{}' consistent",
+            ready_pattern(tool)
+        );
+    } else {
+        logln!(
+            log,
+            "  SKIP: {tool} has no ready pattern; readiness asserted via ready/prompt_empty"
+        );
+    }
     assert_eq!(screen["ready"].as_bool(), Some(true));
     validate_prompt_consistency(&screen);
     logln!(
@@ -573,11 +828,17 @@ fn run_pty_test(tool: &str) {
     logln!(log, "  OK: Baseline event ID: {baseline_event}");
 
     let t1 = Instant::now();
-    // Phrasing matters: gemini-2.5-flash-lite interprets human-style directives
-    // ("do not reply") as needing user confirmation and calls ask_user → approval
-    // gate, blocking the test forever. `[hcom heartbeat] ignore` reads as an
-    // automated signal and reliably returns to listening in 2-3s with no tool calls.
-    send_msg(&format!("@{instance_name} [hcom heartbeat] ignore"));
+    // Phrasing matters on two axes:
+    // 1. Gemini-2.5-flash-lite interprets human-style directives ("do not reply")
+    //    as needing user confirmation and calls ask_user → approval gate,
+    //    blocking forever. Keep the `[hcom heartbeat]` automated-signal framing.
+    // 2. Codex and OpenCode would otherwise run `hcom send … --intent ack` and
+    //    burn tokens (the ack is rejected by hcom since inform can't be acked,
+    //    but the tool call still fires). Explicit "no tools, no hcom send" cuts
+    //    that out without tripping (1).
+    send_msg(&format!(
+        "@{instance_name} [hcom heartbeat] automated test ping. acknowledge inline with \"ok\" only. no tools. no hcom send."
+    ));
     logln!(log, "  OK: Message sent");
 
     // Wait for delivery event
@@ -593,7 +854,7 @@ fn run_pty_test(tool: &str) {
             })
         },
         "delivery event",
-        Duration::from_secs(20),
+        clean_prompt_delivery_timeout(tool),
         Duration::from_secs(1),
     );
     let t_delivery = t1.elapsed();
@@ -641,6 +902,17 @@ fn run_pty_test(tool: &str) {
         Duration::from_secs(60),
         Duration::from_secs(1),
     );
+
+    // cursor only: drain the followup_message auto-continue loop to true
+    // quiescence so Phase 3 doesn't race a residual turn (see wait_for_stable_idle).
+    if tool == "cursor" {
+        wait_for_stable_idle(
+            &base_name,
+            Duration::from_secs(8),
+            Duration::from_secs(120),
+            &log,
+        );
+    }
 
     validate_delivery_events(&base_name, baseline_event, SENDER, &log);
 
@@ -708,7 +980,9 @@ fn run_pty_test(tool: &str) {
         "input_text={input_text:?}"
     );
     validate_prompt_consistency(&screen);
-    validate_ready_pattern(&screen, tool);
+    if has_ready_pattern(tool) {
+        validate_ready_pattern(&screen, tool);
+    }
     logln!(log, "  OK: Input text detected: {input_text:?}");
     log.log_screen(
         &screen,
@@ -718,7 +992,7 @@ fn run_pty_test(tool: &str) {
     let baseline_event2 = get_last_event_id(&base_name);
 
     send_msg(&format!(
-        "@{instance_name} [hcom heartbeat-2 should-block] ignore"
+        "@{instance_name} [hcom heartbeat-2 should-block] automated test ping. acknowledge inline with \"ok\" only. no tools. no hcom send."
     ));
     logln!(log, "  OK: Message sent (should be blocked)");
 
@@ -839,21 +1113,23 @@ fn run_pty_test(tool: &str) {
     logln!(log, "{}", "=".repeat(60));
 }
 
-// ── OpenCode test flow ─────────────────────────────────────────────────
+// ── Plugin-backed test flow ────────────────────────────────────────────
 
-fn run_pty_test_opencode() {
+/// Shared flow for plugin-backed tools (opencode, kilo, pi): the agent boots in
+/// a PTY, the first message is delivered via bootstrap injection, and subsequent
+/// messages are delivered by the tool plugin. OpenCode/Kilo share
+/// `opencode-read`; Pi uses its own `pi-read` hook.
+fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
     let _serial = serial_lock();
 
-    let tool = "opencode";
-    // SAFETY: Integration tests run serially (serial_lock above).
-    unsafe {
-        std::env::set_var("HCOM_TERMINAL", "tmux");
-        std::env::set_var("HCOM_TAG", "ptytest");
-    }
+    let terminal = configure_test_terminal_env();
     let log = TestLog::new(tool);
 
     logln!(log, "{}", "=".repeat(60));
-    logln!(log, "PTY Delivery Test: {tool} (bootstrap injection)");
+    logln!(
+        log,
+        "PTY Delivery Test: {tool} via {terminal} (bootstrap injection)"
+    );
     logln!(log, "{}", "=".repeat(60));
 
     let pre_launch_id = {
@@ -871,45 +1147,50 @@ fn run_pty_test_opencode() {
     };
 
     // ── Phase 1: Launch ──────────────────────────────────────────
-    logln!(log, "\n[Phase 1] Launching {tool} in tmux...");
+    logln!(log, "\n[Phase 1] Launching {tool} in {terminal}...");
     let t0 = Instant::now();
 
     let out = hcom(&format!("--go 1 {tool}"));
-    assert!(
-        out.status.success(),
-        "Launch failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let launched_base_name = assert_launch_process_started(&out);
+    if out.status.code() == Some(2) {
+        logln!(
+            log,
+            "  INFO: launch command still starting after inline wait; continuing with screen poll"
+        );
+    }
 
-    logln!(log, "  Waiting for ready event...");
+    logln!(log, "  Waiting for launched instance...");
     let mut guard = InstanceGuard { base_name: None };
 
-    let base_name: String = poll_until(
-        || {
-            let out = hcom("events --action ready --last 5");
-            if !out.status.success() {
-                return None;
-            }
-            for line in String::from_utf8_lossy(&out.stdout).lines().rev() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
+    let base_name: String = if let Some(base_name) = launched_base_name {
+        base_name
+    } else {
+        poll_until(
+            || {
+                let out = hcom("events --action ready --last 5");
+                if !out.status.success() {
+                    return None;
                 }
-                if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line) {
-                    if ev["type"].as_str() == Some("life")
+                for line in String::from_utf8_lossy(&out.stdout).lines().rev() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(ev) = serde_json::from_str::<serde_json::Value>(line)
+                        && ev["type"].as_str() == Some("life")
                         && ev["data"]["action"].as_str() == Some("ready")
                         && ev["id"].as_i64().unwrap_or(0) > pre_launch_id
                     {
                         return ev["instance"].as_str().map(|s| s.to_string());
                     }
                 }
-            }
-            None
-        },
-        "ready event from launched instance",
-        Duration::from_secs(60),
-        Duration::from_secs(2),
-    );
+                None
+            },
+            "ready event from launched instance",
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+        )
+    };
 
     guard.base_name = Some(base_name.clone());
     let tag = std::env::var("HCOM_TAG").unwrap_or_default();
@@ -929,7 +1210,7 @@ fn run_pty_test_opencode() {
     let screen: serde_json::Value = poll_until(
         || {
             let s = get_screen(&base_name)?;
-            if s["ready"].as_bool() == Some(true) {
+            if plugin_initial_screen_ready(&s, tool) {
                 Some(s)
             } else {
                 None
@@ -941,23 +1222,49 @@ fn run_pty_test_opencode() {
     );
 
     logln!(log, "\n[Validate] Initial screen state for {tool}...");
-    validate_screen_schema(&screen);
-    logln!(log, "  OK: Schema valid");
-    assert_eq!(
-        screen["ready"].as_bool(),
-        Some(true),
-        "OpenCode should be ready after poll"
-    );
-    logln!(log, "  OK: ready=true");
-    validate_ready_pattern(&screen, tool);
-    logln!(
-        log,
-        "  OK: Ready pattern '{}' consistent",
-        ready_pattern(tool)
-    );
+    if matches!(tool, "pi" | "omp") {
+        logln!(
+            log,
+            "  OK: {tool} screen rendered after life.ready (term ready={})",
+            screen["ready"]
+        );
+        if screen["ready"].as_bool() == Some(true) {
+            if has_ready_pattern(tool) {
+                validate_ready_pattern(&screen, tool);
+                logln!(
+                    log,
+                    "  OK: Ready pattern '{}' consistent",
+                    ready_pattern(tool)
+                );
+            } else {
+                logln!(
+                    log,
+                    "  SKIP: {tool} has no ready pattern; readiness asserted via life.ready/plugin bind"
+                );
+            }
+        } else {
+            logln!(
+                log,
+                "  SKIP: {tool} ready footer scrolled out of tmux viewport after life.ready"
+            );
+        }
+    } else {
+        assert_eq!(
+            screen["ready"].as_bool(),
+            Some(true),
+            "{tool} should be ready after poll"
+        );
+        logln!(log, "  OK: ready=true");
+        validate_ready_pattern(&screen, tool);
+        logln!(
+            log,
+            "  OK: Ready pattern '{}' consistent",
+            ready_pattern(tool)
+        );
+    }
     assert!(
         screen["input_text"].is_null(),
-        "OpenCode input_text should be null, got {:?}",
+        "{tool} input_text should be null, got {:?}",
         screen["input_text"]
     );
     logln!(log, "  OK: input_text=null (no input detection)");
@@ -1017,15 +1324,33 @@ fn run_pty_test_opencode() {
         active_id, listening_event["id"]
     ));
 
-    // Check hcom.log for bootstrap_inject (non-fatal)
+    // Confirm the bootstrap path in hcom.log (non-fatal). The two plugin families
+    // bootstrap differently, so we look for different events:
+    //   - opencode/kilo: session is created by the delivery thread's PTY inject,
+    //     logged as `delivery.bootstrap_inject`.
+    //   - pi/omp: the plugin binds a session at launch, so the delivery thread
+    //     takes `delivery.opencode_skip_inject` and the plugin injects the first
+    //     message itself, logged as `plugin.hidden_bootstrap`. The PTY inject event
+    //     never fires for this family — checking for it would always miss.
+    let (bootstrap_event, bootstrap_desc) = if matches!(tool, "pi" | "omp") {
+        ("plugin.hidden_bootstrap", "plugin hidden bootstrap")
+    } else {
+        ("delivery.bootstrap_inject", "PTY bootstrap inject")
+    };
     let log_path = dirs::home_dir().unwrap().join(".hcom/.tmp/logs/hcom.log");
     if let Ok(content) = fs::read_to_string(&log_path) {
-        if content.contains("delivery.bootstrap_inject") && content.contains(&base_name) {
-            logln!(log, "  OK: Bootstrap inject confirmed in hcom.log");
+        let confirmed = content
+            .lines()
+            .any(|line| line.contains(bootstrap_event) && line.contains(&base_name));
+        if confirmed {
+            logln!(
+                log,
+                "  OK: {bootstrap_desc} confirmed in hcom.log ({bootstrap_event})"
+            );
         } else {
             logln!(
                 log,
-                "  WARN: delivery.bootstrap_inject not found in hcom.log (may have rotated)"
+                "  WARN: {bootstrap_event} not found in hcom.log for {base_name} (log may have rotated)"
             );
         }
     }
@@ -1052,7 +1377,7 @@ fn run_pty_test_opencode() {
     //
     // Two co-conditions for true quiescence:
     //   1. Latest event is status=listening (agent is idle right now).
-    //   2. `hcom opencode-read --check` is "false" (cursor caught up; plugin
+    //   2. `hcom <read-hook> --check` is "false" (cursor caught up; plugin
     //      won't re-trigger another piggyback). Listening alone is correlative
     //      — if pendingAckId or deliveryInFlight ever got stuck, listening
     //      could appear stable while the cursor was still behind.
@@ -1063,7 +1388,7 @@ fn run_pty_test_opencode() {
             if last["data"]["status"].as_str() != Some("listening") {
                 return None;
             }
-            let out = hcom(&format!("opencode-read --name {base_name} --check"));
+            let out = hcom(&format!("{read_hook} --name {base_name} --check"));
             if !out.status.success() {
                 return None;
             }
@@ -1162,5 +1487,40 @@ fn test_pty_codex() {
 #[test]
 #[ignore]
 fn test_pty_opencode() {
-    run_pty_test_opencode();
+    run_pty_test_plugin_family("opencode", "opencode-read");
+}
+
+#[test]
+#[ignore]
+fn test_pty_kilo() {
+    run_pty_test_plugin_family("kilo", "opencode-read");
+}
+
+#[test]
+#[ignore]
+fn test_pty_pi() {
+    run_pty_test_plugin_family("pi", "pi-read");
+}
+#[test]
+#[ignore]
+fn test_pty_omp() {
+    run_pty_test_plugin_family("omp", "omp-read");
+}
+
+#[test]
+#[ignore]
+fn test_pty_antigravity() {
+    run_pty_test("antigravity");
+}
+
+#[test]
+#[ignore]
+fn test_pty_cursor() {
+    run_pty_test("cursor");
+}
+
+#[test]
+#[ignore]
+fn test_pty_copilot() {
+    run_pty_test("copilot");
 }

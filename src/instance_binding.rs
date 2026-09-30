@@ -5,9 +5,19 @@
 //! initialization for newly launched or recovered sessions.
 
 use crate::db::{HcomDb, InstanceRow};
+use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
-use crate::shared::ST_INACTIVE;
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
+use crate::shared::{ST_INACTIVE, ST_LISTENING};
+
+/// Result of binding a session when the caller requires every existing owner
+/// to belong to one tool family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCheckedBind {
+    Bound(String),
+    Unbound,
+    Rejected,
+}
 
 /// Persist terminal launch metadata without clobbering other launch_context fields.
 ///
@@ -78,33 +88,31 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let new_ctx = capture_context();
 
     // Preserve fields from prior context that can't be recaptured in hook env
-    let preserve_keys = ["pane_id", "terminal_id", "kitty_listen_on", "process_id"];
+    let preserve_keys = [
+        "pane_id",
+        "terminal_id",
+        "kitty_listen_on",
+        "process_id",
+        "terminal_preset_effective",
+    ];
     let mut ctx = new_ctx;
 
     let missing: Vec<&str> = preserve_keys
         .iter()
-        .filter(|k| {
-            ctx.get(**k)
-                .and_then(|v| v.as_str())
-                .is_none_or(|s| s.is_empty())
-        })
+        .filter(|k| launch_context_value_missing(ctx.get(**k)))
         .copied()
         .collect();
 
-    if !missing.is_empty() {
-        if let Ok(Some(pos)) = db.get_instance_full(instance_name) {
-            if let Some(old_json) = &pos.launch_context {
-                if let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json) {
-                    for k in &missing {
-                        if let Some(val) = old_ctx.get(*k) {
-                            if let Some(s) = val.as_str() {
-                                if !s.is_empty() {
-                                    ctx.insert(k.to_string(), val.clone());
-                                }
-                            }
-                        }
-                    }
-                }
+    if !missing.is_empty()
+        && let Ok(Some(pos)) = db.get_instance_full(instance_name)
+        && let Some(old_json) = &pos.launch_context
+        && let Ok(old_ctx) = serde_json::from_str::<serde_json::Value>(old_json)
+    {
+        for k in &missing {
+            if let Some(val) = old_ctx.get(*k)
+                && !launch_context_value_missing(Some(val))
+            {
+                ctx.insert(k.to_string(), val.clone());
             }
         }
     }
@@ -113,6 +121,19 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
     let mut updates = serde_json::Map::new();
     updates.insert("launch_context".into(), serde_json::json!(json));
     update_instance_position(db, instance_name, &updates);
+}
+
+/// "Missing" for the preserve-from-prior-context check. Treats absent, JSON
+/// null, and empty strings as missing. Non-string non-null values (numbers,
+/// objects, arrays) are considered present even though every preserved field
+/// is currently a string — this is intentionally conservative so a future
+/// non-string preserved field doesn't silently get clobbered by re-capture.
+fn launch_context_value_missing(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(_) => false,
+    }
 }
 
 /// Capture launch context snapshot.
@@ -151,6 +172,8 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
         "KITTY_LISTEN_ON",
         "ALACRITTY_WINDOW_ID",
         "WEZTERM_PANE",
+        "PTYXIS_PROFILE",
+        "PTYXIS_VERSION",
         "GNOME_TERMINAL_SCREEN",
         "KONSOLE_DBUS_WINDOW",
         "TERMINATOR_UUID",
@@ -176,51 +199,57 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
     ];
     let mut env_map = serde_json::Map::new();
     for key in &env_keys {
-        if let Ok(val) = std::env::var(key) {
-            if !val.is_empty() {
-                env_map.insert((*key).to_string(), serde_json::json!(val));
-            }
+        if let Ok(val) = std::env::var(key)
+            && !val.is_empty()
+        {
+            env_map.insert((*key).to_string(), serde_json::json!(val));
         }
     }
     ctx.insert("env".into(), serde_json::Value::Object(env_map));
 
-    // Pane IDs are late-bound. The launcher already persisted the effective preset.
-    if let Ok(preset_name) = std::env::var("HCOM_LAUNCHED_PRESET") {
-        if !preset_name.is_empty() {
-            if let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name) {
-                if let Ok(pane_id) = std::env::var(pane_id_env) {
-                    if !pane_id.is_empty() {
-                        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
-                    }
-                }
-            }
+    // The launcher already resolved the effective preset; record it so
+    // child agents can inherit it (see commands::launch). Pane IDs are
+    // late-bound from the env vars the preset declares.
+    if let Ok(preset_name) = std::env::var("HCOM_LAUNCHED_PRESET")
+        && !preset_name.is_empty()
+    {
+        ctx.insert(
+            "terminal_preset_effective".into(),
+            serde_json::json!(preset_name),
+        );
+
+        if let Some(pane_id_env) = crate::config::get_merged_preset_pane_id_env(&preset_name)
+            && let Ok(pane_id) = std::env::var(pane_id_env)
+            && !pane_id.is_empty()
+        {
+            ctx.insert("pane_id".into(), serde_json::json!(pane_id));
         }
     }
 
     // Process ID for kitty close-by-env matching
-    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID") {
-        if !pid.is_empty() {
-            ctx.insert("process_id".into(), serde_json::json!(pid));
+    if let Ok(pid) = std::env::var("HCOM_PROCESS_ID")
+        && !pid.is_empty()
+    {
+        ctx.insert("process_id".into(), serde_json::json!(pid));
 
-            // Terminal ID from parent's stdout capture
-            let id_file = crate::paths::hcom_dir()
-                .join(".tmp")
-                .join("terminal_ids")
-                .join(&pid);
-            if id_file.exists() {
-                if let Ok(content) = std::fs::read_to_string(&id_file) {
-                    let terminal_id = content.trim().to_string();
-                    if !terminal_id.is_empty() {
-                        if std::env::var("HCOM_LAUNCHED_PRESET").as_deref() == Ok("zellij") {
-                            if let Some(pane_id) = zellij_pane_id_from_terminal_id(&terminal_id) {
-                                ctx.insert("pane_id".into(), serde_json::json!(pane_id));
-                            }
-                        }
-                        ctx.insert("terminal_id".into(), serde_json::json!(terminal_id));
+        // Terminal ID from parent's stdout capture
+        let id_file = crate::paths::hcom_dir()
+            .join(".tmp")
+            .join("terminal_ids")
+            .join(&pid);
+        if id_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&id_file) {
+                let terminal_id = content.trim().to_string();
+                if !terminal_id.is_empty() {
+                    if std::env::var("HCOM_LAUNCHED_PRESET").as_deref() == Ok("zellij")
+                        && let Some(pane_id) = zellij_pane_id_from_terminal_id(&terminal_id)
+                    {
+                        ctx.insert("pane_id".into(), serde_json::json!(pane_id));
                     }
+                    ctx.insert("terminal_id".into(), serde_json::json!(terminal_id));
                 }
-                let _ = std::fs::remove_file(&id_file);
             }
+            let _ = std::fs::remove_file(&id_file);
         }
     }
 
@@ -232,6 +261,180 @@ fn zellij_pane_id_from_terminal_id(terminal_id: &str) -> Option<String> {
         .strip_prefix("terminal_")
         .filter(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
         .map(|suffix| suffix.to_string())
+}
+
+fn is_true_launch_placeholder(data: Option<&InstanceRow>) -> bool {
+    let Some(data) = data else {
+        return false;
+    };
+    if data.session_id.is_some() {
+        return false;
+    }
+
+    if crate::instances::is_launching_placeholder(data) {
+        return true;
+    }
+
+    // OpenCode and other PTY-backed tools can be marked ready/listening by the PTY
+    // watcher before their later session-start hook binds a session id. Those rows
+    // are still launch placeholders, but no longer match the stricter "pending/new"
+    // display predicate. Keep this narrow: active no-session rows are real work, not
+    // launch placeholders.
+    data.status == ST_LISTENING
+        && matches!(
+            data.status_context.as_str(),
+            "start" | "ready_observed" | "launch_blocked_cleared"
+        )
+}
+
+fn migrate_placeholder_notify(db: &HcomDb, placeholder_name: &str, canonical_name: &str) -> bool {
+    match db.migrate_notify_endpoints(placeholder_name, canonical_name) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::log::log_error("binding", "placeholder.migrate_endpoints", &format!("{e}"));
+            false
+        }
+    }
+}
+
+/// Delete a true launch placeholder row. Notify endpoints remain on the canonical instance.
+fn delete_true_placeholder_instance(db: &HcomDb, placeholder_name: &str) {
+    match db.delete_instance(placeholder_name) {
+        Ok(true) => {}
+        Ok(false) => {
+            crate::log::log_info(
+                "binding",
+                "placeholder.delete_missing",
+                &format!("placeholder={placeholder_name}"),
+            );
+        }
+        Err(e) => {
+            crate::log::log_error("binding", "placeholder.delete", &format!("{e}"));
+        }
+    }
+}
+
+/// Carry runtime state the PTY wrapper wrote onto the placeholder row over to the
+/// canonical instance before the placeholder is deleted. The OS `pid` and terminal
+/// `launch_context` (pane_id) are written once at spawn under the launch name
+/// (`src/pty/mod.rs`); without migrating them, `hcom kill <canonical>` finds no pid
+/// and can't close the terminal pane.
+fn migrate_placeholder_runtime_state(
+    db: &HcomDb,
+    canonical_name: &str,
+    placeholder_data: Option<&InstanceRow>,
+) {
+    let Some(ph) = placeholder_data else {
+        return;
+    };
+    if let Some(pid) = ph.pid
+        && let Ok(pid_u32) = u32::try_from(pid)
+        && let Err(e) = db.update_instance_pid(canonical_name, pid_u32)
+    {
+        crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
+    }
+    if let Some(ref ctx) = ph.launch_context
+        && let Err(e) = db.store_launch_context(canonical_name, ctx)
+    {
+        crate::log::log_error(
+            "binding",
+            "placeholder.migrate_launch_context",
+            &format!("{e}"),
+        );
+    }
+}
+
+fn delete_true_placeholder_if_migrated(
+    db: &HcomDb,
+    placeholder_name: &str,
+    canonical_name: &str,
+    placeholder_data: Option<&InstanceRow>,
+) {
+    if is_true_launch_placeholder(placeholder_data) {
+        // Move pid/launch_context to the canonical row before dropping the placeholder
+        // so the restored agent stays killable and its pane closeable.
+        migrate_placeholder_runtime_state(db, canonical_name, placeholder_data);
+        delete_true_placeholder_instance(db, placeholder_name);
+    }
+}
+
+/// Path 2: after restore_stopped bind, merge notify ports and drop the launch placeholder.
+fn retire_true_placeholder_after_canonical_bind(
+    db: &HcomDb,
+    placeholder_name: Option<&String>,
+    canonical_name: &str,
+    placeholder_data: Option<&InstanceRow>,
+) {
+    let Some(ph_name) = placeholder_name else {
+        return;
+    };
+    if ph_name == canonical_name {
+        return;
+    }
+
+    if !migrate_placeholder_notify(db, ph_name, canonical_name) {
+        return;
+    }
+
+    delete_true_placeholder_if_migrated(db, ph_name, canonical_name, placeholder_data);
+}
+
+/// Retire a live identity whose process switched to another session's identity.
+/// Unlike a launch placeholder it is a real agent row, so it is soft-stopped
+/// (kept, inactive) rather than deleted. The stopped event records its session so
+/// resuming that session later restores this identity instead of the current one.
+/// The process's pid and terminal context move to the new identity so
+/// `hcom kill <new>` still works and `hcom kill <old>` can't reach a process it
+/// no longer owns.
+fn retire_switched_identity(
+    db: &HcomDb,
+    name: &str,
+    new_name: &str,
+    old_data: Option<&InstanceRow>,
+) {
+    migrate_placeholder_runtime_state(db, new_name, old_data);
+    let mut clear_pid = serde_json::Map::new();
+    clear_pid.insert("pid".into(), serde_json::Value::Null);
+    update_instance_position(db, name, &clear_pid);
+    crate::hooks::common::soft_finalize_session(db, name, "session_switch", None, false);
+    if let Err(e) = db.delete_session_bindings_for_instance(name) {
+        crate::log::log_error(
+            "binding",
+            "session_switch.delete_session_bindings",
+            &format!("{e}"),
+        );
+    }
+}
+
+/// Recreate a missing instance row from an active placeholder (resume after stop/kill).
+fn recreate_instance_from_placeholder(
+    db: &HcomDb,
+    target_name: &str,
+    session_id: &str,
+    ph: Option<&InstanceRow>,
+) {
+    if db.get_instance_full(target_name).ok().flatten().is_some() {
+        return;
+    }
+    let Some(ph) = ph else {
+        return;
+    };
+    initialize_instance_in_position_file(
+        db,
+        target_name,
+        Some(session_id),
+        ph.parent_session_id.as_deref(),
+        ph.parent_name.as_deref(),
+        ph.agent_id.as_deref(),
+        (!ph.transcript_path.is_empty()).then_some(ph.transcript_path.as_str()),
+        Some(ph.tool.as_str()),
+        ph.background != 0,
+        ph.tag.as_deref(),
+        None,
+        None,
+        ph.hints.as_deref(),
+        Some(ph.directory.as_str()),
+    );
 }
 
 /// Bind session_id to canonical instance for process_id.
@@ -292,110 +495,149 @@ pub fn bind_session_to_process(
             ),
         );
 
+        recreate_instance_from_placeholder(
+            db,
+            canonical_name,
+            session_id,
+            placeholder_data.as_ref(),
+        );
+
         // Reset last_stop on resume
         let now = now_epoch_i64();
         let mut resume_updates = serde_json::Map::new();
         resume_updates.insert("last_stop".into(), serde_json::json!(now));
 
-        if let Some(ref ph_name) = placeholder_name {
-            if ph_name != canonical_name {
-                // Always migrate notify_endpoints
-                if let Err(e) = db.migrate_notify_endpoints(ph_name, canonical_name) {
-                    crate::log::log_error(
-                        "binding",
-                        "bind_canonical.migrate_endpoints",
-                        &format!("{e}"),
-                    );
+        if let Some(ref ph_name) = placeholder_name
+            && ph_name != canonical_name
+        {
+            let migrated = migrate_placeholder_notify(db, ph_name, canonical_name);
+
+            if is_true_launch_placeholder(placeholder_data.as_ref()) {
+                // Path 1a: True placeholder merge
+                if let Some(ref ph_data) = placeholder_data {
+                    if let Some(ref tag) = ph_data.tag {
+                        resume_updates.insert("tag".into(), serde_json::json!(tag));
+                    }
+                    if ph_data.background != 0 {
+                        resume_updates
+                            .insert("background".into(), serde_json::json!(ph_data.background));
+                    }
+                    if let Some(ref args) = ph_data.launch_args {
+                        resume_updates.insert("launch_args".into(), serde_json::json!(args));
+                    }
+                    // Reset status_context for ready event
+                    if std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1") {
+                        resume_updates.insert("status_context".into(), serde_json::json!("new"));
+                    }
                 }
 
-                let is_true_placeholder = placeholder_data
-                    .as_ref()
-                    .map(|d| d.session_id.is_none())
-                    .unwrap_or(false);
-
-                if is_true_placeholder {
-                    // Path 1a: True placeholder merge
-                    if let Some(ref ph_data) = placeholder_data {
-                        if let Some(ref tag) = ph_data.tag {
-                            resume_updates.insert("tag".into(), serde_json::json!(tag));
-                        }
-                        if ph_data.background != 0 {
-                            resume_updates
-                                .insert("background".into(), serde_json::json!(ph_data.background));
-                        }
-                        if let Some(ref args) = ph_data.launch_args {
-                            resume_updates.insert("launch_args".into(), serde_json::json!(args));
-                        }
-                        // Reset status_context for ready event
-                        if std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1") {
-                            resume_updates
-                                .insert("status_context".into(), serde_json::json!("new"));
-                        }
-                    }
-
-                    // Delete true placeholder (temporary identity)
-                    match db.delete_instance(ph_name) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
-                                crate::log::log_error(
-                                    "binding",
-                                    "bind_canonical.rollback_endpoints",
-                                    &format!("{e}"),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            crate::log::log_error(
-                                "binding",
-                                "bind_canonical.delete_placeholder",
-                                &format!("{e}"),
-                            );
-                            if let Err(e) = db.migrate_notify_endpoints(canonical_name, ph_name) {
-                                crate::log::log_error(
-                                    "binding",
-                                    "bind_canonical.rollback_endpoints",
-                                    &format!("{e}"),
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    // Path 1b: Session switch — mark old instance inactive
-                    crate::instance_lifecycle::set_status(
+                if migrated {
+                    delete_true_placeholder_if_migrated(
                         db,
                         ph_name,
-                        ST_INACTIVE,
-                        "exit:session_switch",
-                        Default::default(),
+                        canonical_name,
+                        placeholder_data.as_ref(),
                     );
-                    if let Err(e) = db.delete_session_bindings_for_instance(ph_name) {
-                        crate::log::log_error(
-                            "binding",
-                            "bind_canonical.delete_session_bindings",
-                            &format!("{e}"),
-                        );
-                    }
                 }
+            } else {
+                // Path 1b: Session switch — retire the real old identity. Unlike a true
+                // launch placeholder (deletion above stays gated on endpoint migration),
+                // this is a live old identity: retire it regardless of migration outcome,
+                // else a migrate failure leaves a duplicate active/listening row and a
+                // stale session binding. Endpoints may remain imperfect on the old name,
+                // but the delivery loop re-registers under the canonical name.
+                if !migrated {
+                    crate::log::log_info(
+                        "binding",
+                        "bind_canonical.session_switch_migrate_failed",
+                        &format!("endpoints may remain on {ph_name}; retiring identity anyway"),
+                    );
+                }
+                retire_switched_identity(db, ph_name, canonical_name, placeholder_data.as_ref());
             }
         }
 
         update_instance_position(db, canonical_name, &resume_updates);
 
-        if let Some(pid) = process_id {
-            if let Err(e) = db.set_process_binding(pid, session_id, canonical_name) {
-                crate::log::log_error(
-                    "binding",
-                    "bind_canonical.set_process_binding",
-                    &format!("{e}"),
-                );
-            }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, canonical_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "bind_canonical.set_process_binding",
+                &format!("{e}"),
+            );
         }
 
         return Some(canonical_name.clone());
     }
 
-    // Path 2: No canonical, but placeholder exists — bind session to placeholder
+    // Path 2: session_bindings CASCADE'd on delete — recover canonical name from life.stopped
+    if canonical.is_none()
+        && let Ok(Some(stopped_name)) = db.find_stopped_instance_by_session_id(session_id)
+    {
+        crate::log::log_info(
+            "binding",
+            "bind_session_to_process.restore_stopped",
+            &format!("stopped_name={stopped_name}, session_id={session_id}"),
+        );
+        recreate_instance_from_placeholder(
+            db,
+            &stopped_name,
+            session_id,
+            placeholder_data.as_ref(),
+        );
+        // Without a live placeholder there is nothing to restore into (e.g. the
+        // instance was stopped while its process kept running). Binding anyway
+        // would point the process at a missing row and report a bogus identity.
+        if db.get_instance_full(&stopped_name).ok().flatten().is_none() {
+            crate::log::log_warn(
+                "binding",
+                "restore_stopped.no_instance",
+                &format!("stopped_name={stopped_name}, session_id={session_id}"),
+            );
+            return None;
+        }
+
+        if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
+            crate::log::log_error("binding", "restore_stopped.clear_session", &format!("{e}"));
+        }
+        let mut updates = serde_json::Map::new();
+        updates.insert("session_id".into(), serde_json::json!(session_id));
+        update_instance_position(db, &stopped_name, &updates);
+        if let Err(e) = db.rebind_session(session_id, &stopped_name) {
+            crate::log::log_error("binding", "restore_stopped.rebind_session", &format!("{e}"));
+        }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, &stopped_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "restore_stopped.set_process_binding",
+                &format!("{e}"),
+            );
+        }
+
+        retire_true_placeholder_after_canonical_bind(
+            db,
+            placeholder_name.as_ref(),
+            &stopped_name,
+            placeholder_data.as_ref(),
+        );
+        // Session switch into a stopped identity (e.g. Pi /resume): the process now
+        // belongs to stopped_name, so the identity it had must not stay listening.
+        if let Some(ph_name) = placeholder_name.as_ref()
+            && *ph_name != stopped_name
+            && placeholder_data.is_some()
+            && !is_true_launch_placeholder(placeholder_data.as_ref())
+        {
+            retire_switched_identity(db, ph_name, &stopped_name, placeholder_data.as_ref());
+        }
+
+        return Some(stopped_name);
+    }
+
+    // Path 3: No canonical, but placeholder exists — bind session to placeholder
     if let Some(ref ph_name) = placeholder_name {
         crate::log::log_info(
             "binding",
@@ -418,14 +660,14 @@ pub fn bind_session_to_process(
                 &format!("{e}"),
             );
         }
-        if let Some(pid) = process_id {
-            if let Err(e) = db.set_process_binding(pid, session_id, ph_name) {
-                crate::log::log_error(
-                    "binding",
-                    "bind_placeholder.set_process_binding",
-                    &format!("{e}"),
-                );
-            }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, ph_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "bind_placeholder.set_process_binding",
+                &format!("{e}"),
+            );
         }
 
         return Some(ph_name.clone());
@@ -433,6 +675,210 @@ pub fn bind_session_to_process(
 
     crate::log::log_info("binding", "bind_session_to_process.return_none", "");
     None
+}
+
+/// Bind a session without allowing a hook from one tool to adopt another
+/// tool's process, live session, or stopped-session identity.
+///
+/// The ownership checks and the existing binding operation share one SQLite
+/// transaction. A disagreement therefore rolls back any mutation performed by
+/// `bind_session_to_process`, including placeholder retirement and rebinding.
+pub fn bind_session_to_process_for_tool(
+    db: &HcomDb,
+    session_id: &str,
+    process_id: Option<&str>,
+    expected_tool: &str,
+    create_if_unbound: bool,
+) -> ToolCheckedBind {
+    let transaction = match db.conn().unchecked_transaction() {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            crate::log::log_error(
+                "binding",
+                "bind_for_tool.transaction",
+                &format!("session_id={session_id} expected_tool={expected_tool} err={error}"),
+            );
+            return ToolCheckedBind::Rejected;
+        }
+    };
+
+    let owner_matches = |kind: &str, name: &str, tool: Option<&str>| {
+        if tool == Some(expected_tool) {
+            return true;
+        }
+        crate::log::log_warn(
+            "binding",
+            "bind_for_tool.owner_rejected",
+            &format!(
+                "kind={kind} instance={name} actual_tool={tool:?} expected_tool={expected_tool} session_id={session_id} process_id={process_id:?}"
+            ),
+        );
+        false
+    };
+
+    if let Some(pid) = process_id {
+        match db.get_process_binding(pid) {
+            Ok(Some(name)) => {
+                let tool = db
+                    .get_instance_full(&name)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.tool);
+                if !owner_matches("process", &name, tool.as_deref()) {
+                    return ToolCheckedBind::Rejected;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::log::log_error(
+                    "binding",
+                    "bind_for_tool.process_owner",
+                    &format!("process_id={pid} err={error}"),
+                );
+                return ToolCheckedBind::Rejected;
+            }
+        }
+    }
+
+    let session_owner = match db.get_session_binding(session_id) {
+        Ok(owner) => owner,
+        Err(error) => {
+            crate::log::log_error(
+                "binding",
+                "bind_for_tool.session_owner",
+                &format!("session_id={session_id} err={error}"),
+            );
+            return ToolCheckedBind::Rejected;
+        }
+    };
+    if let Some(ref name) = session_owner {
+        let tool = db
+            .get_instance_full(name)
+            .ok()
+            .flatten()
+            .map(|row| row.tool);
+        if !owner_matches("session", name, tool.as_deref()) {
+            return ToolCheckedBind::Rejected;
+        }
+    } else {
+        match db.find_stopped_instance_by_session_id(session_id) {
+            Ok(Some(name)) => {
+                let tool = db
+                    .conn()
+                    .query_row(
+                        "SELECT json_extract(data, '$.snapshot.tool') FROM events
+                         WHERE type = 'life'
+                           AND instance = ?1
+                           AND json_extract(data, '$.action') = 'stopped'
+                           AND json_extract(data, '$.snapshot.session_id') = ?2
+                         ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![name, session_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten();
+                if !owner_matches("stopped_session", &name, tool.as_deref()) {
+                    return ToolCheckedBind::Rejected;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                crate::log::log_error(
+                    "binding",
+                    "bind_for_tool.stopped_owner",
+                    &format!("session_id={session_id} err={error}"),
+                );
+                return ToolCheckedBind::Rejected;
+            }
+        }
+    }
+
+    let bound = bind_session_to_process(db, session_id, process_id).or_else(|| {
+        if create_if_unbound {
+            create_orphaned_pty_identity(db, session_id, process_id, expected_tool)
+        } else {
+            None
+        }
+    });
+    if let Some(ref name) = bound {
+        let tool = db
+            .get_instance_full(name)
+            .ok()
+            .flatten()
+            .map(|row| row.tool);
+        if !owner_matches("bound", name, tool.as_deref()) {
+            return ToolCheckedBind::Rejected;
+        }
+    }
+
+    if let Err(error) = transaction.commit() {
+        crate::log::log_error(
+            "binding",
+            "bind_for_tool.commit",
+            &format!("session_id={session_id} expected_tool={expected_tool} err={error}"),
+        );
+        return ToolCheckedBind::Rejected;
+    }
+
+    match bound {
+        Some(name) => ToolCheckedBind::Bound(name),
+        None => ToolCheckedBind::Unbound,
+    }
+}
+
+/// Rebind process/session after soft-finalize cleared bindings but left the
+/// instance row (typically inactive). Used when `bind_session_to_process` finds
+/// no process binding, but the caller still knows the instance name via
+/// `HCOM_INSTANCE_NAME` in a live OMP process.
+pub fn recover_process_binding_for_instance(
+    db: &HcomDb,
+    instance_name: &str,
+    session_id: &str,
+    process_id: &str,
+) -> Option<String> {
+    if instance_name.is_empty() || session_id.is_empty() || process_id.is_empty() {
+        return None;
+    }
+
+    let instance = db.get_instance_full(instance_name).ok().flatten()?;
+
+    if instance.tool != "omp" {
+        return None;
+    }
+    if instance.status != ST_INACTIVE {
+        return None;
+    }
+
+    if let Err(e) = db.clear_session_id_from_other_instances(session_id, instance_name) {
+        crate::log::log_error("binding", "recover.clear_session", &format!("{e}"));
+        return None;
+    }
+
+    let mut updates = serde_json::Map::new();
+    updates.insert("session_id".into(), serde_json::json!(session_id));
+    if let Err(e) = db.update_instance_fields(instance_name, &updates) {
+        crate::log::log_error("binding", "recover.update_session_id", &format!("{e}"));
+        return None;
+    }
+
+    if let Err(e) = db.rebind_session(session_id, instance_name) {
+        crate::log::log_error("binding", "recover.rebind_session", &format!("{e}"));
+        return None;
+    }
+    if let Err(e) = db.set_process_binding(process_id, session_id, instance_name) {
+        crate::log::log_error("binding", "recover.set_process_binding", &format!("{e}"));
+        return None;
+    }
+
+    crate::log::log_info(
+        "binding",
+        "recover_process_binding_for_instance",
+        &format!(
+            "instance={} session_id={} process_id={}",
+            instance_name, session_id, process_id
+        ),
+    );
+    Some(instance_name.to_string())
 }
 
 /// Initialize the DB row and default bindings for an instance identity.
@@ -493,6 +939,9 @@ pub fn initialize_instance_in_position_file(
             }
 
             let is_true_placeholder = existing.session_id.is_none();
+            let is_pending_placeholder = is_true_placeholder
+                && existing.status == PLACEHOLDER_STATUS
+                && existing.status_context == PLACEHOLDER_CONTEXT;
             if existing.last_event_id == 0 && is_true_placeholder {
                 let current_max = db.get_last_event_id();
                 let launch_event_id = std::env::var("HCOM_LAUNCH_EVENT_ID")
@@ -512,6 +961,10 @@ pub fn initialize_instance_in_position_file(
 
             if !updates.is_empty() {
                 let _ = db.update_instance_fields(instance_name, &updates);
+            }
+
+            if is_pending_placeholder {
+                auto_subscribe_defaults(db, instance_name, tool.unwrap_or(existing.tool.as_str()));
             }
 
             true
@@ -555,17 +1008,22 @@ pub fn initialize_instance_in_position_file(
 
             if let Some(t) = tag {
                 data.insert("tag".into(), serde_json::json!(t));
-            } else if session_id.is_some() || parent_session_id.is_some() || is_launched {
-                if let Ok(hcom_config) = crate::config::HcomConfig::load(None) {
-                    if !hcom_config.tag.is_empty() {
-                        data.insert("tag".into(), serde_json::json!(hcom_config.tag));
-                    }
-                }
+            } else if (session_id.is_some() || parent_session_id.is_some() || is_launched)
+                && let Ok(hcom_config) = crate::config::HcomConfig::load(None)
+                && !hcom_config.tag.is_empty()
+            {
+                data.insert("tag".into(), serde_json::json!(hcom_config.tag));
             }
 
-            if let Some(wt) = wait_timeout {
-                data.insert("wait_timeout".into(), serde_json::json!(wt));
-            }
+            // Resolve HCOM_TIMEOUT explicitly rather than leaving the column
+            // unset — the schema's DEFAULT 86400 would otherwise silently
+            // mask the configured value for every non-PTY instance (issue #71).
+            let effective_wait_timeout =
+                wait_timeout.unwrap_or_else(crate::config::HcomConfig::effective_timeout);
+            data.insert(
+                "wait_timeout".into(),
+                serde_json::json!(effective_wait_timeout),
+            );
             if let Some(st) = subagent_timeout {
                 data.insert("subagent_timeout".into(), serde_json::json!(st));
             }
@@ -587,17 +1045,14 @@ pub fn initialize_instance_in_position_file(
 
             match db.save_instance_named(instance_name, &data) {
                 Ok(true) => {
-                    let launcher =
-                        std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
-                    let event_data = serde_json::json!({
-                        "action": "created",
-                        "by": launcher,
-                        "is_hcom_launched": is_launched,
-                        "is_subagent": parent_session_id.is_some(),
-                        "parent_name": parent_name.unwrap_or(""),
-                    });
-                    let _ = db.log_event("life", instance_name, &event_data);
-                    auto_subscribe_defaults(db, instance_name, tool.unwrap_or(""));
+                    log_created_and_auto_subscribe(
+                        db,
+                        instance_name,
+                        is_launched,
+                        parent_session_id,
+                        parent_name,
+                        tool.unwrap_or(""),
+                    );
                     true
                 }
                 _ => true,
@@ -605,6 +1060,26 @@ pub fn initialize_instance_in_position_file(
         }
         Err(_) => false,
     }
+}
+
+fn log_created_and_auto_subscribe(
+    db: &HcomDb,
+    instance_name: &str,
+    is_launched: bool,
+    parent_session_id: Option<&str>,
+    parent_name: Option<&str>,
+    tool: &str,
+) {
+    let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
+    let event_data = serde_json::json!({
+        "action": "created",
+        "by": launcher,
+        "is_hcom_launched": is_launched,
+        "is_subagent": parent_session_id.is_some(),
+        "parent_name": parent_name.unwrap_or(""),
+    });
+    let _ = db.log_event("life", instance_name, &event_data);
+    auto_subscribe_defaults(db, instance_name, tool);
 }
 
 /// Create orphaned PTY identity — called when process binding exists but session_id
@@ -651,10 +1126,10 @@ pub fn create_orphaned_pty_identity(
     if let Err(e) = db.rebind_session(session_id, &name) {
         eprintln!("[hcom] warn: rebind_session failed for {name}: {e}");
     }
-    if let Some(pid) = process_id {
-        if let Err(e) = db.set_process_binding(pid, session_id, &name) {
-            eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
-        }
+    if let Some(pid) = process_id
+        && let Err(e) = db.set_process_binding(pid, session_id, &name)
+    {
+        eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
 
     Some(name)
@@ -666,26 +1141,24 @@ pub fn resolve_process_binding(db: &HcomDb, process_id: Option<&str>) -> Option<
     db.get_process_binding(pid).ok()?
 }
 
-/// Resolve instance via process binding, session binding, or transcript marker.
+/// Resolve instance via process or session binding.
 pub fn resolve_instance_from_binding(
     db: &HcomDb,
     session_id: Option<&str>,
     process_id: Option<&str>,
 ) -> Option<InstanceRow> {
-    if let Some(pid) = process_id {
-        if let Ok(Some(name)) = db.get_process_binding(pid) {
-            if let Ok(Some(instance)) = db.get_instance_full(&name) {
-                return Some(instance);
-            }
-        }
+    if let Some(pid) = process_id
+        && let Ok(Some(name)) = db.get_process_binding(pid)
+        && let Ok(Some(instance)) = db.get_instance_full(&name)
+    {
+        return Some(instance);
     }
 
-    if let Some(sid) = session_id {
-        if let Some(name) = db.get_session_binding(sid).ok().flatten() {
-            if let Ok(Some(instance)) = db.get_instance_full(&name) {
-                return Some(instance);
-            }
-        }
+    if let Some(sid) = session_id
+        && let Some(name) = db.get_session_binding(sid).ok().flatten()
+        && let Ok(Some(instance)) = db.get_instance_full(&name)
+    {
+        return Some(instance);
     }
 
     None
@@ -693,8 +1166,13 @@ pub fn resolve_instance_from_binding(
 
 /// Auto-subscribe instance to default event subscriptions from config.
 /// Called during instance creation.
+fn auto_subscribe_eligible(tool: &str) -> bool {
+    tool.parse::<crate::tool::Tool>()
+        .is_ok_and(|tool| tool.spec().released)
+}
+
 fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
-    if !matches!(tool, "claude" | "gemini" | "codex" | "opencode") {
+    if !auto_subscribe_eligible(tool) {
         return;
     }
 
@@ -731,13 +1209,12 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
                     .or_default()
                     .push(val.to_string());
             }
-            let _ = crate::commands::events::create_filter_subscription(
+            let _ = crate::db::subscriptions::create_filter_subscription(
                 db,
                 &filters,
                 &[],
                 instance_name,
                 false,
-                true,
                 None,
             );
         }
@@ -747,8 +1224,41 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use serial_test::serial;
     use std::path::PathBuf;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn setup_test_db() -> (HcomDb, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -762,82 +1272,7 @@ mod tests {
             test_id
         ));
 
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             PRAGMA journal_mode=WAL;
-
-             CREATE TABLE events (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 timestamp TEXT NOT NULL,
-                 type TEXT NOT NULL,
-                 instance TEXT,
-                 data TEXT NOT NULL
-             );
-
-             CREATE TABLE instances (
-                 name TEXT PRIMARY KEY,
-                 session_id TEXT UNIQUE,
-                 parent_session_id TEXT,
-                 parent_name TEXT,
-                 tag TEXT,
-                 last_event_id INTEGER DEFAULT 0,
-                 status TEXT DEFAULT 'active',
-                 status_time INTEGER DEFAULT 0,
-                 status_context TEXT DEFAULT '',
-                 status_detail TEXT DEFAULT '',
-                 last_stop INTEGER DEFAULT 0,
-                 directory TEXT,
-                 created_at REAL NOT NULL DEFAULT 0,
-                 transcript_path TEXT DEFAULT '',
-                 tcp_mode INTEGER DEFAULT 0,
-                 wait_timeout INTEGER DEFAULT 86400,
-                 background INTEGER DEFAULT 0,
-                 background_log_file TEXT DEFAULT '',
-                 name_announced INTEGER DEFAULT 0,
-                 agent_id TEXT UNIQUE,
-                 running_tasks TEXT DEFAULT '',
-                 origin_device_id TEXT DEFAULT '',
-                 hints TEXT DEFAULT '',
-                 subagent_timeout INTEGER,
-                 tool TEXT DEFAULT 'claude',
-                 launch_args TEXT DEFAULT '',
-                 terminal_preset_requested TEXT DEFAULT '',
-                 terminal_preset_effective TEXT DEFAULT '',
-                 idle_since TEXT DEFAULT '',
-                 pid INTEGER DEFAULT NULL,
-                 launch_context TEXT DEFAULT '',
-                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
-             );
-
-             CREATE TABLE process_bindings (
-                 process_id TEXT PRIMARY KEY,
-                 session_id TEXT,
-                 instance_name TEXT,
-                 updated_at REAL NOT NULL
-             );
-
-             CREATE TABLE session_bindings (
-                 session_id TEXT PRIMARY KEY,
-                 instance_name TEXT NOT NULL,
-                 created_at REAL NOT NULL,
-                 FOREIGN KEY (instance_name) REFERENCES instances(name) ON DELETE CASCADE
-             );
-
-             CREATE TABLE notify_endpoints (
-                 instance TEXT NOT NULL,
-                 kind TEXT NOT NULL,
-                 port INTEGER NOT NULL,
-                 updated_at REAL NOT NULL,
-                 PRIMARY KEY (instance, kind)
-             );
-
-             CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let db = HcomDb::open_raw(&db_path).unwrap();
+        let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path)
     }
 
@@ -845,6 +1280,14 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn auto_subscribe_eligibility_follows_released_specs() {
+        assert!(auto_subscribe_eligible("pi"));
+        assert!(auto_subscribe_eligible("kimi"));
+        assert!(!auto_subscribe_eligible("adhoc"));
+        assert!(!auto_subscribe_eligible("unknown"));
     }
 
     #[test]
@@ -877,6 +1320,74 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("kitty")
         );
+        assert_eq!(
+            ctx.get("process_id").and_then(|v| v.as_str()),
+            Some("proc-1")
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_context_records_launched_preset() {
+        // capture_context tags the launch with HCOM_LAUNCHED_PRESET so later
+        // child agents launched from inside this pane can inherit the preset.
+        // Running tests inside a herdr session would otherwise leak
+        // HERDR_PANE_ID into the captured context, so explicitly clear the
+        // herdr-related identity vars before exercising the capture path.
+        crate::config::Config::init();
+        let _preset = EnvVarGuard::set("HCOM_LAUNCHED_PRESET", "herdr");
+        let _herdr_pane = EnvVarGuard::set("HERDR_PANE_ID", "");
+        let _herdr_socket = EnvVarGuard::set("HERDR_SOCKET_PATH", "");
+        let _herdr_env = EnvVarGuard::set("HERDR_ENV", "");
+        let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "");
+
+        let ctx = capture_context();
+
+        assert_eq!(
+            ctx.get("terminal_preset_effective")
+                .and_then(|v| v.as_str()),
+            Some("herdr")
+        );
+        assert!(
+            ctx.get("pane_id").is_none(),
+            "pane_id should be absent when HERDR_PANE_ID isn't set"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_and_store_launch_context_preserves_terminal_metadata() {
+        // Preserve only the fields we can't recapture from hook env:
+        // pane_id, terminal_id, kitty_listen_on, process_id, and the resolved
+        // terminal preset name.
+        let (db, path) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at, launch_context) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "luna",
+                    "claude",
+                    1.0f64,
+                    r#"{"terminal_preset_effective":"herdr","pane_id":"p_7","process_id":"proc-1"}"#
+                ],
+            )
+            .unwrap();
+        let _preset = EnvVarGuard::set("HCOM_LAUNCHED_PRESET", "");
+        let _process_id = EnvVarGuard::set("HCOM_PROCESS_ID", "");
+
+        capture_and_store_launch_context(&db, "luna");
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        let ctx: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(
+            ctx.get("terminal_preset_effective")
+                .and_then(|v| v.as_str()),
+            Some("herdr")
+        );
+        assert_eq!(ctx.get("pane_id").and_then(|v| v.as_str()), Some("p_7"));
         assert_eq!(
             ctx.get("process_id").and_then(|v| v.as_str()),
             Some("proc-1")
@@ -1155,6 +1666,428 @@ mod tests {
     }
 
     #[test]
+    fn test_bind_session_restores_deleted_canonical_from_placeholder() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut canonical_data = serde_json::Map::new();
+        canonical_data.insert("name".into(), serde_json::json!("miso"));
+        canonical_data.insert("session_id".into(), serde_json::json!("sid-resume"));
+        canonical_data.insert("tool".into(), serde_json::json!("antigravity"));
+        canonical_data.insert("created_at".into(), serde_json::json!(now));
+        canonical_data.insert("status".into(), serde_json::json!("listening"));
+        db.save_instance_named("miso", &canonical_data).unwrap();
+        db.rebind_session("sid-resume", "miso").unwrap();
+
+        let mut ph_data = serde_json::Map::new();
+        ph_data.insert("name".into(), serde_json::json!("nova"));
+        ph_data.insert("tool".into(), serde_json::json!("antigravity"));
+        ph_data.insert("tag".into(), serde_json::json!("work"));
+        ph_data.insert("created_at".into(), serde_json::json!(now));
+        ph_data.insert("status".into(), serde_json::json!("pending"));
+        ph_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("nova", &ph_data).unwrap();
+        db.set_process_binding("pid-agy", "", "nova").unwrap();
+
+        let snapshot = serde_json::json!({
+            "session_id": "sid-resume",
+            "tool": "antigravity",
+            "tag": "work",
+        });
+        db.log_life_event("miso", "stopped", "test", "exit", Some(snapshot))
+            .unwrap();
+
+        db.delete_instance("miso").unwrap();
+        assert!(db.get_instance_full("miso").unwrap().is_none());
+        assert_eq!(db.get_session_binding("sid-resume").unwrap(), None);
+
+        let result = bind_session_to_process(&db, "sid-resume", Some("pid-agy"));
+        assert_eq!(result, Some("miso".to_string()));
+
+        let restored = db.get_instance_full("miso").unwrap().unwrap();
+        assert_eq!(restored.session_id.as_deref(), Some("sid-resume"));
+        assert_eq!(restored.tool, "antigravity");
+        assert_eq!(restored.tag.as_deref(), Some("work"));
+        assert!(db.get_instance_full("nova").unwrap().is_none());
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bind_session_restore_stopped_deletes_true_placeholder() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+
+        let snapshot = serde_json::json!({
+            "session_id": "ses-opencode-1",
+            "tool": "opencode",
+        });
+        db.log_life_event("fano", "stopped", "test", "exit", Some(snapshot))
+            .unwrap();
+
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc", "", "mozi").unwrap();
+
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+
+        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert!(db.get_instance_full("mozi").unwrap().is_none());
+        let fano = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(fano.session_id.as_deref(), Some("ses-opencode-1"));
+        assert_eq!(
+            db.get_session_binding("ses-opencode-1").unwrap(),
+            Some("fano".to_string())
+        );
+        assert_eq!(
+            db.get_process_binding("pid-oc").unwrap(),
+            Some("fano".to_string())
+        );
+
+        cleanup(path);
+    }
+
+    /// A stopped instance whose process lost its binding has no row to restore
+    /// into: binding must fail rather than point the process at a missing row.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_without_placeholder_does_not_bind() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let snapshot = serde_json::json!({"session_id": "ses-pi-1", "tool": "pi"});
+        db.log_life_event("miro", "stopped", "session", "exit:reload", Some(snapshot))
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-pi-1", Some("pid-pi"));
+        assert_eq!(result, None);
+        assert!(db.get_instance_full("miro").unwrap().is_none());
+        assert_eq!(db.get_session_binding("ses-pi-1").unwrap(), None);
+        assert_eq!(db.get_process_binding("pid-pi").unwrap(), None);
+
+        cleanup(path);
+    }
+
+    /// A live process resuming another agent's stopped session takes that identity;
+    /// its previous identity is retired instead of left listening without a process.
+    #[test]
+    #[serial]
+    fn test_restore_stopped_retires_switched_live_identity() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut nene = serde_json::Map::new();
+        nene.insert("name".into(), serde_json::json!("nene"));
+        nene.insert("tool".into(), serde_json::json!("pi"));
+        nene.insert("session_id".into(), serde_json::json!("ses-nene"));
+        nene.insert("created_at".into(), serde_json::json!(now));
+        nene.insert("status".into(), serde_json::json!("listening"));
+        nene.insert("pid".into(), serde_json::json!(4242));
+        db.save_instance_named("nene", &nene).unwrap();
+        db.rebind_session("ses-nene", "nene").unwrap();
+        db.set_process_binding("pid-pi", "ses-nene", "nene")
+            .unwrap();
+
+        let snapshot = serde_json::json!({"session_id": "ses-zumi", "tool": "pi"});
+        db.log_life_event("zumi", "stopped", "session", "exit:closed", Some(snapshot))
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-zumi", Some("pid-pi"));
+        assert_eq!(result, Some("zumi".to_string()));
+        assert_eq!(
+            db.get_process_binding("pid-pi").unwrap(),
+            Some("zumi".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("ses-zumi").unwrap(),
+            Some("zumi".to_string())
+        );
+
+        let nene = db.get_instance_full("nene").unwrap().unwrap();
+        assert_eq!(nene.status, ST_INACTIVE);
+        assert_eq!(nene.status_context, "exit:session_switch");
+        assert_eq!(db.get_session_binding("ses-nene").unwrap(), None);
+        assert_eq!(nene.pid, None, "retired identity must not keep the process");
+        let zumi = db.get_instance_full("zumi").unwrap().unwrap();
+        assert_eq!(zumi.pid, Some(4242), "new identity must stay killable");
+
+        // Resuming the previous session switches back to its original identity.
+        let result = bind_session_to_process(&db, "ses-nene", Some("pid-pi"));
+        assert_eq!(result, Some("nene".to_string()));
+        assert_eq!(
+            db.get_process_binding("pid-pi").unwrap(),
+            Some("nene".to_string())
+        );
+        assert_eq!(
+            db.get_session_binding("ses-nene").unwrap(),
+            Some("nene".to_string())
+        );
+        assert_eq!(db.get_session_binding("ses-zumi").unwrap(), None);
+        let nene = db.get_instance_full("nene").unwrap().unwrap();
+        assert_eq!(nene.pid, Some(4242));
+        let zumi = db.get_instance_full("zumi").unwrap().unwrap();
+        assert_eq!(zumi.status_context, "exit:session_switch");
+        assert_eq!(zumi.pid, None);
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_restore_stopped_migrates_pid_and_launch_context_to_canonical() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-oc-pid", "tool": "opencode" })),
+        )
+        .unwrap();
+
+        // Launch placeholder with the runtime state the PTY wrapper writes at spawn.
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc", "", "mozi").unwrap();
+        db.update_instance_pid("mozi", 4242).unwrap();
+        db.store_launch_context("mozi", r#"{"pane_id":"kitty-99"}"#)
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-oc-pid", Some("pid-oc"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        // Placeholder gone; pid + launch_context now live on the canonical so the
+        // restored agent stays killable and its pane closeable.
+        assert!(db.get_instance_full("mozi").unwrap().is_none());
+        let fano = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(fano.pid, Some(4242));
+        assert!(
+            fano.launch_context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kitty-99"),
+            "launch_context not migrated: {:?}",
+            fano.launch_context
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_restore_stopped_migrates_ready_promoted_placeholder_runtime_state() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-oc-ready", "tool": "opencode" })),
+        )
+        .unwrap();
+
+        // PTY ready detection can promote the launch row before opencode-start binds
+        // the session. It is still the launch placeholder and must be retired.
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("listening"));
+        mozi_data.insert("status_context".into(), serde_json::json!("start"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc-ready", "", "mozi").unwrap();
+        db.update_instance_pid("mozi", 4343).unwrap();
+        db.store_launch_context("mozi", r#"{"pane_id":"kitty-101"}"#)
+            .unwrap();
+
+        let result = bind_session_to_process(&db, "ses-oc-ready", Some("pid-oc-ready"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert!(db.get_instance_full("mozi").unwrap().is_none());
+        let fano = db.get_instance_full("fano").unwrap().unwrap();
+        assert_eq!(fano.pid, Some(4343));
+        assert!(
+            fano.launch_context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("kitty-101"),
+            "launch_context not migrated: {:?}",
+            fano.launch_context
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_restore_stopped_keeps_active_no_session_row() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+        db.log_life_event(
+            "fano",
+            "stopped",
+            "test",
+            "exit",
+            Some(serde_json::json!({ "session_id": "ses-keep", "tool": "opencode" })),
+        )
+        .unwrap();
+
+        // An ACTIVE row bound to the pid that happens to lack a session_id — NOT a launch
+        // placeholder (status_context != "new", status active). It must not be deleted.
+        let mut busy_data = serde_json::Map::new();
+        busy_data.insert("name".into(), serde_json::json!("busy"));
+        busy_data.insert("tool".into(), serde_json::json!("opencode"));
+        busy_data.insert("created_at".into(), serde_json::json!(now));
+        busy_data.insert("status".into(), serde_json::json!("active"));
+        busy_data.insert("status_context".into(), serde_json::json!("tool:write"));
+        db.save_instance_named("busy", &busy_data).unwrap();
+        db.set_process_binding("pid-busy", "", "busy").unwrap();
+
+        let result = bind_session_to_process(&db, "ses-keep", Some("pid-busy"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert!(
+            db.get_instance_full("busy").unwrap().is_some(),
+            "active non-placeholder row must not be deleted by restore_stopped"
+        );
+
+        cleanup(path);
+    }
+
+    fn notify_endpoint_port(db: &HcomDb, instance: &str, kind: &str) -> Option<i64> {
+        db.conn()
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = ?1 AND kind = ?2",
+                rusqlite::params![instance, kind],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    struct MigrateNotifyFailGuard;
+
+    impl MigrateNotifyFailGuard {
+        fn enable() -> Self {
+            HcomDb::set_test_migrate_notify_fail(true);
+            Self
+        }
+    }
+
+    impl Drop for MigrateNotifyFailGuard {
+        fn drop(&mut self) {
+            HcomDb::set_test_migrate_notify_fail(false);
+        }
+    }
+
+    #[test]
+    fn test_delete_placeholder_failure_keeps_notify_on_canonical() {
+        let (db, path) = setup_test_db();
+
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+        db.migrate_notify_endpoints("mozi", "fano").unwrap();
+
+        delete_true_placeholder_instance(&db, "ghost_placeholder");
+
+        assert_eq!(notify_endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(notify_endpoint_port(&db, "fano", "pty"), Some(55_568));
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_retire_skips_delete_when_migrate_fails() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let _guard = MigrateNotifyFailGuard::enable();
+        let now = now_epoch_i64();
+
+        let mut fano_data = serde_json::Map::new();
+        fano_data.insert("name".into(), serde_json::json!("fano"));
+        fano_data.insert("tool".into(), serde_json::json!("opencode"));
+        fano_data.insert("created_at".into(), serde_json::json!(now));
+        fano_data.insert("status".into(), serde_json::json!("inactive"));
+        db.save_instance_named("fano", &fano_data).unwrap();
+
+        let snapshot = serde_json::json!({
+            "session_id": "ses-opencode-1",
+            "tool": "opencode",
+        });
+        db.log_life_event("fano", "stopped", "test", "exit", Some(snapshot))
+            .unwrap();
+
+        let mut mozi_data = serde_json::Map::new();
+        mozi_data.insert("name".into(), serde_json::json!("mozi"));
+        mozi_data.insert("tool".into(), serde_json::json!("opencode"));
+        mozi_data.insert("created_at".into(), serde_json::json!(now));
+        mozi_data.insert("status".into(), serde_json::json!("pending"));
+        mozi_data.insert("status_context".into(), serde_json::json!("new"));
+        db.save_instance_named("mozi", &mozi_data).unwrap();
+        db.set_process_binding("pid-oc", "", "mozi").unwrap();
+
+        let result = bind_session_to_process(&db, "ses-opencode-1", Some("pid-oc"));
+        assert_eq!(result, Some("fano".to_string()));
+
+        assert!(db.get_instance_full("mozi").unwrap().is_some());
+        assert_eq!(
+            db.get_session_binding("ses-opencode-1").unwrap(),
+            Some("fano".to_string())
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
     fn test_bind_session_idempotent_same_session() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
@@ -1188,16 +2121,15 @@ mod tests {
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert("collision".to_string(), vec!["1".to_string()]);
 
-        let result = crate::commands::events::create_filter_subscription(
+        let result = crate::db::subscriptions::create_filter_subscription(
             &db,
             &filters,
             &[],
             "test-agent",
             false,
-            true,
             None,
         );
-        assert_eq!(result, 0, "subscription creation should succeed");
+        assert!(result.is_ok(), "subscription creation should succeed");
 
         let rows: Vec<String> = db
             .conn()
@@ -1208,6 +2140,158 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(rows.len(), 1, "should have 1 subscription");
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_pending_placeholder_promotion_auto_subscribes_without_created_event() {
+        let _env = EnvVarGuard::set("HCOM_AUTO_SUBSCRIBE", "collision");
+        let (db, path) = setup_test_db();
+
+        let now = now_epoch_i64();
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("luna"));
+        data.insert("status".into(), serde_json::json!(PLACEHOLDER_STATUS));
+        data.insert(
+            "status_context".into(),
+            serde_json::json!(PLACEHOLDER_CONTEXT),
+        );
+        data.insert("created_at".into(), serde_json::json!(now));
+        data.insert(
+            "last_event_id".into(),
+            serde_json::json!(db.get_last_event_id()),
+        );
+        db.save_instance_named("luna", &data).unwrap();
+
+        let ok = initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(ok);
+        let ok_again = initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(ok_again);
+
+        let created_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE instance = 'luna'
+                   AND type = 'life'
+                   AND json_extract(data, '$.action') = 'created'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_count, 0);
+
+        let collision_sub_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv
+                 WHERE key LIKE 'events_sub:%'
+                   AND json_extract(value, '$.caller') = 'luna'
+                   AND json_extract(value, '$.filters.collision[0]') IS NOT NULL
+                   AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(collision_sub_count, 1);
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn new_row_honors_configured_hcom_timeout() {
+        // Regression test for issue #71: a brand-new instance row (the path
+        // used by adhoc `hcom start`, launched, and resumed sessions) must
+        // carry the effective HCOM_TIMEOUT rather than silently falling back
+        // to the old always-86400 schema default.
+        let _env = EnvVarGuard::set("HCOM_TIMEOUT", "30");
+        let (db, path) = setup_test_db();
+
+        let ok = initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(ok);
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.wait_timeout, Some(30));
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn new_row_falls_back_to_120_without_config() {
+        let _env = EnvVarGuard::unset("HCOM_TIMEOUT");
+        let (db, path) = setup_test_db();
+
+        let ok = initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(ok);
+
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        // Default HcomConfig::timeout is 86400 (schema-equivalent default),
+        // preserved for anyone who hasn't set HCOM_TIMEOUT.
+        assert_eq!(row.wait_timeout, Some(86400));
 
         cleanup(path);
     }

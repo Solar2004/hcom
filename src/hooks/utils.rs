@@ -150,11 +150,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hook_registry_count() {
-        assert_eq!(HOOK_REGISTRY.len(), 10);
-    }
-
-    #[test]
     fn test_stdin_hooks_populated() {
         assert!(STDIN_HOOKS.contains("Stop"));
         assert!(STDIN_HOOKS.contains("PostToolUse"));

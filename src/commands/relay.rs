@@ -122,10 +122,23 @@ fn format_time(timestamp: f64) -> String {
 /// Get device short ID via FNV-1a hash
 /// Auto-creates device_id file if missing (via read_device_uuid).
 /// Returns "?" when the device_id file cannot be created or read — display only.
-fn get_device_short_id() -> String {
+fn get_device_short_id(db: &HcomDb) -> String {
     match crate::relay::read_device_uuid() {
-        Some(uuid) => crate::relay::device_short_id(&uuid),
+        Some(uuid) => crate::relay::device_short_id_for_db(db, &uuid),
         None => "?".to_string(),
+    }
+}
+
+fn paint(code: &str, text: &str) -> String {
+    use std::io::IsTerminal;
+
+    let enabled = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").as_deref() != Ok("dumb");
+    if enabled {
+        format!("{code}{text}{RESET}")
+    } else {
+        text.to_string()
     }
 }
 
@@ -134,13 +147,13 @@ fn relay_status(db: &HcomDb) -> i32 {
     let config = config::load_config_snapshot().core;
 
     if config.relay_id.is_empty() {
-        println!("{FG_GRAY}Relay: not configured{RESET}");
+        println!("{}", paint(FG_GRAY, "Relay: not configured"));
         println!("Run: hcom relay new");
         return 0;
     }
 
     if !config.relay_enabled {
-        println!("{FG_YELLOW}Relay: disabled{RESET}");
+        println!("{}", paint(FG_YELLOW, "Relay: disabled"));
         println!("\nRun: hcom relay connect");
         return 0;
     }
@@ -150,19 +163,26 @@ fn relay_status(db: &HcomDb) -> i32 {
     let health = relay::relay_health(&config, db);
     match &health {
         relay::RelayHealth::Connected => {
-            println!("Status:    {FG_GREEN}connected{RESET}");
+            println!("Status:    {}", paint(FG_GREEN, "connected"));
         }
         relay::RelayHealth::Starting { pid } => {
-            println!("Status:    {FG_YELLOW}starting{RESET} (PID {pid}, awaiting connect)");
+            println!(
+                "Status:    {} (PID {pid}, awaiting connect)",
+                paint(FG_YELLOW, "starting")
+            );
         }
         relay::RelayHealth::Stale { age_s, pid } => {
             println!(
-                "Status:    {FG_YELLOW}stale{RESET} — worker unresponsive (PID {pid}, {:.0}s since last heartbeat)",
+                "Status:    {} — worker unresponsive (PID {pid}, {:.0}s since last heartbeat)",
+                paint(FG_YELLOW, "stale"),
                 age_s
             );
         }
         relay::RelayHealth::Waiting => {
-            println!("Status:    {FG_YELLOW}waiting{RESET} (daemon may not be running)");
+            println!(
+                "Status:    {} (daemon may not be running)",
+                paint(FG_YELLOW, "waiting")
+            );
         }
         relay::RelayHealth::Error {
             reason,
@@ -170,7 +190,8 @@ fn relay_status(db: &HcomDb) -> i32 {
             pid,
         } => {
             println!(
-                "Status:    {FG_RED}error{RESET} — {}",
+                "Status:    {} — {}",
+                paint(FG_RED, "error"),
                 reason.clone().label(detail.as_deref(), *pid)
             );
             if matches!(reason, relay::RelayErrorReason::Reported) {
@@ -192,7 +213,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         // NotConfigured / Disabled never reach here — the early returns above
         // (config.relay_id empty / !config.relay_enabled) handled them already.
         relay::RelayHealth::NotConfigured | relay::RelayHealth::Disabled => {
-            println!("Status:    {FG_YELLOW}waiting{RESET}");
+            println!("Status:    {}", paint(FG_YELLOW, "waiting"));
         }
     }
 
@@ -211,7 +232,7 @@ fn relay_status(db: &HcomDb) -> i32 {
         println!("Broker:    auto (public fallback)");
     }
 
-    println!("Device:    {}", get_device_short_id());
+    println!("Device:    {}", get_device_short_id(db));
 
     // Queued events
     let last_push_id: i64 = db
@@ -224,7 +245,11 @@ fn relay_status(db: &HcomDb) -> i32 {
     let queued: i64 = db
         .conn()
         .query_row(
-            "SELECT COUNT(*) FROM events WHERE id > ?1 AND instance NOT LIKE '%:%'",
+            "SELECT COUNT(*) FROM events
+             WHERE id > ?1
+             AND instance NOT LIKE '%:%'
+             AND instance != '_device'
+             AND json_extract(data, '$._relay') IS NULL",
             rusqlite::params![last_push_id],
             |r| r.get(0),
         )
@@ -274,13 +299,11 @@ fn relay_status(db: &HcomDb) -> i32 {
         "SELECT origin_device_id, COUNT(*) as cnt FROM instances \
          WHERE origin_device_id IS NOT NULL AND origin_device_id != '' \
          GROUP BY origin_device_id",
-    ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        }) {
-            for row in rows.filter_map(|r| r.ok()) {
-                agent_counts.insert(row.0, row.1);
-            }
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        for row in rows.filter_map(|r| r.ok()) {
+            agent_counts.insert(row.0, row.1);
         }
     }
 
@@ -334,7 +357,10 @@ fn relay_status(db: &HcomDb) -> i32 {
     if let Ok(psk) = relay::load_psk(&config) {
         println!("Key:       {}", relay::crypto::fingerprint(&psk));
     } else {
-        println!("Key:       {FG_RED}missing{RESET} (run `hcom relay new`)");
+        println!(
+            "Key:       {} (run `hcom relay new`)",
+            paint(FG_RED, "missing")
+        );
     }
 
     println!("\nShow token: hcom relay token");
@@ -348,31 +374,9 @@ fn relay_push() -> i32 {
     0
 }
 
-fn stop_relay_worker_quiet() {
-    let Some(pid) = crate::relay::worker::relay_worker_pid() else {
-        return;
-    };
-
-    let _ = crate::relay::worker::stop_relay_worker();
-    for _ in 0..50 {
-        if !crate::pidtrack::is_alive(pid) {
-            crate::relay::worker::remove_relay_pid_file();
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    // Last resort: a stale worker pinned to the old namespace must not survive
-    // a relay reset or shutdown.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-    crate::relay::worker::remove_relay_pid_file();
-}
-
 fn restart_relay_worker_for_config_change() -> bool {
     if crate::relay::worker::is_relay_worker_running() {
-        stop_relay_worker_quiet();
+        crate::relay::worker::stop_relay_worker_blocking();
     }
     crate::relay::worker::ensure_worker(false)
 }
@@ -421,6 +425,7 @@ fn relay_notify_off_all(db: &HcomDb, config: &crate::config::HcomConfig) {
     let mut sent = 0usize;
     for short in &peers {
         if relay::control::send_one_way_control_ephemeral(
+            db,
             config,
             "relay_off",
             short,
@@ -470,8 +475,8 @@ fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
         }
     }
 
-    stop_relay_worker_quiet();
-    println!("{FG_YELLOW}Relay: disabled{RESET}");
+    crate::relay::worker::stop_relay_worker_blocking();
+    println!("{}", paint(FG_YELLOW, "Relay: disabled"));
     println!("\nRun 'hcom relay connect' to reconnect");
     0
 }
@@ -815,29 +820,7 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
     let first = argv[0].as_str();
 
     if first == "--help" || first == "-h" {
-        println!(
-            "hcom relay - Cross-device sync via MQTT pub/sub\n\n\
-             Usage:\n  \
-             hcom relay                  Show relay status\n  \
-             hcom relay status           Same as above\n  \
-             hcom relay new              Create new relay group (generates fresh key)\n  \
-             hcom relay token            Show join token\n  \
-             hcom relay connect          Re-enable existing relay\n  \
-             hcom relay connect <token>  Join relay from another device\n  \
-             hcom relay off              Disable relay sync\n  \
-             hcom relay off --all        Ask all known peers to disable this relay too, then disable locally\n  \
-             hcom relay disconnect       Disable relay sync\n  \
-             hcom relay push             Trigger an immediate relay push\n  \
-             \n\
-             Daemon:\n  \
-             hcom relay daemon           Show daemon status\n  \
-             hcom relay daemon start     Start the relay daemon\n  \
-             hcom relay daemon stop      Stop the relay daemon\n  \
-             hcom relay daemon restart   Restart the relay daemon\n\n\
-             Private broker:\n  \
-             hcom relay new --broker mqtts://host:port [--password secret]\n  \
-             hcom relay connect <token> --broker mqtts://host:port [--password secret]"
-        );
+        crate::commands::help::print_command_help("relay");
         return 0;
     }
 
@@ -856,7 +839,9 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
                 relay_connect(db, argv)
             } else {
                 eprintln!("Error: Unknown subcommand: {first}");
-                eprintln!("Usage: hcom relay [new|connect|disconnect|status|push]");
+                eprintln!(
+                    "Usage: hcom relay [new|token|connect|on|off|daemon] (see hcom relay --help)"
+                );
                 1
             }
         }
@@ -972,7 +957,7 @@ mod tests {
     fn test_relay_off_all_disables_local_relay_without_peers() {
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let cfg = crate::config::HcomConfig {
-            relay: "mqtts://broker.emqx.io:8883".to_string(),
+            relay: "mqtt://127.0.0.1:1".to_string(),
             relay_id: "relay-1".to_string(),
             relay_psk: relay::encode_psk(&fake_psk()),
             relay_enabled: true,

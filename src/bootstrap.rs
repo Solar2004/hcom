@@ -5,18 +5,21 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::sync::LazyLock;
 
 use crate::db::HcomDb;
-use crate::instances::get_full_name;
+use crate::identity::get_full_name;
 use crate::paths;
-use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
+use crate::shared::constants::{SENDER, ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
+use crate::shared::context::HcomContext;
+use crate::tool::Tool;
 
 // Bundled script names (compile-time known).
 // User scripts are discovered at runtime from ~/.hcom/scripts/.
 
 // MAIN BOOTSTRAP TEMPLATE
 //
-// `--name` is redundant for live agents (HCOM_PROCESS_ID resolves identity at
+// `--name` is redundant for live managed agents (HCOM_PROCESS_ID resolves identity at
 // priority 4 in identity.rs), but mandatory for two reasons:
 //
 // 1. Explicit `--name` takes the error-propagating path in build_ctx_for_command
@@ -30,12 +33,13 @@ use crate::shared::constants::{SENDER, ST_ACTIVE, ST_LISTENING};
 // 2. Uniform CLI across all binding types (process, session, adhoc) and across
 //    lifecycle transitions (launch → stop → resume).  The underlying binding
 //    changes; the flags don't.
+//
+// Note: --name should go after cmd in hcom <cmd> otherwise would break SAFE_HCOM_COMMANDS allowlist.
 
 const UNIVERSAL: &str = r#"[HCOM SESSION]
-You have access to the hcom communication tool.
+You have access to the hcom cli communication tool.
 - Your name: {display_name}
-- Authority: Prioritize @{SENDER} over others
-- Important: Include this marker anywhere in your first response only: [hcom:{instance_name}]
+- Authority: Prioritize @{SENDER} over others{launched_by}
 
 You run hcom commands on behalf of the human user. The human uses natural language with you.
 
@@ -54,19 +58,21 @@ Routing rules:
 
 You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
-- Message: send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- "message text" 
-  Or instead of --: --file <path> | --base64 <string> | pipe/heredoc
-  Example: send @luna @nova --intent ack --reply-to 82 -- "ok"
-- See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}']
-- Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search "text" [--all]
+- Message: send {target_name_s} [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- 'plain text'
+  Or (for code/md/backticks) instead of --: --file <path> | --base64 <string> | pipe/heredoc
+  Example: send {target_luna} {target_nova} --intent ack --reply-to 82 --name {instance_name} -- 'ok'
+- See who's active: list [name] [-v] [--json]
+- Read another's conversation: transcript [name] [N-M] [--last N] [--full] [--detailed (tools/io)] | transcript search 'text' [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
-  Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
+  Get notified (watch agents, react): events sub [filters] [--once] | --help
+  Example: events sub --idle luna → <hcom> msg when luna goes idle
 - Handoff context: bundle prepare
-- Spawn agents: [num] <claude|gemini|codex|opencode> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
-  Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
+- Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--hcom-prompt 'task']
+  Example: `hcom 1 claude --tag cool --hcom-prompt 'task'` → <hcom> sends you result when done
+  Without --hcom-prompt: you get auto notify <hcom> when ready, then use hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
-  background, set prompt, system, forward args: <claude|gemini|codex|opencode> --help
+  each supports --help (set prompt, system, background, forward args, etc)
 - Run workflows: run <script> [args] [--help]
   {scripts}
 - View agent screen: term [name] | inject text/enter: term inject <name> ['text'] [--enter]
@@ -76,10 +82,10 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 ## RULES
 
-1. Task via hcom → ack immediately, do work, report via hcom
-2. No filler messages (greetings, thanks, congratulations).
-3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
-4. User says "the gemini/claude/codex agent" or unclear → run `hcom list` to resolve name
+1. No filler messages (greetings, thanks, congrats).
+2. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
+3. User says 'the pi/claude/codex agent' or unclear → run `hcom list` to resolve name
+4. Don't delegate to existing agents unless asked. Need help? Spawn your own agents.
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 {active_instances}
@@ -87,16 +93,16 @@ Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 This is session context, not a task for immediate action."#;
 
 const TAG_NOTICE: &str = r#"
-You are tagged "{tag}". Message your group: send @{tag}- -- msg"#;
+You are tagged '{tag}'. Message your group: send {target_tag} -- msg"#;
 
 const RELAY_NOTICE: &str = r#"
-Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE. Remote launch needs --device BOXE and --dir passed in."#;
+Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE. Remote launch needs --device BOXE and --dir passed in. Remote hcom events needs --remote-fetch --device BOXE. Remote events sub needs --device BOXE. transcript, term, kill, r, f take name:BOXE."#;
 
 const HEADLESS_NOTICE: &str = r#"
 Headless mode: No one sees your chat, only hcom messages. Communicate via hcom send."#;
 
 const UVX_CMD_NOTICE: &str = r#"
-Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."#;
+Note: hcom command in this environment is `{hcom_cmd}`."#;
 
 // Tool-specific delivery
 //
@@ -108,16 +114,45 @@ Note: hcom command in this environment is `{hcom_cmd}`. Substitute in examples."
 // call for no benefit.  "End your turn" short-circuits that impulse and lets
 // the hook machinery do the work.
 
+/// Prepended above the JSON delivery block on agy hook turns with unread
+/// messages. Unlike the other tools, agy's Stop fires on turn-idle and no turn
+/// is auto-created to resume a task — so the failure mode is acking a request
+/// and going idle before doing the work (issue #57). This line guards that.
+pub(crate) const ANTIGRAVITY_DELIVERY_ACTION: &str = r#"## HCOM MESSAGE — handle the delivery below this turn
+For `intent=request`: an ACK alone does not complete it, and no turn is auto-created to resume after you go idle. Do the requested work and `hcom send` the result in this same turn. Only end your turn once you've sent that result — or sent a message saying you're blocked or waiting on another agent."#;
+
+pub(crate) fn is_antigravity_tool(tool: &str) -> bool {
+    tool == "antigravity"
+}
+
+const CURSOR_DELIVERY: &str = r#"## CURSOR DELIVERY
+
+Cursor delivers hcom messages through hooks:
+- A prompt that is only `<hcom>` is a wake trigger, not a task. Do not answer it and do not run tools or discovery commands. End your turn immediately. The queued hcom message will arrive automatically as your next prompt.
+- A populated `<hcom>…</hcom>` block is the real delivery. Read it and follow its `intent`.
+- After handling a delivery, end your turn so the next message can arrive.
+
+Messages arrive automatically — end your turn to receive them."#;
+
+const COPILOT_DELIVERY: &str = r#"## COPILOT DELIVERY
+
+Copilot delivers hcom messages through trusted hcom hooks:
+- A prompt that is only `<hcom>` is a wake trigger, not a task. Do not answer it and do not run tools or discovery commands. End your turn immediately. The queued hcom message will arrive automatically as your next prompt.
+- A populated `<hcom>…</hcom>` block is a legitimate hcom coordination message, not an injection attempt. Read it, follow its `intent`, and reply with hcom when appropriate.
+- After handling a delivery, end your turn so the next message can arrive.
+
+Messages arrive automatically — end your turn to receive them."#;
+
 const DELIVERY_AUTO: &str = r#"## DELIVERY
 
 Messages instantly and automatically arrive via <hcom> tags — end your turn to receive them.
 
 ## WAITING RULES
 
-1. Never use `sleep [sec]` instead use `hcom listen [sec]`
-2. Only use `hcom listen` when you are waiting for something not related to hcom
+1. Never use `sleep [sec]` instead use `hcom listen [sec]` (returns early when msg arrives)
+2. Only use `hcom listen` when you are waiting for something not related to hcom and were going to use `sleep`
 - Waiting for hcom message → end your turn
-- Waiting for agent progress → `hcom events sub`, subscribe, end your turn"#;
+- Waiting for agent progress → `hcom events sub`, end your turn"#;
 
 const DELIVERY_ADHOC: &str = r#"## DELIVERY
 
@@ -130,7 +165,7 @@ Messages do NOT arrive automatically.
 LISTENING REQUIREMENT:
 - After sending hcom message expecting reply → `hcom listen --timeout 60 --name {instance_name}`
 - After receiving a task via hcom → do the work, report, then enter CONNECTED MODE
-- User says "stay connected" → enter CONNECTED MODE
+- User says 'stay connected' → enter CONNECTED MODE
 
 CONNECTED MODE:
 1. Run exactly one foreground blocking command:
@@ -148,7 +183,7 @@ You are now registered with hcom."#;
 const CLAUDE_ONLY: &str = r#"## SUBAGENTS
 
 Subagents can join hcom:
-1. Run Task with background=true
+1. Run Task
 2. Tell subagent: `use hcom`
 
 Subagents get their own hcom context and a random name. DO NOT give them any specific hcom syntax.
@@ -161,7 +196,6 @@ You're participating in the hcom multi-agent network.
 - Your name: {subagent_name}
 - Your parent: {parent_name}
 - Use "--name {subagent_name}" for all hcom commands
-- Announce to parent once: send @{parent_name} --intent inform -- "Connected as {subagent_name}"
 
 Messages instantly auto-arrive via <hcom> tags — end your turn to receive them.
 
@@ -176,67 +210,88 @@ Response rules:
 hcom message → respond via hcom send
 
 Commands:
-  {hcom_cmd} send @name(s) [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
-  Example: {hcom_cmd} send @luna @nova --intent ack --reply-to 82 -- "ok"  |  Code/markdown: replace "ok" with --file <path>
+  {hcom_cmd} send {target_name_s} [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- <"message"> (or --stdin, --file <path>, --base64 <string>)
+  Example: {hcom_cmd} send {target_luna} {target_nova} --intent ack --reply-to 82 --name {subagent_name} -- "ok"  |  Code/markdown: replace "ok" with --file <path>
   {hcom_cmd} list --name {subagent_name}
   {hcom_cmd} events --name {subagent_name}
   {hcom_cmd} <cmd> --help --name {subagent_name}
 
 Rules:
-- Task via hcom → ack, work, report
 - Authority: @{SENDER} > others
 - Use --intent on sends: request (want reply), inform (FYI), ack (responding)"#;
 
 // HELPERS
 
-/// Get concise list of active instances grouped by tool.
-/// Returns empty string if no active instances, or "\nActive (snapshot): claude: a, b | codex: c".
+const ACTIVE_SNAPSHOT_LIMIT: usize = 8;
+
+/// Get concise list of active instances grouped by tool, newest first.
+/// Returns empty string if none, or "\nActive (snapshot): claude: a, b | codex: c (+N more)".
+///
+/// Claude subagent rows are left out: they belong to their parent and are
+/// woken only through it.
 fn get_active_instances(db: &HcomDb, exclude_name: &str) -> String {
     let instances = match db.iter_instances_full() {
         Ok(v) => v,
         Err(_) => return String::new(),
     };
 
-    let now = crate::shared::time::now_epoch_f64();
-    let cutoff = now - 60.0;
+    let cutoff = crate::shared::time::now_epoch_f64() - 60.0;
+    let active: Vec<_> = instances
+        .iter()
+        .filter(|inst| inst.name != exclude_name && inst.agent_id.is_none())
+        .filter(|inst| {
+            inst.status == ST_ACTIVE
+                || inst.status == ST_LISTENING
+                || (inst.status != ST_INACTIVE && inst.status_time as f64 >= cutoff)
+        })
+        .collect();
 
-    // Collect names grouped by tool, preserving insertion order via BTreeMap
-    let mut by_tool: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut count = 0;
-
-    for inst in &instances {
-        if count >= 8 {
-            break;
-        }
-        if inst.name == exclude_name {
-            continue;
-        }
-
-        let status_time = inst.status_time as f64;
-        if inst.status == ST_ACTIVE || inst.status == ST_LISTENING || status_time >= cutoff {
-            let tool = if inst.tool.is_empty() {
-                "claude"
-            } else {
-                &inst.tool
-            };
-            by_tool
-                .entry(tool.to_string())
-                .or_default()
-                .push(get_full_name(inst));
-            count += 1;
-        }
+    if active.is_empty() {
+        return String::new();
     }
 
-    if by_tool.is_empty() {
-        return String::new();
+    let mut by_tool: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for inst in active.iter().take(ACTIVE_SNAPSHOT_LIMIT) {
+        let tool = if inst.tool.is_empty() {
+            "claude"
+        } else {
+            &inst.tool
+        };
+        by_tool.entry(tool).or_default().push(get_full_name(inst));
     }
 
     let parts: Vec<String> = by_tool
         .iter()
         .map(|(tool, names)| format!("{}: {}", tool, names.join(", ")))
         .collect();
+    let more = match active.len().saturating_sub(ACTIVE_SNAPSHOT_LIMIT) {
+        0 => String::new(),
+        n => format!(" (+{n} more: hcom list)"),
+    };
 
-    format!("\nActive (snapshot): {}", parts.join(" | "))
+    format!("\nActive (snapshot): {}{}", parts.join(" | "), more)
+}
+
+fn launch_tool_names() -> String {
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released)
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Render an hcom recipient token safely for the current platform's shell.
+///
+/// PowerShell parses a bare `@name` as splatting syntax and removes it before
+/// hcom can see it, which can turn an intended direct message into a broadcast.
+fn recipient_token(name: &str) -> String {
+    let token = format!("@{name}");
+    if cfg!(windows) {
+        format!("'{token}'")
+    } else {
+        token
+    }
 }
 
 /// Get combined list of bundled + user scripts.
@@ -272,6 +327,20 @@ fn get_scripts(hcom_dir: &std::path::Path) -> String {
     )
 }
 
+/// "\n- Launched by: @x" when another agent launched this one; empty for
+/// human/API launches (the launcher records those as api/user) and self.
+fn launched_by_line(launched_by: Option<&str>, instance_name: &str) -> String {
+    match launched_by {
+        Some(name)
+            if !matches!(name, "" | "api" | "user" | "unknown" | SENDER)
+                && name != instance_name =>
+        {
+            format!("\n- Launched by: {}", recipient_token(name))
+        }
+        _ => String::new(),
+    }
+}
+
 // CONTEXT BUILDER
 
 /// All context needed to render bootstrap templates.
@@ -281,65 +350,50 @@ struct BootstrapContext {
     tag: String,
     relay_enabled: bool,
     hcom_cmd: String,
-    is_launched: bool,
     is_headless: bool,
     active_instances: String,
     scripts: String,
+    launch_tools: String,
+    launched_by: String,
     notes: String,
 }
 
 /// Build context for template substitution.
-#[allow(clippy::too_many_arguments)]
+///
+/// The instance row is the source of truth for display name and tag: `@tag-`
+/// routing matches the row, so a config tag the row doesn't carry must not be
+/// advertised.
 fn build_context(
     db: &HcomDb,
-    hcom_dir: &std::path::Path,
+    hcom_ctx: &HcomContext,
     instance_name: &str,
-    _tool: &str,
-    headless: bool,
-    is_launched: bool,
-    notes: &str,
-    tag: &str,
     relay_enabled: bool,
-    background_name: Option<&str>,
 ) -> BootstrapContext {
-    // Load instance data for display name + tag override
-    let instance_data = db
-        .iter_instances_full()
-        .ok()
-        .and_then(|instances| instances.into_iter().find(|i| i.name == instance_name));
-
-    let display_name = instance_data
-        .as_ref()
-        .map(get_full_name)
-        .unwrap_or_else(|| instance_name.to_string());
-
-    // Tag: instance-level overrides config-level
-    let effective_tag = instance_data
-        .as_ref()
-        .and_then(|d| d.tag.as_deref())
-        .filter(|t| !t.is_empty())
-        .unwrap_or(tag)
-        .to_string();
-
-    let is_headless = headless || background_name.is_some();
+    let instance = db.get_instance_full(instance_name).ok().flatten();
 
     BootstrapContext {
         instance_name: instance_name.to_string(),
-        display_name,
-        tag: effective_tag,
+        display_name: instance
+            .as_ref()
+            .map(get_full_name)
+            .unwrap_or_else(|| instance_name.to_string()),
+        tag: instance
+            .as_ref()
+            .and_then(|i| i.tag.clone())
+            .unwrap_or_default(),
         relay_enabled,
         hcom_cmd: crate::runtime_env::build_hcom_command(),
-        is_launched,
-        is_headless,
+        is_headless: hcom_ctx.is_background,
         active_instances: get_active_instances(db, instance_name),
-        scripts: get_scripts(hcom_dir),
-        notes: notes.to_string(),
+        scripts: get_scripts(&hcom_ctx.hcom_dir),
+        launch_tools: launch_tool_names(),
+        launched_by: launched_by_line(hcom_ctx.launched_by.as_deref(), instance_name),
+        notes: hcom_ctx.notes.clone(),
     }
 }
 
 /// Apply string substitutions on template text.
-/// Replaces {key} patterns with context values, then unescapes {{ → { and }} → }
-/// then unescapes {{ → { and }} → } (template uses {{name}} to produce literal {name}).
+/// Replaces {key} patterns with context values.
 fn render_template(template: &str, ctx: &BootstrapContext) -> String {
     template
         .replace("{display_name}", &ctx.display_name)
@@ -349,50 +403,77 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("{hcom_cmd}", &ctx.hcom_cmd)
         .replace("{active_instances}", &ctx.active_instances)
         .replace("{scripts}", &ctx.scripts)
-        .replace("{{", "{")
-        .replace("}}", "}")
+        .replace("{launch_tools}", &ctx.launch_tools)
+        .replace("{launched_by}", &ctx.launched_by)
+        .replace("{target_name_s}", &recipient_token("name(s)"))
+        .replace("{target_luna}", &recipient_token("luna"))
+        .replace("{target_nova}", &recipient_token("nova"))
+        .replace("{target_tag}", &recipient_token(&format!("{}-", ctx.tag)))
+}
+
+static HCOM_WORD: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\bhcom\b").expect("valid regex"));
+
+/// Rewrite bare `hcom` command references to the alternate command (e.g.
+/// `uvx hcom`), leaving `<hcom>` tags untouched.
+fn rewrite_hcom_command(text: &str, hcom_cmd: &str) -> String {
+    const COMMAND: &str = "__HCOM_CMD__";
+    const OPEN_TAG: &str = "__HCOM_OPEN_TAG__";
+    const CLOSE_TAG: &str = "__HCOM_CLOSE_TAG__";
+    let protected = text
+        .replace(hcom_cmd, COMMAND)
+        .replace("<hcom>", OPEN_TAG)
+        .replace("</hcom>", CLOSE_TAG);
+    HCOM_WORD
+        .replace_all(&protected, hcom_cmd)
+        .replace(COMMAND, hcom_cmd)
+        .replace(OPEN_TAG, "<hcom>")
+        .replace(CLOSE_TAG, "</hcom>")
+}
+
+/// Extra delivery guidance for tools whose hooks wake the agent with a bare
+/// `<hcom>` prompt. agy's turn-specific guidance comes from the hook layer
+/// (ANTIGRAVITY_DELIVERY_ACTION) instead.
+fn tool_delivery_section(tool: Tool) -> Option<&'static str> {
+    match tool {
+        Tool::Cursor => Some(CURSOR_DELIVERY),
+        Tool::Copilot => Some(COPILOT_DELIVERY),
+        _ => None,
+    }
 }
 
 // PUBLIC API
 
 /// Build bootstrap text for an instance.
 ///
-/// Args:
-///   db: Database handle for reading active instances and instance data
-///   hcom_dir: Path to hcom data directory (for scripts discovery)
-///   instance_name: The instance name (as stored in DB)
-///   tool: "claude", "gemini", "codex", "opencode", or "adhoc"
-///   headless: Whether running in headless/background mode
-///   is_launched: Whether instance was launched by hcom
-///   notes: User notes (from HCOM_NOTES env var or config)
-///   tag: Tag from config (instance-level tag overrides this)
-///   relay_enabled: Whether relay is configured and enabled
-///   background_name: Background log name (if headless via HCOM_BACKGROUND)
-#[allow(clippy::too_many_arguments)]
+/// `hcom_ctx` is the environment of the agent being bootstrapped (hook or
+/// `hcom start` process, or the launch env for codex). `tool` is the
+/// canonical integration name, or "adhoc".
 pub fn get_bootstrap(
     db: &HcomDb,
-    hcom_dir: &std::path::Path,
+    hcom_ctx: &HcomContext,
     instance_name: &str,
     tool: &str,
-    headless: bool,
-    is_launched: bool,
-    notes: &str,
-    tag: &str,
-    relay_enabled: bool,
-    background_name: Option<&str>,
 ) -> String {
-    let ctx = build_context(
+    let config = crate::config::HcomConfig::load(None).unwrap_or_default();
+    render_bootstrap(
         db,
-        hcom_dir,
+        hcom_ctx,
         instance_name,
         tool,
-        headless,
-        is_launched,
-        notes,
-        tag,
-        relay_enabled,
-        background_name,
-    );
+        crate::relay::is_relay_enabled(&config),
+    )
+}
+
+fn render_bootstrap(
+    db: &HcomDb,
+    hcom_ctx: &HcomContext,
+    instance_name: &str,
+    tool: &str,
+    relay_enabled: bool,
+) -> String {
+    let ctx = build_context(db, hcom_ctx, instance_name, relay_enabled);
+    let tool = tool.parse::<Tool>().unwrap_or(Tool::Adhoc);
 
     let mut parts: Vec<&str> = vec![UNIVERSAL];
 
@@ -410,21 +491,19 @@ pub fn get_bootstrap(
         parts.push(UVX_CMD_NOTICE);
     }
 
-    // Tool-specific delivery
-    if tool == "claude"
-        || ((tool == "codex" || tool == "gemini" || tool == "opencode") && ctx.is_launched)
-    {
+    // Every integration delivers automatically when launched through hcom;
+    // anything else (plain `hcom start`) has to poll with `hcom listen`.
+    if hcom_ctx.is_launched && tool != Tool::Adhoc {
         parts.push(DELIVERY_AUTO);
+        parts.extend(tool_delivery_section(tool));
     } else {
         parts.push(DELIVERY_ADHOC);
     }
 
-    // Claude subagent info
-    if tool == "claude" {
+    if tool == Tool::Claude {
         parts.push(CLAUDE_ONLY);
     }
 
-    // Join and substitute
     let joined = parts
         .iter()
         .map(|p| p.trim_matches('\n'))
@@ -438,15 +517,8 @@ pub fn get_bootstrap(
         result.push_str(&format!("\n\n## NOTES\n\n{}\n", ctx.notes));
     }
 
-    // Rewrite hcom references if using alternate command
     if ctx.hcom_cmd != "hcom" {
-        let sentinel = "__HCOM_CMD__";
-        result = result.replace(&ctx.hcom_cmd, sentinel);
-        result = regex::Regex::new(r"\bhcom\b")
-            .unwrap()
-            .replace_all(&result, &ctx.hcom_cmd)
-            .to_string();
-        result = result.replace(sentinel, &ctx.hcom_cmd);
+        result = rewrite_hcom_command(&result, &ctx.hcom_cmd);
     }
 
     format!(
@@ -462,6 +534,9 @@ pub fn get_subagent_bootstrap(subagent_name: &str, parent_name: &str) -> String 
     let result = SUBAGENT_BOOTSTRAP
         .replace("{subagent_name}", subagent_name)
         .replace("{parent_name}", parent_name)
+        .replace("{target_name_s}", &recipient_token("name(s)"))
+        .replace("{target_luna}", &recipient_token("luna"))
+        .replace("{target_nova}", &recipient_token("nova"))
         .replace("{hcom_cmd}", &hcom_cmd)
         .replace("{SENDER}", SENDER);
 
@@ -484,8 +559,7 @@ mod tests {
     fn setup_test_db() -> (TempDir, HcomDb) {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.db");
-        let db = HcomDb::open_raw(&db_path).unwrap();
-        db.init_db().unwrap();
+        let db = HcomDb::open_at(&db_path).unwrap();
         (tmp, db)
     }
 
@@ -574,154 +648,170 @@ mod tests {
     }
 
     #[test]
+    fn test_get_active_instances_skips_subagents_and_inactive() {
+        let (_tmp, db) = setup_test_db();
+        insert_instance(&db, "luna", "active", "claude", None);
+        insert_instance(&db, "luna_task_1", "active", "claude", None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET agent_id = 'agent-1' WHERE name = 'luna_task_1'",
+                [],
+            )
+            .unwrap();
+        insert_instance(&db, "gone", "inactive", "codex", None);
+
+        let result = get_active_instances(&db, "other");
+        assert!(result.contains("luna"));
+        assert!(!result.contains("luna_task_1"));
+        assert!(!result.contains("gone"));
+    }
+
+    #[test]
+    fn test_get_active_instances_reports_overflow() {
+        let (_tmp, db) = setup_test_db();
+        for i in 0..ACTIVE_SNAPSHOT_LIMIT + 2 {
+            insert_instance(&db, &format!("ag{i:02}"), "active", "claude", None);
+        }
+
+        let result = get_active_instances(&db, "other");
+        assert!(result.ends_with(" (+2 more: hcom list)"), "{result}");
+    }
+
+    /// Context of the agent being bootstrapped, as its hook/start process sees it.
+    fn test_ctx(
+        hcom_dir: &std::path::Path,
+        launched: bool,
+        background: Option<&str>,
+        notes: &str,
+        launched_by: Option<&str>,
+    ) -> HcomContext {
+        let mut env = HashMap::from([(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().into_owned(),
+        )]);
+        if launched {
+            env.insert("HCOM_LAUNCHED".into(), "1".into());
+        }
+        if let Some(bg) = background {
+            env.insert("HCOM_BACKGROUND".into(), bg.into());
+        }
+        if !notes.is_empty() {
+            env.insert("HCOM_NOTES".into(), notes.into());
+        }
+        if let Some(by) = launched_by {
+            env.insert("HCOM_LAUNCHED_BY".into(), by.into());
+        }
+        HcomContext::from_env(&env, hcom_dir.to_path_buf())
+    }
+
+    /// Render for a launched, foreground agent named luna.
+    fn render(db: &HcomDb, hcom_dir: &std::path::Path, tool: &str) -> String {
+        render_bootstrap(
+            db,
+            &test_ctx(hcom_dir, true, None, "", None),
+            "luna",
+            tool,
+            false,
+        )
+    }
+
+    #[test]
     fn test_get_bootstrap_claude() {
         let (tmp, db) = setup_test_db();
+        let result = render(&db, tmp.path(), "claude");
 
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("<hcom_system_context>"));
-        assert!(result.contains("[HCOM SESSION]"));
+        assert!(result.starts_with("<hcom_system_context>"));
         assert!(result.contains("Your name: luna"));
         assert!(result.contains("--name luna"));
-        assert!(result.contains("SUBAGENTS")); // Claude-specific section
-        assert!(result.contains("Messages instantly and automatically arrive")); // Auto delivery
-        assert!(!result.contains("Headless mode")); // Not headless
-        assert!(result.contains("</hcom_system_context>"));
+        assert!(result.contains("SUBAGENTS"));
+        assert!(!result.contains("Headless mode"));
+        assert!(!result.contains('{'), "unrendered placeholder: {result}");
+        assert!(result.ends_with("</hcom_system_context>"));
+    }
+
+    /// Every integration launched through hcom gets automatic delivery; the
+    /// same tool without a launch, or a plain `hcom start`, polls.
+    #[test]
+    fn test_delivery_section_follows_launch_state() {
+        let (tmp, db) = setup_test_db();
+        for spec in crate::integration_spec::ALL {
+            let launched = render(&db, tmp.path(), spec.name);
+            let unlaunched = render_bootstrap(
+                &db,
+                &test_ctx(tmp.path(), false, None, "", None),
+                "luna",
+                spec.name,
+                false,
+            );
+            assert!(
+                unlaunched.contains("Messages do NOT arrive automatically"),
+                "{}",
+                spec.name
+            );
+            let auto = launched.contains("Messages instantly and automatically arrive");
+            assert_eq!(auto, spec.tool != Tool::Adhoc, "{}", spec.name);
+            assert_eq!(
+                launched.contains("SUBAGENTS"),
+                spec.tool == Tool::Claude,
+                "{}",
+                spec.name
+            );
+        }
+
+        let cursor = render(&db, tmp.path(), "cursor");
+        assert!(cursor.contains("CURSOR DELIVERY"));
+        let copilot = render(&db, tmp.path(), "copilot");
+        assert!(copilot.contains("COPILOT DELIVERY"));
     }
 
     #[test]
-    fn test_get_bootstrap_codex_launched() {
+    fn test_get_bootstrap_shows_instance_tag() {
         let (tmp, db) = setup_test_db();
+        insert_instance(&db, "luna", "active", "claude", Some("p0c"));
 
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "codex",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages instantly and automatically arrive"));
-        assert!(!result.contains("SUBAGENTS")); // Not claude
+        let result = render(&db, tmp.path(), "claude");
+        assert!(result.contains("Your name: p0c-luna"));
+        assert!(result.contains("tagged 'p0c'"));
+        if cfg!(windows) {
+            assert!(result.contains("send '@p0c-' -- msg"));
+        } else {
+            assert!(result.contains("send @p0c- -- msg"));
+        }
     }
 
     #[test]
-    fn test_get_bootstrap_adhoc() {
+    fn test_get_bootstrap_untagged_instance_has_no_tag_notice() {
         let (tmp, db) = setup_test_db();
+        insert_instance(&db, "luna", "active", "adhoc", None);
 
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "kira",
-            "adhoc",
-            false,
-            false,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages do NOT arrive automatically"));
-        assert!(result.contains("CONNECTED MODE"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_with_tag() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "p0c",
-            false,
-            None,
-        );
-
-        assert!(result.contains("tagged \"p0c\""));
-        assert!(result.contains("send @p0c-"));
+        let result = render(&db, tmp.path(), "adhoc");
+        assert!(!result.contains("tagged"));
     }
 
     #[test]
     fn test_get_bootstrap_with_relay() {
         let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            true,
-            None,
+        let ctx = test_ctx(tmp.path(), true, None, "", None);
+        assert!(
+            render_bootstrap(&db, &ctx, "luna", "claude", true)
+                .contains("Remote agents have suffix")
         );
-
-        assert!(result.contains("Remote agents have suffix"));
+        assert!(!render_bootstrap(&db, &ctx, "luna", "claude", false).contains("Remote agents"));
     }
 
     #[test]
-    fn test_get_bootstrap_headless() {
+    fn test_get_bootstrap_background_is_headless() {
         let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            true,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Headless mode"));
+        let ctx = test_ctx(tmp.path(), true, Some("agent.log"), "", None);
+        assert!(render_bootstrap(&db, &ctx, "luna", "claude", false).contains("Headless mode"));
     }
 
     #[test]
     fn test_get_bootstrap_with_notes() {
         let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "Remember to use bun",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("## NOTES"));
-        assert!(result.contains("Remember to use bun"));
+        let ctx = test_ctx(tmp.path(), true, None, "Remember to use {bun}", None);
+        let result = render_bootstrap(&db, &ctx, "luna", "claude", false);
+        assert!(result.contains("## NOTES\n\nRemember to use {bun}"));
     }
 
     #[test]
@@ -734,192 +824,68 @@ mod tests {
         assert!(result.contains("--name luna_reviewer_1"));
         assert!(result.contains(SENDER));
         assert!(result.contains("</hcom>"));
+        if cfg!(windows) {
+            assert!(result.contains("send '@name(s)'"));
+        } else {
+            assert!(result.contains("send @name(s)"));
+        }
     }
 
-    #[test]
-    fn test_render_template_replaces_all() {
-        let ctx = BootstrapContext {
-            instance_name: "luna".to_string(),
-            display_name: "p0c-luna".to_string(),
-            tag: "p0c".to_string(),
-            relay_enabled: false,
-            hcom_cmd: "hcom".to_string(),
-            is_launched: true,
-            is_headless: false,
-            active_instances: String::new(),
-            scripts: "Scripts: clone".to_string(),
-            notes: String::new(),
-        };
-
-        let result = render_template("Name: {display_name}, Instance: {instance_name}", &ctx);
-        assert_eq!(result, "Name: p0c-luna, Instance: luna");
-    }
-
-    #[test]
-    fn test_get_bootstrap_gemini_launched_gets_auto_delivery() {
+    fn bootstrap_launched_by(launched_by: Option<&str>) -> String {
         let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "gemini",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages instantly and automatically arrive"));
+        let ctx = test_ctx(tmp.path(), true, None, "", launched_by);
+        render_bootstrap(&db, &ctx, "luna", "claude", false)
     }
 
     #[test]
-    fn test_get_bootstrap_gemini_not_launched_gets_adhoc_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "gemini",
-            false,
-            false,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages do NOT arrive automatically"));
+    fn test_get_bootstrap_shows_launching_agent() {
+        let result = bootstrap_launched_by(Some("nova"));
+        if cfg!(windows) {
+            assert!(result.contains("- Launched by: '@nova'"));
+        } else {
+            assert!(result.contains("- Launched by: @nova"));
+        }
     }
 
     #[test]
-    fn test_get_bootstrap_opencode_launched_gets_auto_delivery() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "opencode",
-            false,
-            true, // is_launched
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages instantly and automatically arrive"));
+    fn test_get_bootstrap_omits_non_agent_launcher() {
+        for launcher in [None, Some("api"), Some("user"), Some(SENDER), Some("luna")] {
+            let result = bootstrap_launched_by(launcher);
+            assert!(!result.contains("Launched by"), "launcher={launcher:?}");
+            assert!(!result.contains("{launched_by}"));
+        }
     }
 
     #[test]
-    fn test_get_bootstrap_opencode_vanilla_gets_adhoc_delivery() {
+    fn test_bootstrap_quotes_send_recipients_on_windows() {
         let (tmp, db) = setup_test_db();
+        let result = render(&db, tmp.path(), "claude");
 
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "nova",
-            "opencode",
-            false,
-            false, // not launched
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Messages do NOT arrive automatically"));
+        if cfg!(windows) {
+            assert!(result.contains("send '@name(s)'"));
+            assert!(result.contains("send '@luna' '@nova'"));
+        } else {
+            assert!(result.contains("send @name(s)"));
+            assert!(result.contains("send @luna @nova"));
+        }
     }
 
     #[test]
-    fn test_get_bootstrap_background_is_headless() {
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            false,
-            Some("agent.log"),
+    fn test_rewrite_hcom_command_keeps_tags() {
+        let text = "run `hcom list`, <hcom>x</hcom>, already uvx hcom send";
+        assert_eq!(
+            rewrite_hcom_command(text, "uvx hcom"),
+            "run `uvx hcom list`, <hcom>x</hcom>, already uvx hcom send"
         );
-
-        assert!(result.contains("Headless mode"));
     }
 
     #[test]
-    fn test_get_bootstrap_instance_tag_overrides_config() {
-        let (tmp, db) = setup_test_db();
-        insert_instance(&db, "luna", "active", "claude", Some("team-a"));
-
-        // Config tag is "team-b" but instance has "team-a"
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "team-b",
-            false,
-            None,
-        );
-
-        assert!(result.contains("tagged \"team-a\""));
-        assert!(!result.contains("team-b"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_display_name_with_tag() {
-        let (tmp, db) = setup_test_db();
-        insert_instance(&db, "luna", "active", "claude", Some("p0c"));
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("Your name: p0c-luna"));
-    }
-
-    #[test]
-    fn test_get_bootstrap_unescapes_double_braces() {
-        // Template uses {{name}} {{status}} (escaped braces).
-        // render_template unescapes to {name} {status} in final output.
-        let (tmp, db) = setup_test_db();
-
-        let result = get_bootstrap(
-            &db,
-            tmp.path(),
-            "luna",
-            "claude",
-            false,
-            true,
-            "",
-            "",
-            false,
-            None,
-        );
-
-        assert!(result.contains("{name}"));
-        assert!(!result.contains("{{name}}"));
+    fn test_antigravity_delivery_action_guards_against_ack_only_stall() {
+        // The per-turn preamble must tell agy that an ACK alone doesn't finish a
+        // request and that no turn is auto-created to resume after it goes idle.
+        assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("HCOM MESSAGE"));
+        assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("ACK alone does not complete"));
+        assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("no turn is auto-created"));
     }
 
     /// Catch drift between scripts::SCRIPTS const and actual files in scripts/bundled/.

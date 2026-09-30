@@ -1,17 +1,15 @@
 //! TCP notification server for instant wake on message arrival.
 //!
 //! Used by the delivery loop to block efficiently instead of busy-polling.
-//! When a message is sent (`hcom send`), the lifecycle wake helpers connect
-//! briefly to each instance's notify port to wake its delivery thread.
+//! When a message is sent (`hcom send`), the wake helpers in
+//! `crate::notify::wake` connect briefly to each instance's notify port to
+//! wake its delivery thread.
 //!
 //! TCP chosen for clean poll/select integration across process boundaries.
 
 use anyhow::{Context, Result};
 use std::net::TcpListener;
-use std::os::fd::{AsRawFd, BorrowedFd};
 use std::time::Duration;
-
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 /// TCP notification server for wake-ups
 pub struct NotifyServer {
@@ -40,19 +38,12 @@ impl NotifyServer {
     ///
     /// Returns true if notified (connection received), false on timeout
     pub fn wait(&self, timeout: Duration) -> bool {
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        let poll_timeout = PollTimeout::try_from(timeout_ms).unwrap_or(PollTimeout::MAX);
-
-        let fd = unsafe { BorrowedFd::borrow_raw(self.listener.as_raw_fd()) };
-        let mut poll_fds = [PollFd::new(fd, PollFlags::POLLIN)];
-
-        match poll(&mut poll_fds, poll_timeout) {
-            Ok(n) if n > 0 => {
-                // Drain all pending notifications
-                self.drain();
-                true
-            }
-            _ => false,
+        if crate::sys::net::wait_readable(&self.listener, timeout) {
+            // Drain all pending notifications
+            self.drain();
+            true
+        } else {
+            false
         }
     }
 

@@ -5,14 +5,16 @@ pub mod constants;
 pub mod context;
 pub mod errors;
 pub mod identity;
+pub mod nested;
 pub mod platform;
+pub mod suggest;
 pub mod terminal_presets;
 pub mod time;
+pub mod tool_detection;
 
 // Re-export key types at module level for convenience.
 pub use crate::tool::Tool;
 pub use constants::{
-    BIND_MARKER_RE,
     MAX_MESSAGE_SIZE,
     MAX_MESSAGES_PER_DELIVERY,
     // Patterns
@@ -27,12 +29,15 @@ pub use constants::{
     ST_LAUNCHING,
     ST_LISTENING,
     SYSTEM_SENDER,
+    TitleMode,
+    VALID_TITLE_MODES,
     // Functions
     extract_mentions,
+    format_pane_title,
+    format_pane_title_combined,
     status_bg,
     status_fg,
     status_icon,
-    thread_membership_sub_id,
 };
 pub use context::HcomContext;
 pub use errors::{CLIError, HcomError, HookError};

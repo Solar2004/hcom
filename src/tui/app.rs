@@ -82,10 +82,11 @@ impl App {
 
     /// Active search query: overlay live input or persisted filter.
     pub fn active_search_query(&self) -> Option<&str> {
-        if let Some(ref overlay) = self.ui.overlay {
-            if overlay.kind == OverlayKind::Search && !overlay.input.is_empty() {
-                return Some(overlay.input.as_str());
-            }
+        if let Some(ref overlay) = self.ui.overlay
+            && overlay.kind == OverlayKind::Search
+            && !overlay.input.is_empty()
+        {
+            return Some(overlay.input.as_str());
         }
         self.ui.search_filter.as_deref()
     }
@@ -135,10 +136,10 @@ impl App {
             }
             offset += 1;
             if self.ui.remote_expanded {
-                if let Some(idx) = self.ui.cursor.checked_sub(offset) {
-                    if idx < self.data.remote_agents.len() {
-                        return CursorTarget::RemoteAgent(idx);
-                    }
+                if let Some(idx) = self.ui.cursor.checked_sub(offset)
+                    && idx < self.data.remote_agents.len()
+                {
+                    return CursorTarget::RemoteAgent(idx);
                 }
                 offset += self.data.remote_agents.len();
             }
@@ -150,10 +151,10 @@ impl App {
             }
             offset += 1;
             if self.ui.stopped_expanded {
-                if let Some(idx) = self.ui.cursor.checked_sub(offset) {
-                    if idx < self.data.stopped_agents.len() {
-                        return CursorTarget::StoppedAgent(idx);
-                    }
+                if let Some(idx) = self.ui.cursor.checked_sub(offset)
+                    && idx < self.data.stopped_agents.len()
+                {
+                    return CursorTarget::StoppedAgent(idx);
                 }
                 offset += self.data.stopped_agents.len();
             }
@@ -164,12 +165,11 @@ impl App {
                 return CursorTarget::OrphanHeader;
             }
             offset += 1;
-            if self.ui.orphans_expanded {
-                if let Some(idx) = self.ui.cursor.checked_sub(offset) {
-                    if idx < self.data.orphans.len() {
-                        return CursorTarget::Orphan(idx);
-                    }
-                }
+            if self.ui.orphans_expanded
+                && let Some(idx) = self.ui.cursor.checked_sub(offset)
+                && idx < self.data.orphans.len()
+            {
+                return CursorTarget::Orphan(idx);
             }
         }
 
@@ -224,13 +224,17 @@ impl App {
 
             if dirty && resize_cooldown == 0 {
                 if is_inline {
-                    crossterm::execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
+                    // Must run BEFORE the synchronized-update frame: Terminal::clear()
+                    // queries the cursor position (ESC[6n), and wezterm holds every
+                    // action — replies included — until the frame ends, so a query
+                    // inside the frame deadlocks until crossterm's 2s timeout errors out.
                     if self.ui.needs_clear_replay {
                         self.ui.needs_clear_replay = false;
                         super::clear_for_resize(viewport_height)?;
                         // We externally cleared terminal content; force a full viewport repaint.
                         terminal.clear()?;
                     }
+                    crossterm::execute!(std::io::stdout(), BeginSynchronizedUpdate)?;
                     if self.ui.inline_filter_changed {
                         self.ui.inline_filter_changed = false;
                         self.update_search();
@@ -417,6 +421,7 @@ mod tests {
                     options_cursor: None,
                     tag: String::new(),
                     headless: false,
+                    headless_pty: false,
                     terminal: 0,
                     terminal_presets: vec!["default".into()],
                     editing: None,

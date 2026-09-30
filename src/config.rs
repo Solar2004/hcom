@@ -64,6 +64,26 @@ impl Config {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let (hcom_dir, _) = paths::resolve_hcom_dir_from_env(&env_map, &cwd);
 
+        // Unit tests must never inherit a real hcom data directory. Raw path
+        // semantics are tested through `resolve_hcom_dir_from_env` directly, so
+        // global Config accepts only roots a test fixture explicitly registered
+        // as disposable — not merely "it lives under $TMPDIR", since a real DB
+        // can sit under the temp tree too. Anything else redirects to a
+        // process-local throwaway. Production builds do not compile this branch.
+        //
+        // Redirect rather than panic on an unregistered dir: countless tests
+        // read Config with no HCOM_DIR set and no isolation installed, and must
+        // land on a safe throwaway instead of aborting. Every explicit consumer
+        // registers its root, so the fallback is a backstop, never the norm.
+        #[cfg(test)]
+        let hcom_dir = {
+            if paths::test_roots::is_registered(&hcom_dir) {
+                hcom_dir
+            } else {
+                test_default_hcom_dir()
+            }
+        };
+
         let instance_name = env::var("HCOM_INSTANCE_NAME")
             .ok()
             .filter(|s| !s.is_empty());
@@ -76,6 +96,27 @@ impl Config {
             process_id,
         }
     }
+}
+
+/// Process-local fallback for unit tests that do not install an isolated
+/// `HCOM_DIR`. Reusing one directory per test binary preserves Config's normal
+/// process-wide semantics. Backed by a retained `TempDir` so it gets a unique,
+/// uncontended name and is registered as a disposable root for the redirect.
+#[cfg(test)]
+fn test_default_hcom_dir() -> PathBuf {
+    use std::sync::OnceLock;
+
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::Builder::new()
+            .prefix("hcom-test-default-")
+            .tempdir()
+            .expect("create test-default hcom dir");
+        paths::test_roots::register(dir.path());
+        dir
+    })
+    .path()
+    .to_path_buf()
 }
 
 /// Bidirectional mapping: HcomConfig field name <-> TOML dotted path.
@@ -93,6 +134,13 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("codex_sandbox_mode", "launch.codex.sandbox_mode"),
     ("codex_system_prompt", "launch.codex.system_prompt"),
     ("opencode_args", "launch.opencode.args"),
+    ("kilo_args", "launch.kilo.args"),
+    ("pi_args", "launch.pi.args"),
+    ("omp_args", "launch.omp.args"),
+    ("cursor_args", "launch.cursor.args"),
+    ("kimi_args", "launch.kimi.args"),
+    ("copilot_args", "launch.copilot.args"),
+    ("grok_args", "launch.grok.args"),
     ("relay", "relay.url"),
     ("relay_id", "relay.id"),
     ("relay_token", "relay.token"),
@@ -101,6 +149,8 @@ const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("timeout", "preferences.timeout"),
     ("auto_approve", "preferences.auto_approve"),
     ("name_export", "preferences.name_export"),
+    ("auto_trust_workspace", "launch.auto_trust_workspace"),
+    ("title_mode", "terminal.title_mode"),
 ];
 
 /// Mapping: HcomConfig field name -> HCOM_* env var key.
@@ -118,6 +168,13 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT"),
     ("codex_system_prompt", "HCOM_CODEX_SYSTEM_PROMPT"),
     ("opencode_args", "HCOM_OPENCODE_ARGS"),
+    ("kilo_args", "HCOM_KILO_ARGS"),
+    ("pi_args", "HCOM_PI_ARGS"),
+    ("omp_args", "HCOM_OMP_ARGS"),
+    ("cursor_args", "HCOM_CURSOR_ARGS"),
+    ("kimi_args", "HCOM_KIMI_ARGS"),
+    ("copilot_args", "HCOM_COPILOT_ARGS"),
+    ("grok_args", "HCOM_GROK_ARGS"),
     ("relay", "HCOM_RELAY"),
     ("relay_id", "HCOM_RELAY_ID"),
     ("relay_token", "HCOM_RELAY_TOKEN"),
@@ -131,6 +188,8 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("auto_approve", "HCOM_AUTO_APPROVE"),
     ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
     ("name_export", "HCOM_NAME_EXPORT"),
+    ("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE"),
+    ("title_mode", "HCOM_TITLE_MODE"),
 ];
 
 /// Relay fields — file-only, no env var override.
@@ -148,7 +207,7 @@ const TERMINAL_DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '&', '\n', '\r']
 use crate::shared::terminal_presets::TERMINAL_PRESETS;
 
 /// Valid codex sandbox modes.
-pub const VALID_SANDBOX_MODES: &[&str] = &["workspace", "untrusted", "danger-full-access", "none"];
+pub const VALID_SANDBOX_MODES: &[&str] = &["workspace", "danger-full-access", "none"];
 
 /// TOML file header comment.
 const TOML_HEADER: &str = "\
@@ -223,6 +282,14 @@ pub struct HcomConfig {
     pub gemini_args: String,
     pub codex_args: String,
     pub opencode_args: String,
+    pub kilo_args: String,
+    pub pi_args: String,
+    /// Oh My Pi specific launch arguments
+    pub omp_args: String,
+    pub cursor_args: String,
+    pub kimi_args: String,
+    pub copilot_args: String,
+    pub grok_args: String,
     pub codex_sandbox_mode: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
@@ -234,6 +301,12 @@ pub struct HcomConfig {
     pub auto_approve: bool,
     pub auto_subscribe: String,
     pub name_export: String,
+    pub auto_trust_workspace: bool,
+    /// Terminal-title behavior: `"combined"` (default) shows
+    /// `{icon} name - {tool's live title}`, `"label"` shows hcom's
+    /// `{icon} name [tool]` only, `"off"` leaves the tool's own title untouched.
+    /// See [`crate::shared::TitleMode`].
+    pub title_mode: String,
 }
 
 impl Default for HcomConfig {
@@ -249,6 +322,13 @@ impl Default for HcomConfig {
             gemini_args: String::new(),
             codex_args: String::new(),
             opencode_args: String::new(),
+            kilo_args: String::new(),
+            pi_args: String::new(),
+            omp_args: String::new(),
+            cursor_args: String::new(),
+            kimi_args: String::new(),
+            copilot_args: String::new(),
+            grok_args: String::new(),
             codex_sandbox_mode: "workspace".to_string(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
@@ -260,6 +340,8 @@ impl Default for HcomConfig {
             auto_approve: true,
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
+            auto_trust_workspace: true,
+            title_mode: "combined".to_string(),
         }
     }
 }
@@ -306,20 +388,33 @@ impl HcomConfig {
             errors.insert("terminal".into(), "terminal cannot be empty".into());
         } else if self.terminal != "default" && self.terminal != "print" && self.terminal != "here"
         {
-            // Check against built-in presets + user-defined TOML presets
-            let known =
-                is_known_terminal_preset(&self.terminal) || is_user_defined_preset(&self.terminal);
-            if !known {
-                // Not a known preset — must be a custom command with {script}
-                if !self.terminal.contains("{script}") {
+            let platform = crate::shared::platform::platform_name();
+            if let Some(error) = user_defined_preset_error(&self.terminal) {
+                errors.insert(
+                    "terminal".into(),
+                    format!("invalid terminal preset '{}': {error}", self.terminal),
+                );
+            } else if is_user_defined_preset(&self.terminal) {
+                // User TOML presets declare no platform and override any built-in
+                // of the same name — exempt from the built-in platform gate.
+            } else if is_known_terminal_preset(&self.terminal) {
+                if !terminal_preset_supported_on(&self.terminal, platform) {
                     errors.insert(
                         "terminal".into(),
                         format!(
-                            "terminal must be 'default', preset name, or custom command with {{script}}, got '{}'",
-                            self.terminal
+                            "terminal preset '{}' is not available on {}",
+                            self.terminal, platform
                         ),
                     );
                 }
+            } else if !self.terminal.contains("{script}") {
+                errors.insert(
+                    "terminal".into(),
+                    format!(
+                        "terminal must be 'default', preset name, or custom command with {{script}}, got '{}'",
+                        self.terminal
+                    ),
+                );
             }
         }
 
@@ -331,20 +426,38 @@ impl HcomConfig {
             );
         }
 
+        if !crate::shared::VALID_TITLE_MODES.contains(&self.title_mode.as_str()) {
+            errors.insert(
+                "title_mode".into(),
+                format!(
+                    "title_mode must be one of: {}. Got '{}'",
+                    crate::shared::VALID_TITLE_MODES.join(", "),
+                    self.title_mode
+                ),
+            );
+        }
+
         // Validate shell-quoted args fields
         for (field, value) in [
             ("claude_args", &self.claude_args),
             ("gemini_args", &self.gemini_args),
             ("codex_args", &self.codex_args),
             ("opencode_args", &self.opencode_args),
+            ("kilo_args", &self.kilo_args),
+            ("pi_args", &self.pi_args),
+            ("omp_args", &self.omp_args),
+            ("cursor_args", &self.cursor_args),
+            ("kimi_args", &self.kimi_args),
+            ("copilot_args", &self.copilot_args),
+            ("grok_args", &self.grok_args),
         ] {
-            if !value.is_empty() {
-                if let Err(e) = shell_words::split(value) {
-                    errors.insert(
-                        field.into(),
-                        format!("{field} contains invalid shell quoting: {e}"),
-                    );
-                }
+            if !value.is_empty()
+                && let Err(e) = shell_words::split(value)
+            {
+                errors.insert(
+                    field.into(),
+                    format!("{field} contains invalid shell quoting: {e}"),
+                );
             }
         }
 
@@ -395,6 +508,13 @@ impl HcomConfig {
             "gemini_args" => Some(self.gemini_args.clone()),
             "codex_args" => Some(self.codex_args.clone()),
             "opencode_args" => Some(self.opencode_args.clone()),
+            "kilo_args" => Some(self.kilo_args.clone()),
+            "pi_args" => Some(self.pi_args.clone()),
+            "omp_args" => Some(self.omp_args.clone()),
+            "cursor_args" => Some(self.cursor_args.clone()),
+            "kimi_args" => Some(self.kimi_args.clone()),
+            "copilot_args" => Some(self.copilot_args.clone()),
+            "grok_args" => Some(self.grok_args.clone()),
             "codex_sandbox_mode" => Some(self.codex_sandbox_mode.clone()),
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
@@ -406,6 +526,10 @@ impl HcomConfig {
             "auto_approve" => Some(if self.auto_approve { "1" } else { "0" }.into()),
             "auto_subscribe" => Some(self.auto_subscribe.clone()),
             "name_export" => Some(self.name_export.clone()),
+            "auto_trust_workspace" => {
+                Some(if self.auto_trust_workspace { "1" } else { "0" }.into())
+            }
+            "title_mode" => Some(self.title_mode.clone()),
             _ => None,
         }
     }
@@ -431,9 +555,18 @@ impl HcomConfig {
             "gemini_args" => self.gemini_args = value.to_string(),
             "codex_args" => self.codex_args = value.to_string(),
             "opencode_args" => self.opencode_args = value.to_string(),
+            "kilo_args" => self.kilo_args = value.to_string(),
+            "pi_args" => self.pi_args = value.to_string(),
+            "omp_args" => self.omp_args = value.to_string(),
+            "cursor_args" => self.cursor_args = value.to_string(),
+            "kimi_args" => self.kimi_args = value.to_string(),
+            "copilot_args" => self.copilot_args = value.to_string(),
+            "grok_args" => self.grok_args = value.to_string(),
             "codex_sandbox_mode" => {
-                // Normalize legacy value
-                self.codex_sandbox_mode = if value == "full-auto" {
+                // Retired modes fall back to the default rather than turning an
+                // existing config into an error. `untrusted` relied on Codex's
+                // `-a untrusted`, which Codex 0.152 removed.
+                self.codex_sandbox_mode = if matches!(value, "full-auto" | "untrusted") {
                     "workspace".to_string()
                 } else {
                     value.to_string()
@@ -449,9 +582,22 @@ impl HcomConfig {
             "auto_approve" => self.auto_approve = !is_falsy(value),
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
+            "auto_trust_workspace" => self.auto_trust_workspace = !is_falsy(value),
+            // Stored leniently; `TitleMode::from_config` maps unknown → default.
+            // The CLI set path (`config_set_at_path`) validates against
+            // `VALID_TITLE_MODES` before this is ever written to the file.
+            "title_mode" => self.title_mode = value.to_string(),
             _ => return Err(format!("unknown field: {field}")),
         }
         Ok(())
+    }
+
+    /// Effective HCOM_TIMEOUT (idle poll timeout for non-PTY instances), falling
+    /// back to 120s if config can't be loaded. Used both by the Stop-hook poll
+    /// fallback and by registration so freshly created rows already carry the
+    /// resolved value instead of relying on the (never-NULL) schema default.
+    pub fn effective_timeout() -> i64 {
+        Self::load(None).ok().map(|c| c.timeout).unwrap_or(120)
     }
 
     /// Load config with precedence: env var → config.toml → defaults.
@@ -501,16 +647,16 @@ impl HcomConfig {
                 .map(|&(_, e)| e);
 
             // Relay fields are file-only (no env override)
-            if let Some(env_key) = env_key {
-                if !is_relay_field(field) {
-                    let env_val = if let Some(overrides) = env_override {
-                        overrides.get(env_key).cloned()
-                    } else {
-                        std::env::var(env_key).ok()
-                    };
-                    if let Some(val) = env_val {
-                        return Some(TomlFieldValue::Str(val));
-                    }
+            if let Some(env_key) = env_key
+                && !is_relay_field(field)
+            {
+                let env_val = if let Some(overrides) = env_override {
+                    overrides.get(env_key).cloned()
+                } else {
+                    std::env::var(env_key).ok()
+                };
+                if let Some(val) = env_val {
+                    return Some(TomlFieldValue::Str(val));
                 }
             }
 
@@ -545,11 +691,17 @@ impl HcomConfig {
             "gemini_args",
             "codex_args",
             "opencode_args",
+            "kilo_args",
+            "pi_args",
+            "cursor_args",
+            "copilot_args",
+            "grok_args",
             "codex_sandbox_mode",
             "gemini_system_prompt",
             "codex_system_prompt",
             "auto_subscribe",
             "name_export",
+            "title_mode",
         ];
         for str_field in &str_fields {
             if let Some(val) = get_var(str_field) {
@@ -564,7 +716,7 @@ impl HcomConfig {
         }
 
         // Load boolean fields
-        for bool_field in &["relay_enabled", "auto_approve"] {
+        for bool_field in &["relay_enabled", "auto_approve", "auto_trust_workspace"] {
             if let Some(val) = get_var(bool_field) {
                 match val {
                     TomlFieldValue::Bool(b) => {
@@ -620,10 +772,10 @@ impl HcomConfig {
         let env_to_field: HashMap<&str, &str> = FIELD_TO_ENV.iter().map(|&(f, e)| (e, f)).collect();
 
         for (env_key, value) in data {
-            if let Some(&field) = env_to_field.get(env_key.as_str()) {
-                if let Err(e) = config.set_field(field, value) {
-                    errors.insert(field.to_string(), e);
-                }
+            if let Some(&field) = env_to_field.get(env_key.as_str())
+                && let Err(e) = config.set_field(field, value)
+            {
+                errors.insert(field.to_string(), e);
             }
         }
 
@@ -720,22 +872,21 @@ pub fn load_toml_config(path: &std::path::Path) -> HashMap<String, TomlFieldValu
     }
 
     // Terminal dangerous-char validation
-    if let Some(TomlFieldValue::Str(terminal_val)) = result.get("terminal") {
-        if terminal_val
+    if let Some(TomlFieldValue::Str(terminal_val)) = result.get("terminal")
+        && terminal_val
             .chars()
             .any(|c| TERMINAL_DANGEROUS_CHARS.contains(&c))
-        {
-            let bad_chars: Vec<String> = TERMINAL_DANGEROUS_CHARS
-                .iter()
-                .filter(|&&c| terminal_val.contains(c))
-                .map(|c| format!("{c:?}"))
-                .collect();
-            eprintln!(
-                "Warning: Unsafe characters in terminal.active ({}), ignoring custom terminal command",
-                bad_chars.join(", ")
-            );
-            result.remove("terminal");
-        }
+    {
+        let bad_chars: Vec<String> = TERMINAL_DANGEROUS_CHARS
+            .iter()
+            .filter(|&&c| terminal_val.contains(c))
+            .map(|c| format!("{c:?}"))
+            .collect();
+        eprintln!(
+            "Warning: Unsafe characters in terminal.active ({}), ignoring custom terminal command",
+            bad_chars.join(", ")
+        );
+        result.remove("terminal");
     }
 
     result
@@ -785,14 +936,13 @@ pub fn save_toml_config(config: &HcomConfig, presets: Option<&toml::Value>) -> s
                 toml::to_string_pretty(&toml::Value::Table(presets_table.clone()))
                     .unwrap_or_default()
             );
-            if let Ok(wrapper_doc) = wrapper_str.parse::<DocumentMut>() {
-                if let Some(item) = wrapper_doc
+            if let Ok(wrapper_doc) = wrapper_str.parse::<DocumentMut>()
+                && let Some(item) = wrapper_doc
                     .as_item()
                     .as_table()
                     .and_then(|t| t.get("presets"))
-                {
-                    terminal.insert("presets", item.clone());
-                }
+            {
+                terminal.insert("presets", item.clone());
             }
         }
     }
@@ -864,6 +1014,7 @@ pub fn load_toml_presets(path: &std::path::Path) -> Option<toml::Value> {
 fn default_toml_structure() -> toml::Value {
     let toml_str = r#"[terminal]
 active = "default"
+title_mode = "combined"
 
 [relay]
 url = ""
@@ -878,6 +1029,7 @@ hints = ""
 notes = ""
 subagent_timeout = 30
 auto_subscribe = "collision"
+auto_trust_workspace = true
 
 [launch.claude]
 args = ""
@@ -892,6 +1044,21 @@ sandbox_mode = "workspace"
 system_prompt = ""
 
 [launch.opencode]
+args = ""
+
+[launch.kilo]
+args = ""
+
+[launch.pi]
+args = ""
+
+[launch.omp]
+args = ""
+
+[launch.cursor]
+args = ""
+
+[launch.copilot]
 args = ""
 
 [preferences]
@@ -916,6 +1083,14 @@ fn is_known_terminal_preset(name: &str) -> bool {
         .any(|(p, _)| p.eq_ignore_ascii_case(name))
 }
 
+/// True if `name` is a built-in preset supported on `platform`
+/// ("Darwin"/"Linux"/"Windows", see `crate::shared::platform::platform_name`).
+pub fn terminal_preset_supported_on(name: &str, platform: &str) -> bool {
+    TERMINAL_PRESETS
+        .iter()
+        .any(|(p, preset)| p.eq_ignore_ascii_case(name) && preset.platforms.contains(&platform))
+}
+
 /// Resolve old casing to canonical preset name (e.g., "WezTerm" → "wezterm").
 /// Returns the canonical name if matched, otherwise returns the input unchanged.
 fn normalize_terminal_case(name: &str) -> String {
@@ -927,13 +1102,43 @@ fn normalize_terminal_case(name: &str) -> String {
     name.to_string()
 }
 
+fn user_defined_preset_error(name: &str) -> Option<String> {
+    let presets = load_toml_presets(&paths::config_toml_path())?;
+    let (_, value) = presets
+        .as_table()?
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))?;
+    let preset = match value.as_table() {
+        Some(preset) => preset,
+        None => return Some("expected a table".to_string()),
+    };
+    for field in ["open", "close"] {
+        if let Some(value) = preset.get(field)
+            && let Err(error) = toml_val_to_argv(value)
+        {
+            return Some(format!("{field}: {error}"));
+        }
+    }
+    None
+}
+
 /// Check if a terminal name matches a user-defined preset in config.toml.
 pub fn is_user_defined_preset(name: &str) -> bool {
     let toml_path = paths::config_toml_path();
-    if let Some(presets_val) = load_toml_presets(&toml_path) {
-        if let Some(table) = presets_val.as_table() {
-            return table.keys().any(|k| k.eq_ignore_ascii_case(name));
-        }
+    if let Some(presets_val) = load_toml_presets(&toml_path)
+        && let Some(table) = presets_val.as_table()
+    {
+        return table.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case(name)
+                && value.as_table().is_some_and(|preset| {
+                    preset.get("open").map(toml_val_to_argv).transpose().is_ok()
+                        && preset
+                            .get("close")
+                            .map(toml_val_to_argv)
+                            .transpose()
+                            .is_ok()
+                })
+        });
     }
     false
 }
@@ -941,6 +1146,38 @@ pub fn is_user_defined_preset(name: &str) -> bool {
 /// Get the pane_id_env for a preset, checking TOML overrides then built-in defaults.
 pub fn get_merged_preset_pane_id_env(name: &str) -> Option<String> {
     get_merged_preset(name).and_then(|p| p.pane_id_env)
+}
+
+/// Environment variables that identify a terminal-local pane/window/workspace.
+///
+/// New-window runner sidecars must not replay these values from the parent:
+/// the terminal backend supplies fresh identity to the child. Include both
+/// built-in detection variables and user-configured `pane_id_env` values.
+pub fn pane_identity_env_vars() -> std::collections::HashSet<String> {
+    pane_identity_env_vars_from_path(&paths::config_toml_path())
+}
+
+fn pane_identity_env_vars_from_path(
+    toml_path: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let mut vars = crate::shared::terminal_presets::TERMINAL_ENV_MAP
+        .iter()
+        .map(|(env_var, _)| (*env_var).to_string())
+        .collect::<std::collections::HashSet<_>>();
+
+    if let Some(presets) = load_toml_presets(toml_path).and_then(|value| value.as_table().cloned())
+    {
+        vars.extend(presets.values().filter_map(|value| {
+            value
+                .as_table()
+                .and_then(|preset| preset.get("pane_id_env"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }));
+    }
+
+    vars
 }
 
 /// Get a fully merged terminal preset: TOML overrides on top of built-in defaults.
@@ -959,28 +1196,30 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
                     .map(|(_, v)| v)
             })?
             .as_table()?;
-        Some(TomlPresetFields {
-            binary: val
-                .get("binary")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            app_name: val
-                .get("app_name")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            open: val
-                .get("open")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            close: val
-                .get("close")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            pane_id_env: val
-                .get("pane_id_env")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-        })
+        let open_result = val.get("open").map(toml_val_to_argv).transpose();
+        let close_result = val.get("close").map(toml_val_to_argv).transpose();
+        match (open_result, close_result) {
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("Warning: skipping custom terminal preset {name:?}: {e}");
+                None
+            }
+            (Ok(open), Ok(close)) => Some(TomlPresetFields {
+                binary: val
+                    .get("binary")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                app_name: val
+                    .get("app_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                open: open.flatten(),
+                close: close.flatten(),
+                pane_id_env: val
+                    .get("pane_id_env")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            }),
+        }
     });
 
     let builtin = crate::shared::get_terminal_preset(name);
@@ -988,20 +1227,45 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
     match (&toml_preset, &builtin) {
         (None, None) => None,
         _ => {
-            let b_open = builtin.map(|b| b.open).unwrap_or("");
-            let b_close = builtin.and_then(|b| b.close);
+            // Built-in argv templates, lowered to owned Vec<String> per platform.
+            let argv_vec = |sel: Option<crate::shared::terminal_presets::ArgvTemplate>| {
+                sel.map(|t| t.iter().map(|s| s.to_string()).collect::<Vec<String>>())
+            };
+            let b_open = builtin.map(|b| b.open);
+            let b_close = builtin.map(|b| b.close);
             let b_binary = builtin.and_then(|b| b.binary);
             let b_app = builtin.and_then(|b| b.app_name);
             let b_pane_env = builtin.and_then(|b| b.pane_id_env);
 
             let t = toml_preset.as_ref();
+
+            // A TOML `open`/`close` override (string or array) replaces the
+            // built-in on BOTH platforms — TOML custom presets have no separate
+            // Windows slot, so the array form is the Windows escape hatch (it
+            // can carry literal Windows paths without shell mangling).
+            let toml_open = t.and_then(|t| t.open.clone());
+            let toml_close = t.and_then(|t| t.close.clone());
+
+            let (open, open_windows) = match toml_open {
+                Some(o) => (o, None),
+                None => (
+                    argv_vec(b_open.and_then(|o| o.default)).unwrap_or_default(),
+                    argv_vec(b_open.and_then(|o| o.windows)),
+                ),
+            };
+            let (close, close_windows) = match toml_close {
+                Some(c) => (Some(c), None),
+                None => (
+                    argv_vec(b_close.and_then(|c| c.default)),
+                    argv_vec(b_close.and_then(|c| c.windows)),
+                ),
+            };
+
             Some(MergedPreset {
-                open: t
-                    .and_then(|t| t.open.clone())
-                    .unwrap_or_else(|| b_open.to_string()),
-                close: t
-                    .and_then(|t| t.close.clone())
-                    .or_else(|| b_close.map(|s| s.to_string())),
+                open,
+                open_windows,
+                close,
+                close_windows,
                 binary: t
                     .and_then(|t| t.binary.clone())
                     .or_else(|| b_binary.map(|s| s.to_string())),
@@ -1016,23 +1280,119 @@ pub fn get_merged_preset(name: &str) -> Option<MergedPreset> {
     }
 }
 
+/// Convert a TOML preset `open`/`close` value into an argv vector.
+///
+/// Accepts BOTH forms:
+/// - Array: each element must be a string; non-string elements are an error.
+///   Literal Windows paths like `C:\Users\x\s.ps1` survive intact — this is
+///   the recommended escape hatch for custom presets.
+/// - String (legacy): tokenized once via the double-quote-aware
+///   `args_common::shell_split`. Backslashes are consumed by that tokenizer, so
+///   the array form is preferred for Windows paths. A `\` in the string triggers
+///   a warning so users can migrate to the array form.
+///
+/// Returns `Ok(None)` for an empty string/array (treated as "unset").
+/// Returns `Err` on non-string array elements or invalid shell quoting — the
+/// caller should treat this as a configuration error rather than falling back
+/// to a built-in preset.
+fn toml_val_to_argv(v: &toml::Value) -> Result<Option<Vec<String>>, String> {
+    match v {
+        toml::Value::Array(items) => {
+            if items.is_empty() {
+                return Ok(None);
+            }
+            let mut argv = Vec::with_capacity(items.len());
+            for (i, e) in items.iter().enumerate() {
+                match e.as_str() {
+                    Some(s) => argv.push(s.to_string()),
+                    None => {
+                        return Err(format!(
+                            "element [{}] is not a string (got {}); use quoted strings",
+                            i,
+                            e.type_str()
+                        ));
+                    }
+                }
+            }
+            Ok(Some(argv))
+        }
+        toml::Value::String(s) => {
+            if s.is_empty() {
+                return Ok(None);
+            }
+            if s.contains('\\') {
+                eprintln!(
+                    "Warning: custom terminal preset command contains backslashes; \
+                     use the array form to avoid shell tokenization issues on Windows: {s:?}"
+                );
+            }
+            match crate::tools::args_common::shell_split(s, cfg!(windows)) {
+                Ok(argv) if !argv.is_empty() => Ok(Some(argv)),
+                Ok(_) => Ok(None),
+                Err(e) => Err(format!("invalid quoting in preset command: {e}")),
+            }
+        }
+        _ => Err(format!(
+            "expected a string or array of strings, got {}",
+            v.type_str()
+        )),
+    }
+}
+
 /// Parsed TOML preset fields (all optional — overlay on built-in).
 struct TomlPresetFields {
     binary: Option<String>,
     app_name: Option<String>,
-    open: Option<String>,
-    close: Option<String>,
+    open: Option<Vec<String>>,
+    close: Option<Vec<String>>,
     pane_id_env: Option<String>,
 }
 
-/// Fully merged terminal preset (TOML + built-in).
+/// Fully merged terminal preset (TOML + built-in), as argument vectors.
 #[derive(Debug, Clone)]
 pub struct MergedPreset {
-    pub open: String,
-    pub close: Option<String>,
+    /// Default (Unix / fallback) open argv.
+    pub open: Vec<String>,
+    /// Windows-specific open argv override (None ⇒ use `open`).
+    pub open_windows: Option<Vec<String>>,
+    /// Default (Unix / fallback) close argv (None ⇒ no close API).
+    pub close: Option<Vec<String>>,
+    /// Windows-specific close argv override (None ⇒ use `close`).
+    pub close_windows: Option<Vec<String>>,
     pub binary: Option<String>,
     pub app_name: Option<String>,
     pub pane_id_env: Option<String>,
+}
+
+impl MergedPreset {
+    /// Open argv for the given platform (Windows falls back to the default).
+    pub fn open_argv(&self, is_windows: bool) -> Vec<String> {
+        if is_windows {
+            self.open_windows
+                .clone()
+                .unwrap_or_else(|| self.open.clone())
+        } else {
+            self.open.clone()
+        }
+    }
+
+    /// Close argv for the given platform (Windows falls back to the default).
+    pub fn close_argv(&self, is_windows: bool) -> Option<Vec<String>> {
+        if is_windows {
+            self.close_windows.clone().or_else(|| self.close.clone())
+        } else {
+            self.close.clone()
+        }
+    }
+
+    /// Whether a close API exists for the given platform (no clone).
+    pub fn has_close(&self, is_windows: bool) -> bool {
+        if is_windows {
+            self.close_windows.is_some() || self.close.is_some()
+        } else {
+            self.close.is_some()
+        }
+    }
 }
 
 fn is_falsy(s: &str) -> bool {
@@ -1223,7 +1583,7 @@ fn lock_down_config_permissions(_path: &std::path::Path) -> std::io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hooks::test_helpers::isolated_test_env;
+    use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
     use std::env;
 
@@ -1263,29 +1623,135 @@ mod tests {
         }
     }
 
+    // Unix-only: asserts against $HOME and POSIX absolute paths; Windows
+    // resolves the base dir from USERPROFILE and treats "/x" as drive-relative.
     #[test]
     #[serial]
-    fn test_default_config_uses_home_hcom() {
+    fn test_guard_redirects_non_temp_hcom_dir() {
+        let _guard = EnvGuard::new();
+        let unsafe_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".hcom-unsafe-test");
+        unsafe {
+            env::set_var("HCOM_DIR", &unsafe_dir);
+        }
         Config::reset();
-        without_env(&["HCOM_DIR"], || {
-            Config::init();
-            let config = Config::get();
-            let expected = env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".hcom"))
-                .unwrap();
-            assert_eq!(config.hcom_dir, expected);
-        });
+        Config::init();
+
+        let actual = Config::get().hcom_dir;
+        assert_ne!(actual, unsafe_dir);
+        assert!(actual.starts_with(env::temp_dir()), "actual={actual:?}");
     }
 
     #[test]
     #[serial]
-    fn test_hcom_dir_overrides_home() {
+    fn test_guard_allows_registered_hcom_dir() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let expected = temp.path().join(".hcom");
+        // A fixture must claim the root before Config will keep it.
+        paths::test_roots::register(temp.path());
+        unsafe {
+            env::set_var("HCOM_DIR", &expected);
+        }
         Config::reset();
-        with_env("HCOM_DIR", "/custom/hcom", || {
-            Config::init();
-            let config = Config::get();
-            assert_eq!(config.hcom_dir, PathBuf::from("/custom/hcom"));
+        Config::init();
+
+        assert_eq!(Config::get().hcom_dir, expected);
+    }
+
+    #[test]
+    #[serial]
+    fn test_guard_redirects_unregistered_temp_hcom_dir() {
+        // Geography is not ownership: a temp path no fixture registered is not
+        // trusted, even though it sits under $TMPDIR. This is the finding-3
+        // guarantee that a real hcom DB happening to live under /tmp is not
+        // waved through.
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let unregistered = temp.path().join(".hcom");
+        unsafe {
+            env::set_var("HCOM_DIR", &unregistered);
+        }
+        Config::reset();
+        Config::init();
+
+        assert_ne!(Config::get().hcom_dir, unregistered);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn test_guard_rejects_temp_symlink_to_non_temp_hcom_dir() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("outside");
+        symlink(env!("CARGO_MANIFEST_DIR"), &link).unwrap();
+        let unsafe_dir = link.join(".hcom");
+        unsafe {
+            env::set_var("HCOM_DIR", &unsafe_dir);
+        }
+        Config::reset();
+        Config::init();
+
+        let actual = Config::get().hcom_dir;
+        assert_ne!(actual, unsafe_dir);
+        assert!(actual.starts_with(env::temp_dir()), "actual={actual:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_raw_resolution_and_db_open_do_not_share_mutable_escape_state() {
+        use std::sync::{Arc, Barrier};
+
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let barrier = Arc::new(Barrier::new(2));
+        let raw_barrier = Arc::clone(&barrier);
+        let db_barrier = Arc::clone(&barrier);
+        let raw_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".hcom-resolution-test");
+        let expected_db = hcom_dir.join("hcom.db");
+
+        let resolver = std::thread::spawn(move || {
+            let env = HashMap::from([(
+                "HCOM_DIR".to_string(),
+                raw_path.to_string_lossy().into_owned(),
+            )]);
+            raw_barrier.wait();
+            let (resolved, explicit) =
+                paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+            assert_eq!(resolved, raw_path);
+            assert!(explicit);
         });
+        let db_open = std::thread::spawn(move || {
+            db_barrier.wait();
+            let db = crate::db::HcomDb::open().unwrap();
+            assert_eq!(db.path(), expected_db);
+        });
+
+        resolver.join().unwrap();
+        db_open.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_default_config_uses_home_hcom() {
+        let env = HashMap::from([("HOME".to_string(), "/home/test".to_string())]);
+        let (actual, explicit) =
+            paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+
+        assert_eq!(actual, PathBuf::from("/home/test/.hcom"));
+        assert!(!explicit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_hcom_dir_overrides_home() {
+        let env = HashMap::from([("HCOM_DIR".to_string(), "/custom/hcom".to_string())]);
+        let (actual, explicit) =
+            paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+
+        assert_eq!(actual, PathBuf::from("/custom/hcom"));
+        assert!(explicit);
     }
 
     #[test]
@@ -1349,39 +1815,38 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_hcom_dir_tilde_expansion() {
-        Config::reset();
-        with_env("HCOM_DIR", "~/.hcom", || {
-            Config::init();
-            let config = Config::get();
-            assert!(config.hcom_dir.is_absolute());
-            assert!(config.hcom_dir.ends_with(".hcom"));
-        });
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let env = HashMap::from([
+            ("HOME".to_string(), home.to_string_lossy().into_owned()),
+            ("HCOM_DIR".to_string(), "~/.hcom".to_string()),
+        ]);
+        let (actual, explicit) =
+            paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+
+        assert_eq!(actual, home.join(".hcom"));
+        assert!(explicit);
     }
 
     #[test]
-    #[serial]
     fn test_hcom_dir_relative_resolved_to_absolute() {
-        Config::reset();
-        with_env("HCOM_DIR", "relative/path", || {
-            Config::init();
-            let config = Config::get();
-            // Should be resolved relative to CWD
-            assert!(config.hcom_dir.is_absolute());
-            assert!(config.hcom_dir.ends_with("relative/path"));
-        });
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let env = HashMap::from([("HCOM_DIR".to_string(), "relative/path".to_string())]);
+        let (actual, explicit) = paths::resolve_hcom_dir_from_env(&env, &cwd);
+
+        assert_eq!(actual, cwd.join("relative/path"));
+        assert!(explicit);
     }
 
+    #[cfg(unix)]
     #[test]
-    #[serial]
     fn test_hcom_dir_absolute_stays_absolute() {
-        Config::reset();
-        with_env("HCOM_DIR", "/absolute/hcom", || {
-            Config::init();
-            let config = Config::get();
-            assert_eq!(config.hcom_dir, PathBuf::from("/absolute/hcom"));
-        });
+        let env = HashMap::from([("HCOM_DIR".to_string(), "/absolute/hcom".to_string())]);
+        let (actual, explicit) =
+            paths::resolve_hcom_dir_from_env(&env, std::path::Path::new("/worktree"));
+
+        assert_eq!(actual, PathBuf::from("/absolute/hcom"));
+        assert!(explicit);
     }
 
     #[test]
@@ -1488,8 +1953,14 @@ mod tests {
 
         config.terminal = "KITTY".to_string();
         let errors = config.collect_errors();
-        assert!(!errors.contains_key("terminal"));
-        assert_eq!(config.terminal, "kitty");
+        assert_eq!(config.terminal, "kitty"); // Normalized regardless of platform
+        // kitty is Darwin/Linux-only (DL); on Windows it's correctly rejected
+        // by the platform-availability check added for finding #17.
+        if crate::shared::platform::platform_name() == "Windows" {
+            assert!(errors.contains_key("terminal"));
+        } else {
+            assert!(!errors.contains_key("terminal"));
+        }
     }
 
     #[test]
@@ -1507,28 +1978,50 @@ mod tests {
 
     #[test]
     fn test_terminal_known_presets_accepted() {
+        // Finding 17: presets are now validated against the host platform, so
+        // only assert presets that are actually supported here.
+        let platform = crate::shared::platform::platform_name();
         let mut config = HcomConfig::default();
         for preset in &[
             "kitty",
             "wezterm",
             "tmux",
             "alacritty",
+            "ptyxis",
             "terminal.app",
             "iterm",
         ] {
+            if !terminal_preset_supported_on(preset, platform) {
+                continue;
+            }
             config.terminal = preset.to_string();
             assert!(
                 !config.collect_errors().contains_key("terminal"),
-                "preset '{preset}' should be valid"
+                "preset '{preset}' should be valid on {platform}"
             );
         }
     }
 
     #[test]
-    fn test_set_field_full_auto_normalization() {
-        let mut config = HcomConfig::default();
-        config.set_field("codex_sandbox_mode", "full-auto").unwrap();
-        assert_eq!(config.codex_sandbox_mode, "workspace");
+    #[cfg(not(target_os = "windows"))]
+    fn wrong_platform_builtin_preset_is_rejected() {
+        // Finding 17: a built-in preset not available on the host platform
+        // (here, "wttab" is Windows-only) must be rejected at validation time,
+        // not just silently accepted and left to fail at launch.
+        let mut config = HcomConfig {
+            terminal: "wttab".to_string(),
+            ..HcomConfig::default()
+        };
+        assert!(config.collect_errors().contains_key("terminal"));
+    }
+
+    #[test]
+    fn test_set_field_retired_sandbox_modes_normalize_to_workspace() {
+        for retired in ["full-auto", "untrusted"] {
+            let mut config = HcomConfig::default();
+            config.set_field("codex_sandbox_mode", retired).unwrap();
+            assert_eq!(config.codex_sandbox_mode, "workspace", "{retired}");
+        }
     }
 
     #[test]
@@ -1624,6 +2117,20 @@ mod tests {
         assert_eq!(config.timeout, 3600);
         assert_eq!(config.tag, "test");
         assert!(!config.relay_enabled);
+    }
+
+    #[test]
+    fn test_load_from_sources_title_mode_and_env_override() {
+        let mut file_config = HashMap::new();
+        file_config.insert(
+            "title_mode".to_string(),
+            TomlFieldValue::Str("label".to_string()),
+        );
+        let mut env = HashMap::new();
+        env.insert("HCOM_TITLE_MODE".to_string(), "off".to_string());
+
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        assert_eq!(config.title_mode, "off");
     }
 
     #[test]
@@ -1872,14 +2379,30 @@ auto_approve = false
     }
 
     #[test]
-    fn test_hcom_config_from_env_dict_with_full_auto() {
-        let mut data = HcomConfig::default().to_env_dict();
-        data.insert(
-            "HCOM_CODEX_SANDBOX_MODE".to_string(),
-            "full-auto".to_string(),
+    fn args_env_keys_match_integration_specs() {
+        let expected: std::collections::HashSet<&str> = crate::integration_spec::ALL
+            .iter()
+            .filter_map(|spec| spec.launch.args_env)
+            .collect();
+        let actual: std::collections::HashSet<&str> = FIELD_TO_ENV
+            .iter()
+            .filter_map(|(field, env_key)| field.ends_with("_args").then_some(*env_key))
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "HcomConfig *_args env vars must match IntegrationSpec.launch.args_env"
         );
-        let config = HcomConfig::from_env_dict(&data).unwrap();
-        assert_eq!(config.codex_sandbox_mode, "workspace");
+    }
+
+    #[test]
+    fn test_hcom_config_from_env_dict_with_retired_sandbox_modes() {
+        for retired in ["full-auto", "untrusted"] {
+            let mut data = HcomConfig::default().to_env_dict();
+            data.insert("HCOM_CODEX_SANDBOX_MODE".to_string(), retired.to_string());
+            let config = HcomConfig::from_env_dict(&data).unwrap();
+            assert_eq!(config.codex_sandbox_mode, "workspace", "{retired}");
+        }
     }
 
     #[test]
@@ -1900,6 +2423,7 @@ auto_approve = false
         let structure = default_toml_structure();
         // Verify key paths exist
         assert!(get_nested(&structure, "terminal.active").is_some());
+        assert!(get_nested(&structure, "terminal.title_mode").is_some());
         assert!(get_nested(&structure, "launch.tag").is_some());
         assert!(get_nested(&structure, "launch.claude.args").is_some());
         assert!(get_nested(&structure, "relay.url").is_some());
@@ -1928,6 +2452,176 @@ binary = "myterm"
         assert!(presets.is_some());
         let presets = presets.unwrap();
         assert!(presets.as_table().unwrap().contains_key("myterm"));
+    }
+
+    #[test]
+    fn test_pane_identity_env_vars_include_builtin_and_custom_vars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[terminal.presets.myterm]
+open = "myterm spawn -- bash {script}"
+close = "myterm close {pane_id}"
+pane_id_env = "MYTERM_PANE_ID"
+"#,
+        )
+        .unwrap();
+
+        let vars = pane_identity_env_vars_from_path(&path);
+        assert!(vars.contains("HERDR_PANE_ID"));
+        assert!(vars.contains("KITTY_WINDOW_ID"));
+        assert!(vars.contains("MYTERM_PANE_ID"));
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_array_preserves_windows_path() {
+        // Array form: elements collected verbatim, so a literal Windows path
+        // (backslashes, drive letter) survives without tokenization.
+        let v = toml::Value::Array(vec![
+            toml::Value::String("myterm".into()),
+            toml::Value::String("-e".into()),
+            toml::Value::String(r"C:\Users\x\s.ps1".into()),
+        ]);
+        assert_eq!(
+            toml_val_to_argv(&v),
+            Ok(Some(vec![
+                "myterm".to_string(),
+                "-e".to_string(),
+                r"C:\Users\x\s.ps1".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_array_rejects_non_string_element() {
+        let v = toml::Value::Array(vec![
+            toml::Value::String("myterm".into()),
+            toml::Value::Integer(42),
+            toml::Value::String("{script}".into()),
+        ]);
+        assert!(toml_val_to_argv(&v).is_err());
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_string_tokenizes_legacy() {
+        let v = toml::Value::String("myterm -e bash {script}".into());
+        assert_eq!(
+            toml_val_to_argv(&v),
+            Ok(Some(vec![
+                "myterm".to_string(),
+                "-e".to_string(),
+                "bash".to_string(),
+                "{script}".to_string(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_string_invalid_quoting_returns_err() {
+        let v = toml::Value::String(r#"kitty -- bash "unterminated"#.into());
+        assert!(toml_val_to_argv(&v).is_err());
+    }
+
+    #[test]
+    fn test_toml_val_to_argv_empty_and_wrong_type() {
+        assert!(toml_val_to_argv(&toml::Value::Integer(3)).is_err());
+        assert_eq!(toml_val_to_argv(&toml::Value::Array(vec![])), Ok(None));
+        assert_eq!(
+            toml_val_to_argv(&toml::Value::String(String::new())),
+            Ok(None)
+        );
+    }
+
+    // B-1: a user-defined `[terminal.presets.<builtin>]` override declares no
+    // platform and takes precedence over the built-in, so it must be accepted
+    // even on a platform where the built-in itself is unavailable.
+    #[test]
+    #[serial]
+    fn user_defined_override_exempt_from_builtin_platform_gate() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let platform = crate::shared::platform::platform_name();
+        // A built-in preset NOT available on the current host platform.
+        let builtin = match platform {
+            // windows-terminal is Windows-only.
+            "Darwin" | "Linux" => "windows-terminal",
+            // iterm is Darwin-only.
+            _ => "iterm",
+        };
+
+        // Control: without any user override the wrong-platform built-in is
+        // rejected at validate time.
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.collect_errors().contains_key("terminal"),
+            "built-in {builtin} should be rejected on {platform} without a user override"
+        );
+
+        // Define a user preset with the SAME name — it must now be accepted.
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!(
+                "[terminal.presets.{builtin}]\nopen = \"{builtin} -- powershell -File {{script}}\"\n"
+            ),
+        )
+        .unwrap();
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !cfg.collect_errors().contains_key("terminal"),
+            "user-defined override of {builtin} must be accepted on {platform}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_user_override_does_not_bypass_builtin_platform_gate() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let builtin = match crate::shared::platform::platform_name() {
+            "Darwin" | "Linux" => "windows-terminal",
+            _ => "iterm",
+        };
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nopen = \"powershell \\\"unterminated\"\n"),
+        )
+        .unwrap();
+
+        assert!(!is_user_defined_preset(builtin));
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            cfg.collect_errors().contains_key("terminal"),
+            "malformed override must not exempt {builtin} from the platform gate"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn malformed_user_override_rejected_for_supported_builtin() {
+        let (_dir, hcom_dir, _home, _guard) = isolated_test_env();
+        let builtin = if cfg!(windows) { "cmd" } else { "tmux" };
+        std::fs::write(
+            hcom_dir.join("config.toml"),
+            format!("[terminal.presets.{builtin}]\nclose = 42\n"),
+        )
+        .unwrap();
+        let mut cfg = HcomConfig {
+            terminal: builtin.to_string(),
+            ..Default::default()
+        };
+
+        let error = cfg.collect_errors().remove("terminal").unwrap();
+        assert!(error.contains("invalid terminal preset"));
+        assert!(error.contains("close:"));
     }
 
     #[test]

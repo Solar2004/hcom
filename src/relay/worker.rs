@@ -24,15 +24,24 @@ fn pid_file_path() -> PathBuf {
     crate::paths::hcom_dir().join(".tmp").join("relay.pid")
 }
 
-fn write_pid_file() {
-    let pid = std::process::id().to_string();
-    crate::paths::atomic_write(&pid_file_path(), &pid);
+fn spawn_lock_path() -> PathBuf {
+    crate::paths::hcom_dir()
+        .join(".tmp")
+        .join("relay.spawn.lock")
+}
+
+fn write_pid_file_for(pid: u32) {
+    crate::paths::atomic_write(&pid_file_path(), &pid.to_string());
     // Seed heartbeat alongside the pidfile so readers in the startup window
     // (before the main loop starts ticking) don't see pid-alive + no-heartbeat
     // and falsely declare the worker dead.
     if let Ok(db) = HcomDb::open() {
         super::write_worker_heartbeat(&db);
     }
+}
+
+fn write_pid_file() {
+    write_pid_file_for(std::process::id());
 }
 
 fn read_pid_file() -> Option<u32> {
@@ -99,8 +108,11 @@ impl Drop for PidFileGuard {
 pub fn run() -> i32 {
     // Check if already running
     if let Some(existing_pid) = read_pid_file() {
-        eprintln!("relay-worker already running (PID {})", existing_pid);
-        return 1;
+        let current_pid = std::process::id();
+        if existing_pid != current_pid {
+            eprintln!("relay-worker already running (PID {})", existing_pid);
+            return 1;
+        }
     }
 
     // Write PID file (guard removes on exit)
@@ -140,25 +152,11 @@ pub fn run() -> i32 {
     // CLI callers (hcom send, hooks) connect to trigger immediate push.
     let notify_port = setup_notify_listener(&cmd_tx);
 
-    // Install signal handlers via signal-hook (sets AtomicBool on SIGTERM/SIGINT).
+    // Install shutdown-signal handlers (set AtomicBool on terminate/interrupt).
     // The watchdog thread checks this flag — no separate signal-polling thread needed.
     let shutdown = Arc::new(AtomicBool::new(false));
-    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))
-    {
-        log::log_error(
-            "relay",
-            "signal.register.sigterm",
-            &format!("Failed to register SIGTERM handler: {}", e),
-        );
-    }
-    if let Err(e) = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))
-    {
-        log::log_error(
-            "relay",
-            "signal.register.sigint",
-            &format!("Failed to register SIGINT handler: {}", e),
-        );
-    }
+    crate::sys::signal::register_term(&shutdown);
+    crate::sys::signal::register_int(&shutdown);
 
     // Spawn auto-exit watchdog thread (also monitors shutdown flag)
     let cmd_tx_watchdog = cmd_tx;
@@ -170,10 +168,10 @@ pub fn run() -> i32 {
     relay.run(connection);
 
     // Clear notify port so CLI callers stop trying to connect
-    if notify_port.is_some() {
-        if let Ok(db) = HcomDb::open() {
-            super::safe_kv_set(&db, "relay_daemon_port", None);
-        }
+    if notify_port.is_some()
+        && let Ok(db) = HcomDb::open()
+    {
+        super::safe_kv_set(&db, "relay_daemon_port", None);
     }
 
     log::log_info("relay", "relay_worker.stop", "exited cleanly");
@@ -300,6 +298,37 @@ fn local_instance_count(db: &HcomDb) -> i64 {
 /// Detaches via setsid() so the worker survives terminal close.
 /// Returns true if spawned successfully, false if already running or spawn failed.
 fn do_spawn() -> bool {
+    let lock_path = spawn_lock_path();
+    if let Some(parent) = lock_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        log::log_warn(
+            "relay",
+            "relay_worker.spawn_lock_mkdir_err",
+            &format!("{e}"),
+        );
+        return false;
+    }
+
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            log::log_warn("relay", "relay_worker.spawn_lock_open_err", &format!("{e}"));
+            return false;
+        }
+    };
+
+    if let Err(err) = crate::sys::fs::lock_exclusive(&lock_file) {
+        log::log_warn("relay", "relay_worker.spawn_lock_err", &format!("{err}"));
+        return false;
+    }
+
     if is_relay_worker_running() {
         return false;
     }
@@ -329,20 +358,13 @@ fn do_spawn() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    // Detach into own session so it survives parent terminal close (no SIGHUP)
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
-
-    match cmd.spawn() {
+    // Detach into its own session so it survives parent terminal close (no
+    // SIGHUP) and, on Windows, doesn't inherit the parent's stdio handles
+    // (which would otherwise keep any caller piping hcom's output from ever
+    // observing EOF).
+    match crate::sys::process::spawn_detached(&mut cmd) {
         Ok(child) => {
+            write_pid_file_for(child.id());
             log::log_info(
                 "relay",
                 "relay_worker.spawned",
@@ -450,17 +472,14 @@ fn poll_until_ready(timeout_ms: u64) -> bool {
     let db = HcomDb::open().ok();
 
     while start.elapsed() < deadline {
-        if let Some(ref db) = db {
-            if let Some(port_str) = super::safe_kv_get(db, "relay_daemon_port") {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    use std::net::{SocketAddr, TcpStream};
-                    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                    if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50))
-                        .is_ok()
-                    {
-                        return true;
-                    }
-                }
+        if let Some(ref db) = db
+            && let Some(port_str) = super::safe_kv_get(db, "relay_daemon_port")
+            && let Ok(port) = port_str.trim().parse::<u16>()
+        {
+            use std::net::{SocketAddr, TcpStream};
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(50)).is_ok() {
+                return true;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(30));
@@ -480,15 +499,43 @@ pub fn remove_relay_pid_file() {
 
 /// Stop a running relay-worker by sending SIGTERM to the PID from PID file.
 pub fn stop_relay_worker() -> bool {
-    if let Some(pid) = read_pid_file() {
-        // SAFETY: Sending SIGTERM to a known PID.
-        let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if ret == 0 {
-            log::log_info("relay", "relay_worker.stopped", &format!("pid={}", pid));
-            return true;
-        }
+    if let Some(pid) = read_pid_file()
+        && crate::sys::process::terminate(pid)
+    {
+        log::log_info("relay", "relay_worker.stopped", &format!("pid={}", pid));
+        return true;
     }
     false
+}
+
+/// Stop the relay worker and block until it exits, escalating to a force-kill
+/// if the graceful request does not take effect within ~5s. Removes the PID
+/// file once the worker is gone.
+///
+/// Unlike [`stop_relay_worker`], this *guarantees* termination. Callers with no
+/// other backstop must use this: [`terminate`](crate::sys::process::terminate)
+/// is best-effort and on Windows may not be delivered when the worker shares no
+/// console with the caller, so a bare `stop_relay_worker` could leave the worker
+/// running (the auto-exit watchdog only winds down when no local instances
+/// remain).
+pub fn stop_relay_worker_blocking() {
+    let Some(pid) = read_pid_file() else {
+        return;
+    };
+
+    let _ = stop_relay_worker();
+    for _ in 0..50 {
+        if !crate::pidtrack::is_alive(pid) {
+            remove_pid_file();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Graceful request did not take effect in time; force-kill so a stale
+    // worker cannot survive a relay reset/off.
+    crate::sys::process::kill(pid);
+    remove_pid_file();
 }
 
 #[cfg(test)]

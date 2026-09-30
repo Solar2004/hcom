@@ -2,13 +2,13 @@
 //!
 //! Lifecycle: SessionStart → BeforeAgent → [BeforeTool → AfterTool]* → AfterAgent → SessionEnd
 
-use std::env;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::Value;
 
+use crate::bootstrap;
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common;
 use crate::hooks::{HookPayload, HookResult};
@@ -16,9 +16,8 @@ use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
-use crate::shared::constants::BIND_MARKER_RE;
 use crate::shared::context::HcomContext;
-use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
+use crate::shared::{ST_BLOCKED, ST_LISTENING};
 
 /// Derive Gemini CLI transcript path from session_id.
 ///
@@ -36,15 +35,7 @@ pub fn derive_gemini_transcript_path(session_id: &str) -> Option<String> {
         return None;
     }
 
-    let gemini_base = if let Ok(cli_home) = env::var("GEMINI_CLI_HOME") {
-        if !cli_home.is_empty() {
-            PathBuf::from(cli_home).join(".gemini")
-        } else {
-            PathBuf::from(env::var("HOME").ok()?).join(".gemini")
-        }
-    } else {
-        PathBuf::from(env::var("HOME").ok()?).join(".gemini")
-    };
+    let gemini_base = crate::runtime_env::gemini_family_config_dir();
     let gemini_tmp = gemini_base.join("tmp");
     if !gemini_tmp.exists() {
         return None;
@@ -170,52 +161,34 @@ fn resolve_instance_gemini(db: &HcomDb, payload: &HookPayload) -> Option<Instanc
     instance_binding::resolve_instance_from_binding(db, payload.session_id.as_deref(), None)
 }
 
-/// Bind vanilla Gemini instance by parsing tool_result for [hcom:X] marker.
-fn bind_vanilla_instance(db: &HcomDb, payload: &HookPayload) -> Option<String> {
-    // Skip if no pending instances (optimization)
-    let pending = common::get_pending_instances(db);
-    if pending.is_empty() {
-        return None;
+/// Resolve the directory value to record on this hook fire.
+///
+/// For antigravity, `ctx.cwd` is agy's internal config dir (~/.gemini/...), not
+/// the user's project. Prefer agy's own `workspacePaths[0]` from stdin instead.
+/// Returns None when no reliable directory is available — callers should leave
+/// the existing `instances.directory` field untouched rather than clobber it
+/// with agy's internal cwd (otherwise resume launches in the wrong folder).
+fn resolve_hook_directory(payload: &HookPayload, ctx: &HcomContext) -> Option<String> {
+    if payload.tool == "antigravity" {
+        return payload
+            .raw
+            .get("workspacePaths")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.iter().find_map(|v| v.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
     }
-
-    // Only check run_shell_command tool responses
-    if payload.tool_name != "run_shell_command" {
-        return None;
-    }
-
-    let tool_response = &payload.tool_result;
-    if tool_response.is_empty() {
-        return None;
-    }
-
-    let caps = BIND_MARKER_RE.captures(tool_response)?;
-    let instance_name = caps[1].to_string();
-
-    super::family::bind_vanilla_instance(
-        db,
-        &instance_name,
-        payload.session_id.as_deref(),
-        payload.transcript_path.as_deref(),
-        "gemini",
-        "gemini-aftertool",
-    )
+    Some(ctx.cwd.to_string_lossy().to_string())
 }
 
 /// Handle Gemini SessionStart hook.
 ///
 /// HCOM-launched: bind session_id, inject bootstrap if not announced.
-/// Vanilla: show hcom hint.
+/// Plain runs: no-op.
 fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    // Persistent hooks also fire in plain runs; stay out of those.
     if ctx.process_id.is_none() {
-        // Vanilla instance - show hint
-        return HookResult::Allow {
-            additional_context: Some(format!(
-                "[hcom available - run '{} start' to participate]",
-                crate::runtime_env::build_hcom_command()
-            )),
-            system_message: None,
-            delivery_ack: None,
-        };
+        return hook_noop();
     }
 
     let session_id = match payload.session_id.as_deref() {
@@ -240,17 +213,24 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         Some(name) => name,
         None => {
             if let Some(ref pid) = ctx.process_id {
+                // Preserve the actual tool identity: agy reuses the gemini hook
+                // family but must not be recorded as "gemini" in the instance row.
+                let orphan_tool = if ctx.tool == crate::tool::Tool::Antigravity {
+                    "antigravity"
+                } else {
+                    "gemini"
+                };
                 match instance_binding::create_orphaned_pty_identity(
                     db,
                     session_id,
                     Some(pid.as_str()),
-                    "gemini",
+                    orphan_tool,
                 ) {
                     Some(name) => {
                         log::log_info(
                             "hooks",
                             "gemini.sessionstart.orphan_created",
-                            &format!("instance={} process_id={}", name, pid),
+                            &format!("instance={} process_id={} tool={}", name, pid, orphan_tool),
                         );
                         name
                     }
@@ -264,18 +244,45 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 
     let _ = db.rebind_instance_session(&instance_name, session_id);
 
+    // agy fires PreInvocation before every model call, not just at process start.
+    // Once the instance is initialized on the same session, skip the setup
+    // side-effects below but refresh its bootstrap: agy's ephemeralMessage is
+    // not persisted in the conversation trajectory.
+    //
+    // re-running set_status("listening","start") mid-turn would briefly clobber an
+    // in-progress delivery status (e.g. "active:deliver:sender") set by the previous
+    // turn boundary.
+    let instance = db.get_instance_full(&instance_name).ok().flatten();
+    let already_bootstrapped = instance.as_ref().is_some_and(|inst| {
+        inst.name_announced != 0 && inst.session_id.as_deref() == Some(session_id)
+    });
+    if already_bootstrapped {
+        if let Some(inst) = instance.as_ref()
+            && bootstrap::is_antigravity_tool(&inst.tool)
+        {
+            let recurring = bootstrap::get_bootstrap(db, ctx, &instance_name, &inst.tool);
+            return HookResult::Allow {
+                additional_context: Some(recurring),
+                system_message: None,
+                delivery_ack: None,
+            };
+        }
+        return hook_noop();
+    }
+
     // Capture launch context
     instance_binding::capture_and_store_launch_context(db, &instance_name);
 
     let mut updates = serde_json::Map::new();
-    updates.insert(
-        "directory".into(),
-        Value::String(ctx.cwd.to_string_lossy().to_string()),
-    );
+    if let Some(dir) = resolve_hook_directory(payload, ctx) {
+        updates.insert("directory".into(), Value::String(dir));
+    }
     if let Some(ref tp) = payload.transcript_path {
         updates.insert("transcript_path".into(), Value::String(tp.clone()));
     }
-    instances::update_instance_position(db, &instance_name, &updates);
+    if !updates.is_empty() {
+        instances::update_instance_position(db, &instance_name, &updates);
+    }
     lifecycle::set_status(
         db,
         &instance_name,
@@ -289,8 +296,21 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     // Auto-spawn relay-worker now that an instance is active
     crate::relay::worker::ensure_worker(true);
 
-    // Bootstrap injection moved to BeforeAgent only
-    // Reason: Gemini doesn't display SessionStart hook output after /clear
+    // Gemini: SessionStart additionalContext is hidden after /clear — bootstrap stays in BeforeAgent.
+    // Antigravity: initial bootstrap path (agy ignores GEMINI_SYSTEM_MD).
+    // Later PreInvocation hooks take the recurring path above.
+    if let Ok(Some(inst)) = db.get_instance_full(&instance_name)
+        && bootstrap::is_antigravity_tool(&inst.tool)
+        && let Some(bootstrap) =
+            common::inject_bootstrap_once(db, ctx, &instance_name, &inst, &inst.tool)
+    {
+        return HookResult::Allow {
+            additional_context: Some(bootstrap),
+            system_message: None,
+            delivery_ack: None,
+        };
+    }
+
     hook_noop()
 }
 
@@ -306,74 +326,75 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
 
     let instance_name = &instance.name;
 
-    // Keep directory current
-    let mut dir_updates = serde_json::Map::new();
-    dir_updates.insert(
-        "directory".into(),
-        Value::String(ctx.cwd.to_string_lossy().to_string()),
-    );
-    instances::update_instance_position(db, instance_name, &dir_updates);
+    // Keep directory current — but for agy, prefer workspacePaths over the
+    // hook subprocess cwd (which is agy's internal config dir, not the project).
+    if let Some(dir) = resolve_hook_directory(payload, ctx) {
+        let mut dir_updates = serde_json::Map::new();
+        dir_updates.insert("directory".into(), Value::String(dir));
+        instances::update_instance_position(db, instance_name, &dir_updates);
+    }
 
     // Bind session_id if instance doesn't have one (fresh instance after /clear)
-    if instance.session_id.is_none() {
-        if let Some(ref sid) = payload.session_id {
-            log::log_info(
+    if instance.session_id.is_none()
+        && let Some(ref sid) = payload.session_id
+    {
+        log::log_info(
+            "hooks",
+            "gemini.beforeagent.bind_session",
+            &format!("instance={} session_id={}", instance_name, sid),
+        );
+        let mut sid_updates = serde_json::Map::new();
+        sid_updates.insert("session_id".into(), Value::String(sid.clone()));
+        instances::update_instance_position(db, instance_name, &sid_updates);
+        if let Err(e) = db.rebind_session(sid, instance_name) {
+            log::log_warn(
                 "hooks",
-                "gemini.beforeagent.bind_session",
-                &format!("instance={} session_id={}", instance_name, sid),
+                "gemini.rebind_failed",
+                &format!("rebind_session failed for {instance_name}: {e}"),
             );
-            let mut sid_updates = serde_json::Map::new();
-            sid_updates.insert("session_id".into(), Value::String(sid.clone()));
-            instances::update_instance_position(db, instance_name, &sid_updates);
-            if let Err(e) = db.rebind_session(sid, instance_name) {
-                log::log_warn(
-                    "hooks",
-                    "gemini.rebind_failed",
-                    &format!("rebind_session failed for {instance_name}: {e}"),
-                );
-            }
-            if let Some(ref pid) = ctx.process_id {
-                if let Err(e) = db.set_process_binding(pid, sid, instance_name) {
-                    log::log_warn(
-                        "hooks",
-                        "gemini.process_binding_failed",
-                        &format!("set_process_binding failed for {instance_name}: {e}"),
-                    );
-                }
-            }
+        }
+        if let Some(ref pid) = ctx.process_id
+            && let Err(e) = db.set_process_binding(pid, sid, instance_name)
+        {
+            log::log_warn(
+                "hooks",
+                "gemini.process_binding_failed",
+                &format!("set_process_binding failed for {instance_name}: {e}"),
+            );
         }
     }
 
     try_capture_transcript_path(db, instance_name, payload);
 
-    let mut outputs: Vec<String> = Vec::new();
+    let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+    let assembled = common::assemble_gemini_family_lifecycle_outputs(
+        db,
+        ctx,
+        &instance,
+        is_agy,
+        common::GeminiFamilyLifecycleOpts {
+            allow_wake_no_pending: true,
+            set_status_on_empty: true,
+        },
+    );
 
-    // Inject bootstrap if not already announced
-    if let Some(bootstrap) =
-        common::inject_bootstrap_once(db, ctx, instance_name, &instance, "gemini")
-    {
-        outputs.push(bootstrap);
+    if let Some(wake_only) = assembled.early_wake_context {
+        return HookResult::Allow {
+            additional_context: Some(wake_only),
+            system_message: None,
+            delivery_ack: None,
+        };
     }
 
-    // Deliver pending messages
-    let mut delivery_ack = None;
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        outputs.push(prepared.formatted);
-        delivery_ack = Some(prepared.ack);
-    } else {
-        // Real user prompt (not hcom injection)
-        lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
-    }
-
-    if outputs.is_empty() {
+    if assembled.parts.is_empty() {
         return hook_noop();
     }
 
-    let combined = outputs.join("\n\n---\n\n");
+    let combined = assembled.parts.join("\n\n---\n\n");
     HookResult::Allow {
         additional_context: Some(combined),
         system_message: None,
-        delivery_ack,
+        delivery_ack: assembled.delivery_ack,
     }
 }
 
@@ -383,6 +404,12 @@ fn handle_afteragent(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
         Some(inst) => inst,
         None => return hook_noop(),
     };
+
+    if payload.tool == "antigravity" || instance.tool == "antigravity" {
+        // Antigravity PostInvocation fires after each model invocation, including
+        // between tool calls. Stop/turn-end is the reliable idle boundary.
+        return hook_noop();
+    }
 
     lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
     common::notify_hook_instance_with_db(db, &instance.name);
@@ -402,61 +429,58 @@ fn handle_beforetool(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
     } else {
         &payload.tool_name
     };
-    common::update_tool_status(db, &instance.name, "gemini", tool_name, &payload.tool_input);
+    let status_tool = if instance.tool.is_empty() {
+        payload.tool.as_str()
+    } else {
+        instance.tool.as_str()
+    };
+    common::update_tool_status(
+        db,
+        &instance.name,
+        status_tool,
+        tool_name,
+        &payload.tool_input,
+    );
 
     hook_noop()
 }
 
 /// Handle AfterTool hook - fires after tool execution.
 ///
-/// Vanilla binding: detects [hcom:X] marker from hcom start output.
 /// Bootstrap injection and message delivery via additionalContext.
 fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let mut instance: Option<InstanceRow> = None;
-
-    // Vanilla binding: try tool_response first (immediate)
-    if ctx.process_id.is_none() {
-        if let Some(bound_name) = bind_vanilla_instance(db, payload) {
-            instance = db.get_instance_full(&bound_name).ok().flatten();
-        }
-    }
-
-    // Process/session binding fallback
-    if instance.is_none() {
-        instance = resolve_instance_gemini(db, payload);
-    }
-
-    let instance = match instance {
+    let instance = match resolve_instance_gemini(db, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
 
-    let instance_name = &instance.name;
-    let mut outputs: Vec<String> = Vec::new();
-
-    // Inject bootstrap if not already announced
-    if let Some(bootstrap) =
-        common::inject_bootstrap_once(db, ctx, instance_name, &instance, "gemini")
-    {
-        outputs.push(bootstrap);
-    }
-
-    // Deliver pending messages (JSON format)
-    let mut delivery_ack = None;
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        outputs.push(prepared.formatted);
-        delivery_ack = Some(prepared.ack);
-    }
-
-    if outputs.is_empty() {
+    let is_agy = bootstrap::is_antigravity_tool(&instance.tool);
+    if is_agy {
+        // Antigravity PostToolUse cannot inject model context. Preparing delivery here would
+        // attach a delivery_ack that dispatch would commit even though serialization emits `{}`.
         return hook_noop();
     }
 
-    let combined = outputs.join("\n\n---\n\n");
+    let assembled = common::assemble_gemini_family_lifecycle_outputs(
+        db,
+        ctx,
+        &instance,
+        is_agy,
+        common::GeminiFamilyLifecycleOpts {
+            allow_wake_no_pending: false,
+            set_status_on_empty: false,
+        },
+    );
+
+    if assembled.parts.is_empty() {
+        return hook_noop();
+    }
+
+    let combined = assembled.parts.join("\n\n---\n\n");
     HookResult::Allow {
         additional_context: Some(combined),
         system_message: None,
-        delivery_ack,
+        delivery_ack: assembled.delivery_ack,
     }
 }
 
@@ -487,12 +511,35 @@ fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
         None => return hook_noop(),
     };
 
-    let reason = payload
-        .raw
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    common::finalize_session(db, &instance.name, reason, None);
+    let is_agy = payload.tool == "antigravity" || instance.tool == "antigravity";
+    let reason = if is_agy {
+        crate::hooks::antigravity::sessionend_reason(&payload.raw)
+    } else {
+        payload
+            .raw
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let turn_idle_skip =
+        is_agy && crate::hooks::antigravity::stop_should_skip_soft_finalize(&payload.raw);
+
+    if turn_idle_skip {
+        lifecycle::set_status(db, &instance.name, ST_LISTENING, "", Default::default());
+        common::notify_hook_instance_with_db(db, &instance.name);
+        return hook_noop();
+    }
+
+    // agy always soft-finalizes: this `Stop` is a loop-end signal on a *live* process
+    // (agy has no SessionEnd hook), so hard-deleting would strand a still-running agent
+    // that's about to take another turn. Real teardown is the PTY exit. Other gemini
+    // tools have a genuine SessionEnd == process death, so they hard-finalize.
+    if is_agy {
+        common::soft_finalize_session(db, &instance.name, &reason, None, false);
+    } else {
+        common::finalize_session(db, &instance.name, &reason, None);
+    }
 
     hook_noop()
 }
@@ -520,6 +567,120 @@ fn get_handler(hook_name: &str) -> Option<fn(&HcomDb, &HcomContext, &HookPayload
     }
 }
 
+/// Serialize hook stdout JSON.
+///
+/// Gemini lifecycle hooks: `hookSpecificOutput.additionalContext`.
+/// Antigravity PreInvocation/PostInvocation (mapped from gemini-sessionstart, -beforeagent,
+/// -afteragent) use `injectSteps[*].ephemeralMessage` per agy hooks docs.
+/// Antigravity PostToolUse (mapped from gemini-aftertool) cannot inject — must return `{}`,
+/// so additional_context from those handlers is dropped.
+/// Tool permission hooks: Antigravity uses flat `decision: deny` per agy-hooks.md.
+fn serialize_hook_result(tool: &str, hook_name: &str, result: &HookResult) -> Option<Value> {
+    let is_agy = tool == "antigravity";
+    match result {
+        // Note: system_message on Allow is unused for Gemini (not part of Gemini hook schema)
+        HookResult::Allow {
+            additional_context, ..
+        } => {
+            if let Some(ctx) = additional_context {
+                if is_agy {
+                    // agy hook events are PreInvocation / PostInvocation / PostToolUse / Stop.
+                    // Only the Invocation events accept injectSteps.
+                    let supports_inject = matches!(
+                        hook_name,
+                        "gemini-sessionstart" | "gemini-beforeagent" | "gemini-afteragent"
+                    );
+                    if !supports_inject {
+                        // PostToolUse expects exactly `{}` — emitting anything else risks agy
+                        // discarding sibling hooks' output in the same phase.
+                        return Some(serde_json::json!({}));
+                    }
+                    return Some(serde_json::json!({
+                        "injectSteps": [ { "ephemeralMessage": ctx } ]
+                    }));
+                }
+                let event_name = match hook_name {
+                    "gemini-sessionstart" => "SessionStart",
+                    "gemini-beforeagent" => "BeforeAgent",
+                    "gemini-afteragent" => "AfterAgent",
+                    "gemini-beforetool" => "BeforeTool",
+                    "gemini-aftertool" => "AfterTool",
+                    "gemini-notification" => "Notification",
+                    "gemini-sessionend" => "SessionEnd",
+                    _ => hook_name,
+                };
+                Some(serde_json::json!({
+                    "decision": "allow",
+                    "hookSpecificOutput": {
+                        "hookEventName": event_name,
+                        "additionalContext": ctx,
+                    }
+                }))
+            } else if is_agy {
+                // agy noop: emit valid JSON rather than empty stdout. PreToolUse REQUIRES a
+                // decision field — `{}` is interpreted as deny and breaks all tool calls.
+                // Stop also requires a decision field.
+                if matches!(hook_name, "gemini-beforetool" | "gemini-sessionend") {
+                    Some(serde_json::json!({ "decision": "allow" }))
+                } else {
+                    Some(serde_json::json!({}))
+                }
+            } else {
+                None
+            }
+        }
+        HookResult::Block { reason, .. } => {
+            if is_agy {
+                Some(serde_json::json!({
+                    "decision": "deny",
+                    "reason": reason,
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "decision": "block",
+                    "reason": reason,
+                }))
+            }
+        }
+        HookResult::UpdateInput { updated_input } => {
+            Some(serde_json::json!({ "updatedInput": updated_input }))
+        }
+    }
+}
+
+/// Whether stdin/context should route through Antigravity payload parsing.
+///
+/// Order: `ANTIGRAVITY_AGENT` env → exclude `GEMINI_CLI` gemini → Antigravity schema fallback.
+pub(crate) fn detect_antigravity_payload(ctx: &HcomContext, stdin_json: &Value) -> (bool, bool) {
+    if ctx.tool == crate::tool::Tool::Antigravity {
+        return (true, false);
+    }
+    if ctx.tool == crate::tool::Tool::Gemini {
+        return (false, false);
+    }
+    if stdin_json.get("toolCall").is_some() {
+        return (true, true);
+    }
+    if stdin_json
+        .get("conversationId")
+        .and_then(|v| v.as_str())
+        .is_some()
+        && [
+            "workspacePaths",
+            "artifactDirectoryPath",
+            "invocationNum",
+            "executionNum",
+            "fullyIdle",
+            "terminationReason",
+        ]
+        .iter()
+        .any(|key| stdin_json.get(*key).is_some())
+    {
+        return (true, true);
+    }
+    (false, false)
+}
+
 /// Main entry point for Gemini hooks — called by router.
 ///
 /// Reads stdin JSON, builds HookPayload + HcomContext, dispatches to handler.
@@ -537,8 +698,23 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         Err(_) => Value::Object(Default::default()),
     };
 
-    // Build payload
-    let payload = HookPayload::from_gemini(stdin_json);
+    let (is_agy, agy_fallback) = detect_antigravity_payload(&ctx, &stdin_json);
+    if agy_fallback {
+        static AGY_FALLBACK_LOGGED: std::sync::Once = std::sync::Once::new();
+        AGY_FALLBACK_LOGGED.call_once(|| {
+            log::log_warn(
+                "hooks",
+                "gemini.agy_detect_fallback",
+                "Antigravity payload detected via toolCall without ANTIGRAVITY_AGENT; set env at launch",
+            );
+        });
+    }
+
+    let payload = if is_agy {
+        HookPayload::from_antigravity(stdin_json, hook_name)
+    } else {
+        HookPayload::from_gemini(stdin_json)
+    };
 
     // Pre-gate: skip BeforeAgent for non-participants
     if !ctx.is_launched && hook_name == "gemini-beforeagent" {
@@ -619,54 +795,19 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
         ),
     );
 
-    // Output result JSON to stdout — Gemini expects hookSpecificOutput wrapper
+    // Output result JSON to stdout
     let exit_code = result.exit_code();
-    let output_json = match &result {
-        // Note: system_message on Allow is unused for Gemini (not part of Gemini hook schema)
-        HookResult::Allow {
-            additional_context, ..
-        } => {
-            if let Some(ctx) = additional_context {
-                // Map hook name to Gemini event name (e.g. "gemini-beforeagent" → "BeforeAgent")
-                let event_name = match hook_name {
-                    "gemini-sessionstart" => "SessionStart",
-                    "gemini-beforeagent" => "BeforeAgent",
-                    "gemini-afteragent" => "AfterAgent",
-                    "gemini-beforetool" => "BeforeTool",
-                    "gemini-aftertool" => "AfterTool",
-                    "gemini-notification" => "Notification",
-                    "gemini-sessionend" => "SessionEnd",
-                    _ => hook_name,
-                };
-                Some(serde_json::json!({
-                    "decision": "allow",
-                    "hookSpecificOutput": {
-                        "hookEventName": event_name,
-                        "additionalContext": ctx,
-                    }
-                }))
-            } else {
-                None
-            }
-        }
-        HookResult::Block { reason } => Some(serde_json::json!({
-            "decision": "block",
-            "reason": reason,
-        })),
-        HookResult::UpdateInput { updated_input } => {
-            Some(serde_json::json!({ "updatedInput": updated_input }))
-        }
-    };
+    let output_json = serialize_hook_result(&payload.tool, hook_name, &result);
     if let Some(json) = output_json {
         let mut stdout = std::io::stdout().lock();
-        if serde_json::to_writer(&mut stdout, &json).is_ok() && stdout.flush().is_ok() {
-            if let HookResult::Allow {
+        if serde_json::to_writer(&mut stdout, &json).is_ok()
+            && stdout.flush().is_ok()
+            && let HookResult::Allow {
                 delivery_ack: Some(ack),
                 ..
             } = &result
-            {
-                common::commit_delivery_ack(&db, ack);
-            }
+        {
+            common::commit_delivery_ack(&db, ack);
         }
     }
 
@@ -695,6 +836,19 @@ pub fn get_gemini_version() -> Option<(u32, u32, u32)> {
     if !package_json.exists() {
         // Try parent (dist/index.js -> package.json at package root)
         package_json = real_path.parent()?.parent()?.join("package.json");
+    }
+    #[cfg(windows)]
+    if !package_json.exists() {
+        // npm on Windows installs a `gemini.cmd`/`.ps1` shim directly in the
+        // global bin dir (e.g. `%APPDATA%\npm\`) rather than a symlink into
+        // the package, so canonicalize() just resolves the shim itself. The
+        // package always lives in that same dir's `node_modules\@google\gemini-cli`.
+        package_json = real_path
+            .parent()?
+            .join("node_modules")
+            .join("@google")
+            .join("gemini-cli")
+            .join("package.json");
     }
     if !package_json.exists() {
         return None;
@@ -794,16 +948,8 @@ fn build_all_permission_patterns() -> Vec<String> {
     patterns
 }
 
-/// Resolve the Gemini config directory.
-///
-/// Priority: GEMINI_CLI_HOME env var (+ .gemini suffix) → tool_config_root()/.gemini
 fn gemini_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("GEMINI_CLI_HOME") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir).join(".gemini");
-        }
-    }
-    crate::runtime_env::tool_config_root().join(".gemini")
+    crate::runtime_env::gemini_family_config_dir()
 }
 
 /// Get path to Gemini policies directory.
@@ -846,12 +992,11 @@ fn setup_gemini_policy() -> bool {
     let policy_content = build_gemini_policy();
 
     // Check if already configured correctly
-    if policy_file.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&policy_file) {
-            if existing == policy_content {
-                return true;
-            }
-        }
+    if policy_file.exists()
+        && let Ok(existing) = std::fs::read_to_string(&policy_file)
+        && existing == policy_content
+    {
+        return true;
     }
 
     let _ = std::fs::create_dir_all(&policies_dir);
@@ -919,12 +1064,12 @@ fn set_hooks_enabled(settings: &mut serde_json::Map<String, Value>) {
     }
 
     // Clean up legacy hooks.enabled
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
-        if hooks.get("enabled").and_then(|v| v.as_bool()).is_some() {
-            hooks.remove("enabled");
-            if hooks.is_empty() {
-                settings.remove("hooks");
-            }
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|v| v.as_object_mut())
+        && hooks.get("enabled").and_then(|v| v.as_bool()).is_some()
+    {
+        hooks.remove("enabled");
+        if hooks.is_empty() {
+            settings.remove("hooks");
         }
     }
 }
@@ -942,68 +1087,67 @@ fn is_hooks_enabled(settings: &serde_json::Map<String, Value>) -> bool {
 ///
 /// Only removes hcom-specific hooks, preserving user hooks.
 fn remove_hcom_hooks_from_settings(settings: &mut serde_json::Map<String, Value>) {
-    if let Some(hooks_val) = settings.get_mut("hooks") {
-        if let Some(hooks) = hooks_val.as_object_mut() {
-            let hook_types: Vec<String> = hooks.keys().cloned().collect();
-            for hook_type in hook_types {
-                if let Some(matchers) = hooks.get_mut(&hook_type).and_then(|v| v.as_array_mut()) {
-                    let mut updated = Vec::new();
-                    for matcher in matchers.iter() {
-                        if let Some(matcher_obj) = matcher.as_object() {
-                            if let Some(hook_list) =
-                                matcher_obj.get("hooks").and_then(|v| v.as_array())
-                            {
-                                let non_hcom: Vec<Value> = hook_list
-                                    .iter()
-                                    .filter(|h| !is_hcom_hook(h))
-                                    .cloned()
-                                    .collect();
-                                if !non_hcom.is_empty() {
-                                    let mut new_matcher = matcher_obj.clone();
-                                    new_matcher.insert("hooks".into(), Value::Array(non_hcom));
-                                    updated.push(Value::Object(new_matcher));
-                                } else if !matcher_obj.contains_key("hooks") {
-                                    updated.push(matcher.clone());
-                                }
-                                // else: had only hcom hooks — drop
-                            } else {
+    if let Some(hooks_val) = settings.get_mut("hooks")
+        && let Some(hooks) = hooks_val.as_object_mut()
+    {
+        let hook_types: Vec<String> = hooks.keys().cloned().collect();
+        for hook_type in hook_types {
+            if let Some(matchers) = hooks.get_mut(&hook_type).and_then(|v| v.as_array_mut()) {
+                let mut updated = Vec::new();
+                for matcher in matchers.iter() {
+                    if let Some(matcher_obj) = matcher.as_object() {
+                        if let Some(hook_list) = matcher_obj.get("hooks").and_then(|v| v.as_array())
+                        {
+                            let non_hcom: Vec<Value> = hook_list
+                                .iter()
+                                .filter(|h| !is_hcom_hook(h))
+                                .cloned()
+                                .collect();
+                            if !non_hcom.is_empty() {
+                                let mut new_matcher = matcher_obj.clone();
+                                new_matcher.insert("hooks".into(), Value::Array(non_hcom));
+                                updated.push(Value::Object(new_matcher));
+                            } else if !matcher_obj.contains_key("hooks") {
                                 updated.push(matcher.clone());
                             }
+                            // else: had only hcom hooks — drop
                         } else {
                             updated.push(matcher.clone());
                         }
-                    }
-                    if updated.is_empty() {
-                        hooks.remove(&hook_type);
                     } else {
-                        hooks.insert(hook_type, Value::Array(updated));
+                        updated.push(matcher.clone());
                     }
                 }
+                if updated.is_empty() {
+                    hooks.remove(&hook_type);
+                } else {
+                    hooks.insert(hook_type, Value::Array(updated));
+                }
             }
+        }
 
-            // Clean up legacy hooks.enabled
-            if hooks.get("enabled").and_then(|v| v.as_bool()).is_some() {
-                hooks.remove("enabled");
-            }
+        // Clean up legacy hooks.enabled
+        if hooks.get("enabled").and_then(|v| v.as_bool()).is_some() {
+            hooks.remove("enabled");
+        }
 
-            if hooks.is_empty() {
-                settings.remove("hooks");
-            }
+        if hooks.is_empty() {
+            settings.remove("hooks");
         }
     }
 
     // Remove hcom permission patterns from tools.allowed
-    if let Some(tools) = settings.get_mut("tools").and_then(|v| v.as_object_mut()) {
-        if let Some(allowed) = tools.get_mut("allowed").and_then(|v| v.as_array_mut()) {
-            let all_patterns = build_all_permission_patterns();
-            allowed.retain(|v| {
-                v.as_str()
-                    .map(|s| !all_patterns.iter().any(|p| p == s))
-                    .unwrap_or(true)
-            });
-            if allowed.is_empty() {
-                tools.remove("allowed");
-            }
+    if let Some(tools) = settings.get_mut("tools").and_then(|v| v.as_object_mut())
+        && let Some(allowed) = tools.get_mut("allowed").and_then(|v| v.as_array_mut())
+    {
+        let all_patterns = build_all_permission_patterns();
+        allowed.retain(|v| {
+            v.as_str()
+                .map(|s| !all_patterns.iter().any(|p| p == s))
+                .unwrap_or(true)
+        });
+        if allowed.is_empty() {
+            tools.remove("allowed");
         }
     }
 }
@@ -1014,10 +1158,10 @@ fn remove_hcom_hooks_from_settings(settings: &mut serde_json::Map<String, Value>
 /// Skips mutation if Gemini version < 0.26.0.
 pub fn ensure_hooks_enabled() -> bool {
     let version = get_gemini_version();
-    if let Some(v) = version {
-        if v < GEMINI_MIN_VERSION {
-            return false;
-        }
+    if let Some(v) = version
+        && v < GEMINI_MIN_VERSION
+    {
+        return false;
     }
 
     let settings_path = get_gemini_settings_path();
@@ -1113,6 +1257,31 @@ pub enum SetupError {
     },
 }
 
+/// Shell wrapper for a single hcom hook subcommand (`gemini-beforeagent`, etc.).
+///
+/// Silently no-ops (exit 0) when hcom isn't on PATH.
+///
+/// Gemini CLI's `getShellConfiguration()` (packages/core/src/utils/shell-utils.ts)
+/// runs hook commands via PowerShell on Windows (`-NoProfile -NonInteractive -Command`),
+/// never a POSIX shell, and via a POSIX shell (e.g. `bash -c`) elsewhere. The command
+/// string built here is PowerShell-native on Windows and POSIX `sh -c` elsewhere to
+/// match what actually executes it.
+fn hook_command(hcom_cmd: &str, cmd_suffix: &str) -> String {
+    let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
+    if cfg!(windows) {
+        // hcom_cmd/cmd_suffix are always fixed hcom invocations (never user input),
+        // so no quoting is needed here; if that ever changes, note that PowerShell
+        // still expands `$variables` and backticks in bare (unquoted) script text.
+        format!(
+            "if (Get-Command {bin} -ErrorAction SilentlyContinue) {{ {hcom_cmd} {cmd_suffix} }} else {{ exit 0 }}"
+        )
+    } else {
+        format!(
+            "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {cmd_suffix} || exit 0'"
+        )
+    }
+}
+
 /// Set up hcom hooks in Gemini settings.json.
 ///
 /// - Removes existing hcom hooks first (clean slate)
@@ -1120,13 +1289,13 @@ pub enum SetupError {
 /// - Uses atomic write for safety
 pub fn try_setup_gemini_hooks(include_permissions: bool) -> Result<(), SetupError> {
     // Guard: block only if version detected AND too old
-    if let Some(v) = get_gemini_version() {
-        if v < GEMINI_MIN_VERSION {
-            return Err(SetupError::VersionUnsupported {
-                detected: v,
-                required: GEMINI_MIN_VERSION,
-            });
-        }
+    if let Some(v) = get_gemini_version()
+        && v < GEMINI_MIN_VERSION
+    {
+        return Err(SetupError::VersionUnsupported {
+            detected: v,
+            required: GEMINI_MIN_VERSION,
+        });
     }
 
     let settings_path = get_gemini_settings_path();
@@ -1181,16 +1350,12 @@ pub fn try_setup_gemini_hooks(include_permissions: bool) -> Result<(), SetupErro
     if let Some(hooks) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
         for &(hook_type, matcher, cmd_suffix, timeout, description) in GEMINI_HOOK_CONFIGS {
             let hook_name = format!("hcom-{}", hook_type.to_lowercase());
-            let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-            let hook_command = format!(
-                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {cmd_suffix} || exit 0'"
-            );
             let hook_entry = serde_json::json!({
                 "matcher": matcher,
                 "hooks": [{
                     "name": hook_name,
                     "type": "command",
-                    "command": hook_command,
+                    "command": hook_command(&hcom_cmd, cmd_suffix),
                     "timeout": timeout,
                     "description": description,
                 }]
@@ -1419,254 +1584,41 @@ fn remove_hooks_from_path(path: &Path) -> bool {
     crate::paths::atomic_write(path, &json_str)
 }
 
-/// Gemini arg parser result — detects headless mode and validates conflicts.
-///
-/// Full arg parser (merge, update, rebuild) is future scope.
-#[derive(Debug, Clone)]
-pub struct GeminiArgsSpec {
-    pub is_headless: bool,
-    pub has_prompt_flag: bool,
-    pub has_prompt_interactive: bool,
-    pub is_yolo: bool,
-    pub errors: Vec<String>,
-}
-
-/// Boolean flags (no value required).
-const GEMINI_BOOLEAN_FLAGS: &[&str] = &[
-    "-d",
-    "--debug",
-    "-s",
-    "--sandbox",
-    "-y",
-    "--yolo",
-    "-l",
-    "--list-extensions",
-    "--list-sessions",
-    "--screen-reader",
-    "-v",
-    "--version",
-    "-h",
-    "--help",
-    "--experimental-acp",
-    "--raw-output",
-    "--accept-raw-output-risk",
-];
-
-/// Flags that require a following value.
-const GEMINI_VALUE_FLAGS: &[&str] = &[
-    "-m",
-    "--model",
-    "-p",
-    "--prompt",
-    "-i",
-    "--prompt-interactive",
-    "--approval-mode",
-    "--allowed-mcp-server-names",
-    "--allowed-tools",
-    "-e",
-    "--extensions",
-    "--delete-session",
-    "--include-directories",
-    "-o",
-    "--output-format",
-];
-
-/// Optional value flags (can be used with or without a value).
-const GEMINI_OPTIONAL_VALUE_FLAGS: &[&str] = &["--resume", "-r"];
-
-/// Known subcommands.
-const GEMINI_SUBCOMMANDS: &[&str] = &[
-    "mcp",
-    "extensions",
-    "extension",
-    "hooks",
-    "hook",
-    "skills",
-    "skill",
-];
-
-/// Parse Gemini CLI args to detect headless mode and validate conflicts.
-///
-pub fn parse_gemini_args(args: &[String]) -> GeminiArgsSpec {
-    let mut is_headless = false;
-    let mut has_prompt_flag = false;
-    let mut has_prompt_interactive = false;
-    let mut is_yolo = false;
-    let mut errors = Vec::new();
-    let mut has_positional = false;
-
-    let mut i = 0;
-
-    // Skip subcommand if present
-    if !args.is_empty() {
-        let first = args[0].to_lowercase();
-        if GEMINI_SUBCOMMANDS.contains(&first.as_str()) {
-            i = 1;
-        }
-    }
-
-    let mut pending_flag: Option<String> = None;
-    let mut after_double_dash = false;
-
-    while i < args.len() {
-        let token = &args[i];
-        let token_lower = token.to_lowercase();
-
-        // Handle pending value flag
-        if let Some(ref flag) = pending_flag {
-            let flag_lower = flag.to_lowercase();
-            if flag_lower == "-p" || flag_lower == "--prompt" {
-                has_prompt_flag = true;
-                is_headless = true;
-            }
-            if flag_lower == "-i" || flag_lower == "--prompt-interactive" {
-                has_prompt_interactive = true;
-            }
-            if flag_lower == "--approval-mode" && token_lower == "yolo" {
-                is_yolo = true;
-            }
-            pending_flag = None;
-            i += 1;
-            continue;
-        }
-
-        // After -- separator
-        if after_double_dash {
-            has_positional = true;
-            if !has_prompt_interactive {
-                is_headless = true;
-            }
-            i += 1;
-            continue;
-        }
-
-        if token == "--" {
-            after_double_dash = true;
-            i += 1;
-            continue;
-        }
-
-        // Boolean flags
-        if GEMINI_BOOLEAN_FLAGS.contains(&token_lower.as_str()) {
-            if token_lower == "--yolo" || token_lower == "-y" {
-                is_yolo = true;
-            }
-            i += 1;
-            continue;
-        }
-
-        // Optional value flags (--resume)
-        if GEMINI_OPTIONAL_VALUE_FLAGS.contains(&token_lower.as_str()) {
-            i += 1;
-            // Peek: consume value only if looks like session ID
-            if i < args.len() {
-                let next = &args[i];
-                if !next.starts_with('-') && looks_like_session_id(next) {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-
-        // --flag=value syntax
-        let mut matched_eq = false;
-        for flag in GEMINI_VALUE_FLAGS
-            .iter()
-            .chain(GEMINI_OPTIONAL_VALUE_FLAGS.iter())
-        {
-            let prefix = format!("{}=", flag);
-            if token_lower.starts_with(&prefix) {
-                let value = &token[prefix.len()..];
-                let flag_lower = flag.to_lowercase();
-                if flag_lower == "-p" || flag_lower == "--prompt" {
-                    has_prompt_flag = true;
-                    is_headless = true;
-                }
-                if flag_lower == "-i" || flag_lower == "--prompt-interactive" {
-                    has_prompt_interactive = true;
-                }
-                if flag_lower == "--approval-mode" && value.to_lowercase() == "yolo" {
-                    is_yolo = true;
-                }
-                matched_eq = true;
-                break;
-            }
-        }
-        if matched_eq {
-            i += 1;
-            continue;
-        }
-
-        // Value flags (space-separated)
-        if GEMINI_VALUE_FLAGS.contains(&token_lower.as_str()) {
-            pending_flag = Some(token.clone());
-            i += 1;
-            continue;
-        }
-
-        // Positional or unknown
-        if !token_lower.starts_with('-') {
-            has_positional = true;
-            if !has_prompt_interactive {
-                is_headless = true;
-            }
-        }
-        i += 1;
-    }
-
-    // Validate conflicts
-    if has_positional {
-        errors.push(
-            "ERROR: Gemini headless mode (positional query) not supported in hcom.\n\
-             Use -i/--prompt-interactive for interactive sessions with initial prompt.\n\
-             For headless: use 'hcom N claude -p \"task\"'"
-                .to_string(),
-        );
-    } else if has_prompt_flag {
-        errors.push(
-            "ERROR: Gemini headless mode (-p/--prompt flag) not supported in hcom.\n\
-             Use -i/--prompt-interactive for interactive sessions with initial prompt.\n\
-             For headless: use 'hcom N claude -p \"task\"'"
-                .to_string(),
-        );
-    }
-
-    if is_yolo && has_prompt_flag {
-        // --yolo with --approval-mode together check
-    }
-
-    GeminiArgsSpec {
-        is_headless,
-        has_prompt_flag,
-        has_prompt_interactive,
-        is_yolo,
-        errors,
-    }
-}
-
-/// Check if token looks like a Gemini session ID (numeric, "latest", or UUID).
-fn looks_like_session_id(token: &str) -> bool {
-    let lower = token.to_lowercase();
-    if lower == "latest" {
-        return true;
-    }
-    if token.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    // UUID: 8-4-4-4-12 hex chars
-    let parts: Vec<&str> = lower.split('-').collect();
-    parts.len() == 5
-        && parts[0].len() == 8
-        && parts[1].len() == 4
-        && parts[2].len() == 4
-        && parts[3].len() == 4
-        && parts[4].len() == 12
-        && lower.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hook_command_platform_specific() {
+        let cmd = hook_command("hcom", "gemini-beforeagent");
+        if cfg!(windows) {
+            assert_eq!(
+                cmd,
+                "if (Get-Command hcom -ErrorAction SilentlyContinue) { hcom gemini-beforeagent } else { exit 0 }"
+            );
+        } else {
+            assert_eq!(
+                cmd,
+                "sh -c 'command -v hcom >/dev/null 2>&1 && exec hcom gemini-beforeagent || exit 0'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hook_command_uses_first_word_as_bin_for_uvx() {
+        let cmd = hook_command("uvx hcom", "gemini-sessionend");
+        if cfg!(windows) {
+            assert_eq!(
+                cmd,
+                "if (Get-Command uvx -ErrorAction SilentlyContinue) { uvx hcom gemini-sessionend } else { exit 0 }"
+            );
+        } else {
+            assert_eq!(
+                cmd,
+                "sh -c 'command -v uvx >/dev/null 2>&1 && exec uvx hcom gemini-sessionend || exit 0'"
+            );
+        }
+    }
 
     #[test]
     fn test_matches_session_pattern() {
@@ -1714,6 +1666,93 @@ mod tests {
     fn test_get_handler_unknown() {
         assert!(get_handler("gemini-unknown").is_none());
         assert!(get_handler("sessionstart").is_none());
+    }
+
+    #[test]
+    fn test_detect_antigravity_via_env() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("ANTIGRAVITY_AGENT", "1"), ("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({"sessionId": "abc"});
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(is_agy);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn test_detect_gemini_session_without_tool_call() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("GEMINI_CLI", "1"), ("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({"sessionId": "abc", "conversationId": "legacy"});
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(!is_agy);
+        assert!(!fallback);
+    }
+
+    #[test]
+    fn test_detect_antigravity_tool_call_fallback() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({
+            "conversationId": "6f000787",
+            "toolCall": {"name": "run_command", "args": {}}
+        });
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(is_agy);
+        assert!(fallback);
+    }
+
+    #[test]
+    fn test_detect_antigravity_lifecycle_schema_fallback() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({
+            "conversationId": "6f000787",
+            "workspacePaths": ["/tmp/project"],
+            "invocationNum": 1
+        });
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(is_agy);
+        assert!(fallback);
+    }
+
+    #[test]
+    fn test_detect_plain_conversation_id_does_not_steal_gemini_payload() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let env: HashMap<String, String> = [("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let stdin = serde_json::json!({"conversationId": "legacy"});
+        let (is_agy, fallback) = detect_antigravity_payload(&ctx, &stdin);
+        assert!(!is_agy);
+        assert!(!fallback);
     }
 
     #[test]
@@ -1971,82 +2010,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_gemini_args_no_args() {
-        let spec = parse_gemini_args(&[]);
-        assert!(!spec.is_headless);
-        assert!(spec.errors.is_empty());
-    }
-
-    #[test]
-    fn test_parse_gemini_args_headless_positional() {
-        let args: Vec<String> = vec!["explain rust".into()];
-        let spec = parse_gemini_args(&args);
-        assert!(spec.is_headless);
-        assert!(!spec.errors.is_empty());
-        assert!(spec.errors[0].contains("headless"));
-    }
-
-    #[test]
-    fn test_parse_gemini_args_headless_prompt_flag() {
-        let args: Vec<String> = vec!["-p".into(), "write code".into()];
-        let spec = parse_gemini_args(&args);
-        assert!(spec.is_headless);
-        assert!(spec.has_prompt_flag);
-        assert!(!spec.errors.is_empty());
-    }
-
-    #[test]
-    fn test_parse_gemini_args_interactive_not_headless() {
-        let args: Vec<String> = vec!["-i".into(), "initial prompt".into()];
-        let spec = parse_gemini_args(&args);
-        assert!(!spec.is_headless);
-        assert!(spec.has_prompt_interactive);
-        assert!(spec.errors.is_empty());
-    }
-
-    #[test]
-    fn test_parse_gemini_args_model_flag() {
-        let args: Vec<String> = vec!["--model".into(), "gemini-2.0".into()];
-        let spec = parse_gemini_args(&args);
-        assert!(!spec.is_headless);
-        assert!(spec.errors.is_empty());
-    }
-
-    #[test]
-    fn test_parse_gemini_args_yolo() {
-        let args: Vec<String> = vec!["--yolo".into()];
-        let spec = parse_gemini_args(&args);
-        assert!(spec.is_yolo);
-    }
-
-    #[test]
-    fn test_parse_gemini_args_subcommand_skipped() {
-        let args: Vec<String> = vec!["hooks".into(), "--help".into()];
-        let spec = parse_gemini_args(&args);
-        assert!(!spec.is_headless);
-        assert!(spec.errors.is_empty());
-    }
-
-    #[test]
-    fn test_parse_gemini_args_prompt_equals() {
-        let args: Vec<String> = vec!["--prompt=write code".into()];
-        let spec = parse_gemini_args(&args);
-        assert!(spec.is_headless);
-        assert!(spec.has_prompt_flag);
-    }
-
-    #[test]
-    fn test_looks_like_session_id() {
-        assert!(looks_like_session_id("latest"));
-        assert!(looks_like_session_id("42"));
-        assert!(looks_like_session_id(
-            "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-        ));
-        assert!(!looks_like_session_id("explain rust"));
-        assert!(!looks_like_session_id("--model"));
-    }
-
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
 
@@ -2107,10 +2070,7 @@ mod tests {
             }
         };
         for &(hook_type, cmd_suffix) in expected {
-            let bin = hcom_cmd.split_whitespace().next().unwrap_or("hcom");
-            let expected_full = format!(
-                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom_cmd} {cmd_suffix} || exit 0'"
-            );
+            let expected_full = hook_command(&hcom_cmd, cmd_suffix);
             let matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
                 Some(a) => a,
                 None => {
@@ -2122,11 +2082,11 @@ mod tests {
             for matcher in matchers {
                 if let Some(hook_list) = matcher.get("hooks").and_then(|v| v.as_array()) {
                     for hook in hook_list {
-                        if let Some(cmd) = hook.get("command").and_then(|v| v.as_str()) {
-                            if cmd == expected_full {
-                                found = true;
-                                break;
-                            }
+                        if let Some(cmd) = hook.get("command").and_then(|v| v.as_str())
+                            && cmd == expected_full
+                        {
+                            found = true;
+                            break;
                         }
                     }
                 }
@@ -2211,10 +2171,7 @@ mod tests {
             );
             assert_eq!(hook["timeout"].as_u64().unwrap(), expected_timeout as u64);
             let hcom = crate::runtime_env::build_hcom_command();
-            let bin = hcom.split_whitespace().next().unwrap_or("hcom");
-            let expected_command = format!(
-                "sh -c 'command -v {bin} >/dev/null 2>&1 && exec {hcom} {cmd_suffix} || exit 0'"
-            );
+            let expected_command = hook_command(&hcom, cmd_suffix);
             assert_eq!(
                 hook["command"].as_str().unwrap(),
                 expected_command,
@@ -2852,5 +2809,264 @@ mod tests {
         );
 
         drop(_guard);
+    }
+
+    #[test]
+    fn test_antigravity_serialization_allow_no_context() {
+        let result = HookResult::Allow {
+            additional_context: None,
+            system_message: None,
+            delivery_ack: None,
+        };
+        // PreToolUse REQUIRES `decision` — `{}` is treated as deny and blocks all tools.
+        let beforetool =
+            serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
+        assert_eq!(beforetool, serde_json::json!({ "decision": "allow" }));
+
+        // Other phases (PostToolUse, PreInvocation noop, etc.) emit `{}`.
+        let aftertool = serialize_hook_result("antigravity", "gemini-aftertool", &result).unwrap();
+        assert_eq!(aftertool, serde_json::json!({}));
+
+        let sessionend =
+            serialize_hook_result("antigravity", "gemini-sessionend", &result).unwrap();
+        assert_eq!(sessionend, serde_json::json!({ "decision": "allow" }));
+    }
+
+    #[test]
+    fn test_antigravity_serialization_allow_with_context() {
+        let result = HookResult::Allow {
+            additional_context: Some("pending messages".to_string()),
+            system_message: None,
+            delivery_ack: None,
+        };
+        // agy PreInvocation/PostInvocation hooks accept injectSteps; hookSpecificOutput is
+        // silently ignored. Only gemini-sessionstart, -beforeagent, -afteragent emit injection.
+        let out = serialize_hook_result("antigravity", "gemini-beforeagent", &result).unwrap();
+        assert_eq!(
+            out["injectSteps"][0]["ephemeralMessage"],
+            "pending messages"
+        );
+        assert!(out.get("hookSpecificOutput").is_none());
+        assert!(out.get("decision").is_none());
+
+        // PostToolUse (gemini-aftertool) cannot inject in agy — drop context, emit `{}`.
+        let aftertool = serialize_hook_result("antigravity", "gemini-aftertool", &result).unwrap();
+        assert_eq!(aftertool, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_antigravity_serialization_block() {
+        let result = HookResult::Block {
+            reason: "permission denied".to_string(),
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["decision"], "deny");
+        assert_eq!(out["reason"], "permission denied");
+        assert!(out.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn test_antigravity_serialization_update_input() {
+        let result = HookResult::UpdateInput {
+            updated_input: serde_json::json!({"command": "ls -l"}),
+        };
+        let out = serialize_hook_result("antigravity", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["updatedInput"]["command"], "ls -l");
+    }
+
+    #[test]
+    fn test_gemini_serialization_allow_no_context() {
+        let result = HookResult::Allow {
+            additional_context: None,
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("gemini", "gemini-beforetool", &result);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_gemini_serialization_allow_with_context() {
+        let result = HookResult::Allow {
+            additional_context: Some("injected context".to_string()),
+            system_message: None,
+            delivery_ack: None,
+        };
+        let out = serialize_hook_result("gemini", "gemini-beforetool", &result).unwrap();
+        assert_eq!(out["decision"], "allow");
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "BeforeTool");
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            "injected context"
+        );
+    }
+
+    fn make_test_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    fn insert_test_instance(db: &HcomDb, name: &str, tool: &str) {
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn().execute(
+            "INSERT INTO instances (name, status, created_at, tool) VALUES (?1, 'active', ?2, ?3)",
+            rusqlite::params![name, now, tool],
+        ).unwrap();
+    }
+
+    fn insert_test_message(db: &HcomDb, instance: &str, from: &str, text: &str) -> i64 {
+        let data = serde_json::json!({
+            "from": from,
+            "text": text,
+            "scope": "broadcast",
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:01Z', ?1, ?2)",
+                rusqlite::params![instance, data],
+            )
+            .unwrap();
+        db.conn().last_insert_rowid()
+    }
+
+    #[test]
+    fn test_antigravity_aftertool_does_not_ack_pending_delivery() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "vago", "antigravity");
+        db.rebind_session("sess-vago", "vago").unwrap();
+        let message_id = insert_test_message(&db, "homo", "homo", "secret body");
+
+        let env: HashMap<String, String> = [("ANTIGRAVITY_AGENT", "1"), ("HOME", "/home/test")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let payload = HookPayload {
+            session_id: Some("sess-vago".to_string()),
+            transcript_path: None,
+            hook_name: "gemini-aftertool".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: "run_command".to_string(),
+            tool_input: serde_json::Value::Null,
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = handle_aftertool(&db, &ctx, &payload);
+        match result {
+            HookResult::Allow {
+                additional_context,
+                delivery_ack,
+                ..
+            } => {
+                assert!(additional_context.is_none());
+                assert!(delivery_ack.is_none());
+            }
+            _ => panic!("expected Allow"),
+        }
+
+        let cursor: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'vago'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, 0);
+        assert_eq!(db.get_unread_messages("vago").len(), 1);
+        assert_eq!(db.get_unread_messages("vago")[0].event_id, Some(message_id));
+    }
+
+    #[test]
+    fn test_antigravity_afteragent_does_not_mark_idle_mid_turn() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "vago", "antigravity");
+        db.rebind_session("sess-vago", "vago").unwrap();
+
+        let payload = HookPayload {
+            session_id: Some("sess-vago".to_string()),
+            transcript_path: None,
+            hook_name: "gemini-afteragent".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: String::new(),
+            tool_input: serde_json::Value::Null,
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = handle_afteragent(&db, &HcomContext::from_os(), &payload);
+        assert_eq!(result.exit_code(), 0);
+        let instance = db.get_instance_full("vago").unwrap().unwrap();
+        assert_eq!(instance.status, "active");
+    }
+
+    #[test]
+    fn test_antigravity_turn_end_stop_marks_idle() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "vago", "antigravity");
+        db.rebind_session("sess-vago", "vago").unwrap();
+
+        let payload = HookPayload {
+            session_id: Some("sess-vago".to_string()),
+            transcript_path: None,
+            hook_name: "gemini-sessionend".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: String::new(),
+            tool_input: serde_json::Value::Null,
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::json!({
+                "fullyIdle": true,
+                "terminationReason": "NO_TOOL_CALL",
+            }),
+        };
+
+        let result = handle_sessionend(&db, &HcomContext::from_os(), &payload);
+        assert_eq!(result.exit_code(), 0);
+        let instance = db.get_instance_full("vago").unwrap().unwrap();
+        assert_eq!(instance.status, ST_LISTENING);
+    }
+
+    #[test]
+    fn test_antigravity_beforetool_uses_antigravity_status_detail() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "vago", "antigravity");
+        db.rebind_session("sess-vago", "vago").unwrap();
+
+        let payload = HookPayload {
+            session_id: Some("sess-vago".to_string()),
+            transcript_path: None,
+            hook_name: "gemini-beforetool".to_string(),
+            tool: "antigravity".to_string(),
+            tool_name: "run_command".to_string(),
+            tool_input: serde_json::json!({ "CommandLine": "cargo test" }),
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let result = handle_beforetool(&db, &HcomContext::from_os(), &payload);
+        assert_eq!(result.exit_code(), 0);
+
+        let detail: String = db
+            .conn()
+            .query_row(
+                "SELECT status_detail FROM instances WHERE name = 'vago'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(detail, "cargo test");
     }
 }

@@ -182,11 +182,11 @@ impl App {
     pub fn handle_paste(&mut self, text: &str) {
         let clean: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
         if self.ui.mode == InputMode::Relay {
-            if let Some(ref mut popup) = self.ui.relay_popup {
-                if popup.editing_token {
-                    for c in clean.chars() {
-                        insert_at(&mut popup.token_input, &mut popup.token_cursor, c);
-                    }
+            if let Some(ref mut popup) = self.ui.relay_popup
+                && popup.editing_token
+            {
+                for c in clean.chars() {
+                    insert_at(&mut popup.token_input, &mut popup.token_cursor, c);
                 }
             }
         } else if self.ui.mode == InputMode::Launch && self.ui.launch.editing.is_some() {
@@ -247,6 +247,26 @@ impl App {
     }
 
     fn handle_confirm(&mut self, code: KeyCode) {
+        if self
+            .ui
+            .confirm
+            .as_ref()
+            .is_some_and(Confirm::is_inline_agent_action)
+        {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    if let Some(confirm) = self.ui.confirm.take() {
+                        self.execute_confirm(confirm.action);
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.ui.confirm = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match code {
             KeyCode::Left | KeyCode::Right => {
                 if let Some(ref mut c) = self.ui.confirm {
@@ -273,22 +293,22 @@ impl App {
             KeyCode::Esc => {
                 self.ui.confirm = None;
             }
-            KeyCode::Char('n') => {
-                // n = "No" shortcut, not applicable to OrphanAction (Kill/Recover)
+            KeyCode::Char('n')
                 if !matches!(
                     self.ui.confirm.as_ref().map(|c| &c.action),
                     Some(ConfirmAction::OrphanAction(_))
-                ) {
-                    self.ui.confirm = None;
-                }
+                ) =>
+            {
+                // n = "No" shortcut, not applicable to OrphanAction (Kill/Recover)
+                self.ui.confirm = None;
             }
             KeyCode::Char('y') => {
                 // y = "Yes" shortcut, not applicable to OrphanAction
-                if let Some(confirm) = self.ui.confirm.as_ref() {
-                    if !matches!(confirm.action, ConfirmAction::OrphanAction(_)) {
-                        let confirm = self.ui.confirm.take().unwrap();
-                        self.execute_confirm(confirm.action);
-                    }
+                if let Some(confirm) = self.ui.confirm.as_ref()
+                    && !matches!(confirm.action, ConfirmAction::OrphanAction(_))
+                {
+                    let confirm = self.ui.confirm.take().unwrap();
+                    self.execute_confirm(confirm.action);
                 }
             }
             _ => {}
@@ -305,25 +325,20 @@ impl App {
 
         match code {
             // MOVEMENT — always work, no conditions
-            KeyCode::Up => {
-                if self.ui.cursor > 0 {
-                    self.ui.cursor -= 1;
-                }
+            KeyCode::Up if self.ui.cursor > 0 => {
+                self.ui.cursor -= 1;
             }
-            KeyCode::Down => {
-                if self.ui.cursor + 1 < self.total_visible_rows() {
-                    self.ui.cursor += 1;
-                }
+            KeyCode::Down if self.ui.cursor + 1 < self.total_visible_rows() => {
+                self.ui.cursor += 1;
             }
-            KeyCode::Left if self.ui.view_mode == ViewMode::Inline => {
-                if self.ui.cursor > 0 {
-                    self.ui.cursor -= 1;
-                }
+            KeyCode::Left if self.ui.view_mode == ViewMode::Inline && self.ui.cursor > 0 => {
+                self.ui.cursor -= 1;
             }
-            KeyCode::Right if self.ui.view_mode == ViewMode::Inline => {
-                if self.ui.cursor + 1 < self.total_visible_rows() {
-                    self.ui.cursor += 1;
-                }
+            KeyCode::Right
+                if self.ui.view_mode == ViewMode::Inline
+                    && self.ui.cursor + 1 < self.total_visible_rows() =>
+            {
+                self.ui.cursor += 1;
             }
             KeyCode::Home => {
                 if self.ui.view_mode == ViewMode::Inline {
@@ -389,7 +404,7 @@ impl App {
 
             // ACTIONS — operate on resolve_targets() (selection or cursor)
             KeyCode::Char('k') => {
-                let names = self.resolve_targets();
+                let names = self.resolve_kill_targets();
                 if !names.is_empty() {
                     let text = if names.len() == 1 {
                         format!("Kill {}?", names[0])
@@ -401,7 +416,7 @@ impl App {
                 }
             }
             KeyCode::Char('f') => {
-                let names = self.resolve_targets();
+                let names = self.resolve_fork_targets();
                 if !names.is_empty() {
                     let text = if names.len() == 1 {
                         format!("Fork {}?", names[0])
@@ -412,13 +427,25 @@ impl App {
                         Some(Confirm::new(text, ConfirmAction::ForkAgents(names), true));
                 }
             }
+            KeyCode::Char('r') => {
+                let names = self.resolve_resume_targets();
+                if !names.is_empty() {
+                    let text = if names.len() == 1 {
+                        format!("Resume {}?", names[0])
+                    } else {
+                        format!("Resume {} agents?", names.len())
+                    };
+                    self.ui.confirm =
+                        Some(Confirm::new(text, ConfirmAction::ResumeAgents(names), true));
+                }
+            }
             KeyCode::Char('t') => {
-                let names = self.resolve_targets();
+                let names = self.resolve_tag_targets();
                 if !names.is_empty() {
                     // Pre-fill with common tag if all targets share one
                     let tags: std::collections::HashSet<&str> = names
                         .iter()
-                        .filter_map(|n| self.data.agents.iter().find(|a| a.name == *n))
+                        .filter_map(|n| self.find_agent_by_action_name(n))
                         .map(|a| a.tag.as_str())
                         .collect();
                     let common_tag = if tags.len() == 1 {
@@ -536,20 +563,77 @@ impl App {
         }
     }
 
-    /// Resolve action target: selection if non-empty, else cursor agent.
-    fn resolve_targets(&self) -> Vec<String> {
+    /// Resolve selectable target names by action capability.
+    fn resolve_action_targets(&self, can_apply: impl Fn(&Agent) -> bool) -> Vec<String> {
         if !self.ui.selected.is_empty() {
-            self.ui
-                .selected
-                .iter()
-                .filter(|n| self.data.agents.iter().any(|a| &a.name == *n))
-                .cloned()
-                .collect()
-        } else {
-            match self.cursor_target() {
-                CursorTarget::Agent(idx) => vec![self.data.agents[idx].name.clone()],
-                _ => Vec::new(),
-            }
+            return self
+                .all_agents()
+                .filter(|agent| can_apply(agent) && self.ui.selected.contains(&agent.action_name()))
+                .map(Agent::action_name)
+                .collect();
+        }
+
+        self.cursor_agent()
+            .filter(|agent| can_apply(agent))
+            .map(|agent| vec![agent.action_name()])
+            .unwrap_or_default()
+    }
+
+    fn resolve_kill_targets(&self) -> Vec<String> {
+        self.resolve_action_targets(Agent::can_kill)
+    }
+
+    fn resolve_fork_targets(&self) -> Vec<String> {
+        self.resolve_action_targets(Agent::can_fork_from_tui)
+    }
+
+    fn resolve_resume_targets(&self) -> Vec<String> {
+        self.resolve_action_targets(Agent::can_resume)
+    }
+
+    fn resolve_tag_targets(&self) -> Vec<String> {
+        self.resolve_action_targets(Agent::can_tag)
+    }
+
+    fn all_agents(&self) -> impl Iterator<Item = &Agent> {
+        self.data
+            .agents
+            .iter()
+            .chain(self.data.remote_agents.iter())
+            .chain(self.data.stopped_agents.iter())
+    }
+
+    fn cursor_agent(&self) -> Option<&Agent> {
+        match self.cursor_target() {
+            CursorTarget::Agent(idx) => self.data.agents.get(idx),
+            CursorTarget::RemoteAgent(idx) => self.data.remote_agents.get(idx),
+            CursorTarget::StoppedAgent(idx) => self.data.stopped_agents.get(idx),
+            _ => None,
+        }
+    }
+
+    fn find_agent_by_action_name(&self, name: &str) -> Option<&Agent> {
+        self.all_agents().find(|agent| agent.action_name() == name)
+    }
+
+    pub(crate) fn cursor_action_availability(&self) -> ActionAvailability {
+        if !self.ui.selected.is_empty() {
+            return ActionAvailability {
+                kill: !self.resolve_kill_targets().is_empty(),
+                fork: !self.resolve_fork_targets().is_empty(),
+                resume: !self.resolve_resume_targets().is_empty(),
+                tag: !self.resolve_tag_targets().is_empty(),
+            };
+        }
+
+        match self.cursor_agent() {
+            Some(agent) => ActionAvailability {
+                kill: agent.can_kill(),
+                fork: agent.can_fork_from_tui(),
+                resume: agent.can_resume(),
+                tag: agent.can_tag(),
+            },
+            None => ActionAvailability::default(),
         }
     }
 
@@ -758,36 +842,21 @@ impl App {
     fn build_command_suggestions(&self) -> Vec<CommandSuggestion> {
         let mut s = Vec::new();
 
-        // Collect targeted agent names: selected agents, or cursor agent if none selected
-        let mut targeted: Vec<String> = Vec::new();
+        // Collect targeted agent action names: selected agents, or cursor agent if none selected.
+        let mut targeted: Vec<&Agent> = Vec::new();
         if !self.ui.selected.is_empty() {
-            for a in &self.data.agents {
-                if self.ui.selected.contains(&a.name) {
-                    targeted.push(a.display_name());
+            for agent in self.all_agents() {
+                if self.ui.selected.contains(&agent.action_name()) {
+                    targeted.push(agent);
                 }
             }
-        } else if let Some(name) = self.cursor_display_name() {
-            targeted.push(name);
+        } else if let Some(agent) = self.cursor_agent() {
+            targeted.push(agent);
         }
 
         // Per-agent commands for targeted agents go first
-        for name in &targeted {
-            s.push(CommandSuggestion {
-                command: format!("term {}", name),
-                description: "view terminal",
-            });
-            s.push(CommandSuggestion {
-                command: format!("term inject {} --enter", name),
-                description: "send enter to terminal",
-            });
-            s.push(CommandSuggestion {
-                command: format!("transcript {} --last 1 --full", name),
-                description: "last conversation (full)",
-            });
-            s.push(CommandSuggestion {
-                command: format!("transcript {} --full", name),
-                description: "full transcript",
-            });
+        for agent in &targeted {
+            push_agent_command_suggestions(&mut s, agent);
         }
 
         // Static commands
@@ -817,35 +886,12 @@ impl App {
         });
 
         // Per-agent commands for non-targeted agents
-        for agent in &self.data.agents {
-            let name = agent.display_name();
-            if targeted.contains(&name) {
+        for agent in self.all_agents() {
+            let name = agent.action_name();
+            if targeted.iter().any(|target| target.action_name() == name) {
                 continue;
             }
-            s.push(CommandSuggestion {
-                command: format!("term {}", name),
-                description: "view terminal",
-            });
-            s.push(CommandSuggestion {
-                command: format!("term inject {} --enter", name),
-                description: "send enter to terminal",
-            });
-            s.push(CommandSuggestion {
-                command: format!("transcript {} --last 1 --full", name),
-                description: "last conversation (full)",
-            });
-            s.push(CommandSuggestion {
-                command: format!("transcript {} --full", name),
-                description: "full transcript",
-            });
-        }
-
-        // Stopped agent resume
-        for agent in &self.data.stopped_agents {
-            s.push(CommandSuggestion {
-                command: format!("r {}", agent.display_name()),
-                description: "resume agent",
-            });
+            push_agent_command_suggestions(&mut s, agent);
         }
 
         s
@@ -983,17 +1029,13 @@ impl App {
                 KeyCode::Down => self.ui.launch.cursor_down(),
                 KeyCode::Left => self.ui.launch.adjust_left(),
                 KeyCode::Right => self.ui.launch.adjust_right(),
-                KeyCode::Enter => {
-                    if !self.ui.launch.is_text_field() {
-                        self.ui.launch.toggle_or_select();
-                    }
+                KeyCode::Enter if !self.ui.launch.is_text_field() => {
+                    self.ui.launch.toggle_or_select();
                 }
                 KeyCode::Char(' ') => self.ui.launch.toggle_or_select(),
-                KeyCode::Char(c) => {
-                    if self.ui.launch.is_text_field() {
-                        self.ui.launch.start_editing();
-                        self.ui.launch.insert_char(c);
-                    }
+                KeyCode::Char(c) if self.ui.launch.is_text_field() => {
+                    self.ui.launch.start_editing();
+                    self.ui.launch.insert_char(c);
                 }
                 _ => {}
             }
@@ -1038,10 +1080,11 @@ impl App {
             KeyCode::Right => cursor_right(&self.ui.input, &mut self.ui.input_cursor),
 
             KeyCode::Enter => {
-                let tool = self.ui.launch.tool;
+                let tool = self.ui.launch.tool.clone();
                 let count = self.ui.launch.count;
                 let tag = self.ui.launch.tag.clone();
                 let headless = self.ui.launch.headless;
+                let headless_pty = self.ui.launch.headless_pty;
                 let terminal = self
                     .ui
                     .launch
@@ -1050,12 +1093,14 @@ impl App {
                     .map(|s| s.as_str())
                     .unwrap_or("auto");
                 let prompt = self.ui.input.clone();
+                let tool_name = tool.name().to_string();
 
                 if let Err(e) = self.enqueue_rpc(RpcOp::Launch {
                     tool,
                     count,
                     tag,
                     headless,
+                    headless_pty,
                     terminal: terminal.into(),
                     prompt,
                 }) {
@@ -1065,7 +1110,7 @@ impl App {
                     ));
                 } else {
                     self.ui.flash = Some(Flash::new(
-                        format!("Launching {} {}", count, tool.name()),
+                        format!("Launching {} {}", count, tool_name),
                         Theme::flash_info(),
                     ));
                 }
@@ -1097,31 +1142,29 @@ impl App {
                     popup.token_input.clear();
                     popup.token_cursor = 0;
                 }
-                KeyCode::Enter => {
-                    if !popup.token_input.is_empty() {
-                        let token = popup.token_input.clone();
-                        let cmd = format!("relay connect {}", token);
-                        if let Err(e) = self.enqueue_rpc(RpcOp::RelayConnect {
-                            token: token.clone(),
-                        }) {
-                            self.ui.command_result = Some(CommandResult {
-                                label: cmd,
-                                output: vec![format!("Error: {}", e)],
-                            });
-                        } else {
-                            self.ui.command_result = Some(CommandResult {
-                                label: cmd,
-                                output: vec!["(running...)".into()],
-                            });
-                        }
-                        self.ui.relay_popup = None;
-                        if self.ui.view_mode == ViewMode::Inline {
-                            self.ui.pending_eject_cmd = true;
-                            self.ui.mode = InputMode::Navigate;
-                        } else {
-                            self.ui.mode = InputMode::CommandOutput;
-                            self.ui.msg_scroll = 0;
-                        }
+                KeyCode::Enter if !popup.token_input.is_empty() => {
+                    let token = popup.token_input.clone();
+                    let cmd = format!("relay connect {}", token);
+                    if let Err(e) = self.enqueue_rpc(RpcOp::RelayConnect {
+                        token: token.clone(),
+                    }) {
+                        self.ui.command_result = Some(CommandResult {
+                            label: cmd,
+                            output: vec![format!("Error: {}", e)],
+                        });
+                    } else {
+                        self.ui.command_result = Some(CommandResult {
+                            label: cmd,
+                            output: vec!["(running...)".into()],
+                        });
+                    }
+                    self.ui.relay_popup = None;
+                    if self.ui.view_mode == ViewMode::Inline {
+                        self.ui.pending_eject_cmd = true;
+                        self.ui.mode = InputMode::Navigate;
+                    } else {
+                        self.ui.mode = InputMode::CommandOutput;
+                        self.ui.msg_scroll = 0;
                     }
                 }
                 KeyCode::Left => cursor_left(&popup.token_input, &mut popup.token_cursor),
@@ -1138,15 +1181,11 @@ impl App {
                 self.ui.relay_popup = None;
                 self.ui.mode = InputMode::Navigate;
             }
-            KeyCode::Up => {
-                if popup.cursor > 0 {
-                    popup.cursor -= 1;
-                }
+            KeyCode::Up if popup.cursor > 0 => {
+                popup.cursor -= 1;
             }
-            KeyCode::Down => {
-                if popup.cursor < RELAY_ACTIONS.len() as u8 {
-                    popup.cursor += 1;
-                }
+            KeyCode::Down if popup.cursor < RELAY_ACTIONS.len() as u8 => {
+                popup.cursor += 1;
             }
             KeyCode::Enter | KeyCode::Char(' ') => match popup.cursor {
                 0 => {
@@ -1196,6 +1235,52 @@ impl App {
     }
 }
 
+fn push_agent_command_suggestions(s: &mut Vec<CommandSuggestion>, agent: &Agent) {
+    let name = agent.action_name();
+    if !agent.is_stopped() {
+        s.push(CommandSuggestion {
+            command: format!("term {}", name),
+            description: "view terminal",
+        });
+        s.push(CommandSuggestion {
+            command: format!("term inject {} --enter", name),
+            description: "send enter to terminal",
+        });
+    }
+    s.push(CommandSuggestion {
+        command: format!("transcript {} --last 1 --full", name),
+        description: "last conversation (full)",
+    });
+    s.push(CommandSuggestion {
+        command: format!("transcript {} --full", name),
+        description: "full transcript",
+    });
+    if agent.can_resume() {
+        s.push(CommandSuggestion {
+            command: format!("r {}", name),
+            description: "resume agent",
+        });
+    }
+    if agent.can_fork_from_tui() {
+        s.push(CommandSuggestion {
+            command: format!("f {}", name),
+            description: "fork agent",
+        });
+    }
+    if agent.can_kill() {
+        s.push(CommandSuggestion {
+            command: format!("kill {}", name),
+            description: "kill agent",
+        });
+    }
+    if agent.can_tag() {
+        s.push(CommandSuggestion {
+            command: format!("config -i {} tag", name),
+            description: "set tag",
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1230,6 +1315,14 @@ mod tests {
         app.ui.cursor = 0;
         app.ui.selected.clear();
         app
+    }
+
+    fn flash_text(app: &App) -> String {
+        app.ui
+            .flash
+            .as_ref()
+            .map(|f| f.text.clone())
+            .unwrap_or_default()
     }
 
     #[test]
@@ -1307,6 +1400,100 @@ mod tests {
 
         assert_eq!(app.ui.mode, InputMode::Compose);
         assert_eq!(app.ui.input, "");
+    }
+
+    #[test]
+    fn kill_key_opens_inline_confirm_and_enter_confirms() {
+        let mut app = test_app();
+
+        key(&mut app, KeyCode::Char('k'));
+
+        let confirm = app.ui.confirm.as_ref().expect("confirm");
+        assert!(confirm.is_inline_agent_action());
+        assert!(matches!(confirm.action, ConfirmAction::KillAgents(_)));
+        assert_eq!(confirm.text, "Kill nova?");
+
+        key(&mut app, KeyCode::Enter);
+
+        assert!(app.ui.confirm.is_none());
+        assert!(flash_text(&app).contains("Kill failed"));
+    }
+
+    #[test]
+    fn fork_key_opens_inline_confirm_and_escape_cancels() {
+        let mut app = test_app();
+
+        key(&mut app, KeyCode::Char('f'));
+
+        let confirm = app.ui.confirm.as_ref().expect("confirm");
+        assert!(confirm.is_inline_agent_action());
+        assert!(matches!(confirm.action, ConfirmAction::ForkAgents(_)));
+        assert_eq!(confirm.text, "Fork nova?");
+
+        key(&mut app, KeyCode::Esc);
+
+        assert!(app.ui.confirm.is_none());
+        assert_eq!(flash_text(&app), "");
+    }
+
+    #[test]
+    fn fork_key_ignores_tools_without_fork_support() {
+        let mut app = test_app();
+        app.data.agents[0].tool = Tool::Gemini;
+
+        key(&mut app, KeyCode::Char('f'));
+
+        assert!(app.ui.confirm.is_none());
+    }
+
+    #[test]
+    fn stopped_agent_uses_resume_not_kill_or_fork() {
+        let mut app = test_app();
+        app.data.agents.clear();
+        let mut stopped = make_agent("nova");
+        stopped.status = AgentStatus::Inactive;
+        app.data.stopped_agents = vec![stopped];
+        app.ui.view_mode = ViewMode::Vertical;
+        app.ui.stopped_expanded = true;
+        app.ui.cursor = 1; // stopped header is row 0
+
+        key(&mut app, KeyCode::Char('k'));
+        assert!(app.ui.confirm.is_none());
+        key(&mut app, KeyCode::Char('f'));
+        assert!(app.ui.confirm.is_none());
+
+        key(&mut app, KeyCode::Char('r'));
+        let confirm = app.ui.confirm.as_ref().expect("resume confirm");
+        assert!(matches!(confirm.action, ConfirmAction::ResumeAgents(_)));
+        assert_eq!(confirm.text, "Resume nova?");
+    }
+
+    #[test]
+    fn remote_agent_targets_use_display_name_for_kill_and_tag() {
+        let mut app = test_app();
+        app.data.agents.clear();
+        let mut remote = make_agent("nova");
+        remote.device_name = Some("BOXE".into());
+        app.data.remote_agents = vec![remote];
+        app.ui.remote_expanded = true;
+        app.ui.cursor = 1; // remote header is row 0
+
+        assert_eq!(app.resolve_kill_targets(), vec!["nova:BOXE"]);
+        assert_eq!(app.resolve_tag_targets(), vec!["nova:BOXE"]);
+        assert!(app.resolve_fork_targets().is_empty());
+    }
+
+    #[test]
+    fn selected_local_agent_does_not_match_remote_with_same_base_name() {
+        let mut app = test_app();
+        app.data.agents = vec![make_agent("nova")];
+        let mut remote = make_agent("nova");
+        remote.device_name = Some("BOXE".into());
+        app.data.remote_agents = vec![remote];
+        app.ui.selected.insert("nova".into());
+
+        assert_eq!(app.resolve_kill_targets(), vec!["nova"]);
+        assert_eq!(app.resolve_tag_targets(), vec!["nova"]);
     }
 
     #[test]

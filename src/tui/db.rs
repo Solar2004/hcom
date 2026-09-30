@@ -15,6 +15,30 @@ use crate::tui::status;
 use crate::paths;
 use crate::shared::ST_ACTIVE;
 
+// An open SQLite connection continues to address an unlinked database on Unix.
+// Keep the file identity from when the connection was opened so the TUI can
+// reconnect after `hcom reset` replaces hcom.db from another terminal.
+#[cfg(unix)]
+type DbFileId = (u64, u64);
+
+#[cfg(unix)]
+fn db_file_id(path: &std::path::Path) -> Option<DbFileId> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+// On Windows reset cannot replace a database while another process holds it
+// open: remove_file reports the lock error and leaves the original DB intact.
+#[cfg(not(unix))]
+type DbFileId = ();
+
+#[cfg(not(unix))]
+fn db_file_id(_path: &std::path::Path) -> Option<DbFileId> {
+    None
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -31,6 +55,9 @@ fn read_device_uuid(conn: &Connection) -> String {
 pub struct DbDataSource {
     db_path: PathBuf,
     conn: Option<Connection>,
+    db_file_id: Option<DbFileId>,
+    #[cfg(test)]
+    after_next_open: Option<Box<dyn FnOnce() + Send>>,
     last_data_version: u64,
     cached: Option<DataState>,
     last_error: Option<String>,
@@ -49,6 +76,9 @@ impl DbDataSource {
         Self {
             db_path: paths::db_path(),
             conn: None,
+            db_file_id: None,
+            #[cfg(test)]
+            after_next_open: None,
             last_data_version: 0,
             cached: None,
             last_error: None,
@@ -57,35 +87,96 @@ impl DbDataSource {
         }
     }
 
-    /// Lazy-open persistent connection; reconnects on failure.
+    /// Lazy-open a persistent connection, retrying if reset replaces the file
+    /// while SQLite is opening it.
     fn ensure_conn(&mut self) -> Option<&Connection> {
         if self.conn.is_none() {
-            let conn = match Connection::open(&self.db_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    self.last_error = Some(format!("open {}: {}", self.db_path.display(), e));
+            // Harden before opening: the TUI is the no-arg default entry point,
+            // so it must apply the same owner-only permission boundary as the
+            // CLI rather than letting SQLite create/leave a broad db.
+            let hcom_dir = self.db_path.parent().unwrap_or(std::path::Path::new("."));
+            if let Err(e) = paths::ensure_private_directory(hcom_dir)
+                .and_then(|()| paths::ensure_private_db(&self.db_path))
+            {
+                self.last_error = Some(format!("secure {}: {}", self.db_path.display(), e));
+                return None;
+            }
+            // On Unix, opening an unlinked database can succeed while reset is
+            // creating its replacement. Record the pathname identity on both
+            // sides of the open so we never associate that old handle with the
+            // replacement file's identity.
+            for _ in 0..3 {
+                let before_open = db_file_id(&self.db_path);
+                let conn = match Connection::open(&self.db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.last_error = Some(format!("open {}: {}", self.db_path.display(), e));
+                        return None;
+                    }
+                };
+                // query_only=ON: TUI is read-only; any accidental write will
+                // error immediately rather than silently succeed.
+                if let Err(e) = conn.execute_batch(
+                    "PRAGMA busy_timeout=3000; PRAGMA journal_mode=WAL; PRAGMA query_only=ON;",
+                ) {
+                    self.last_error = Some(format!(
+                        "init database pragmas {}: {}",
+                        self.db_path.display(),
+                        e
+                    ));
                     return None;
                 }
-            };
-            // query_only=ON: TUI is read-only; any accidental write will
-            // error immediately rather than silently succeed.
-            if let Err(e) = conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000; PRAGMA query_only=ON;",
-            ) {
+                #[cfg(test)]
+                if let Some(after_open) = self.after_next_open.take() {
+                    after_open();
+                }
+                let after_open = db_file_id(&self.db_path);
+                if before_open != after_open {
+                    continue;
+                }
+
+                self.conn = Some(conn);
+                self.db_file_id = after_open;
+                // Force full reload on new connection
+                self.last_data_version = 0;
+                self.cached = None;
+                self.last_error = None;
+                break;
+            }
+            if self.conn.is_none() {
                 self.last_error = Some(format!(
-                    "init database pragmas {}: {}",
-                    self.db_path.display(),
-                    e
+                    "database changed repeatedly while opening {}",
+                    self.db_path.display()
                 ));
                 return None;
             }
-            self.conn = Some(conn);
-            // Force full reload on new connection
-            self.last_data_version = 0;
-            self.cached = None;
-            self.last_error = None;
         }
         self.conn.as_ref()
+    }
+
+    /// Drop a connection to a database that `hcom reset` has replaced.
+    ///
+    /// A missing file is intentionally ignored: reset briefly removes the old
+    /// file before bootstrapping the new one, and opening it during that window
+    /// would create an empty database from the read-only TUI process.
+    fn reconnect_if_database_replaced(&mut self) -> bool {
+        #[cfg(unix)]
+        let replaced = matches!(
+            (self.db_file_id, db_file_id(&self.db_path)),
+            (Some(opened), Some(current)) if opened != current
+        );
+        #[cfg(not(unix))]
+        let replaced = false;
+        if !replaced {
+            return false;
+        }
+
+        self.conn = None;
+        self.db_file_id = None;
+        self.last_data_version = 0;
+        self.cached = None;
+        self.last_error = None;
+        true
     }
 
     /// Check PRAGMA data_version and config.toml mtime for changes.
@@ -137,6 +228,7 @@ impl DataSource for DbDataSource {
     }
 
     fn load_all_stopped(&mut self) -> Vec<Agent> {
+        self.reconnect_if_database_replaced();
         let conn = match self.ensure_conn() {
             Some(c) => c,
             None => return vec![],
@@ -145,14 +237,16 @@ impl DataSource for DbDataSource {
     }
 
     fn load_if_changed(&mut self) -> Option<DataState> {
+        let replaced = self.reconnect_if_database_replaced();
+
         // Ensure we have a connection (lazy open / reconnect)
         if self.ensure_conn().is_none() {
             self.cached = Some(DataState::empty());
             return self.cached.clone();
         }
 
-        // Fast path: DB unchanged
-        if !self.data_version_changed() {
+        // Fast path: DB unchanged. A reconnection always needs a full snapshot.
+        if !replaced && !self.data_version_changed() {
             return None;
         }
 
@@ -167,6 +261,7 @@ impl DataSource for DbDataSource {
     }
 
     fn search_timeline(&mut self, query: &str, limit: usize) -> (Vec<Message>, Vec<Event>) {
+        self.reconnect_if_database_replaced();
         if self.ensure_conn().is_none() {
             return (vec![], vec![]);
         }
@@ -234,12 +329,21 @@ fn json_str<'a>(v: &'a serde_json::Value, key: &str, default: &'a str) -> &'a st
 }
 
 fn parse_tool(s: &str) -> Tool {
-    match s {
-        "claude" => Tool::Claude,
-        "gemini" => Tool::Gemini,
-        "codex" => Tool::Codex,
-        "opencode" => Tool::OpenCode,
-        _ => Tool::Adhoc,
+    match s.parse::<crate::tool::Tool>() {
+        Ok(crate::tool::Tool::Claude) => Tool::Claude,
+        Ok(crate::tool::Tool::Gemini) => Tool::Gemini,
+        Ok(crate::tool::Tool::Codex) => Tool::Codex,
+        Ok(crate::tool::Tool::OpenCode) => Tool::OpenCode,
+        Ok(crate::tool::Tool::Kilo) => Tool::Kilo,
+        Ok(crate::tool::Tool::Pi) => Tool::Pi,
+        Ok(crate::tool::Tool::Omp) => Tool::Omp,
+        Ok(crate::tool::Tool::Antigravity) => Tool::Antigravity,
+        Ok(crate::tool::Tool::Cursor) => Tool::Cursor,
+        Ok(crate::tool::Tool::Kimi) => Tool::Kimi,
+        Ok(crate::tool::Tool::Copilot) => Tool::Copilot,
+        Ok(crate::tool::Tool::Grok) => Tool::Grok,
+        Ok(crate::tool::Tool::Adhoc) => Tool::Adhoc,
+        Err(_) => Tool::Unknown(s.to_string()),
     }
 }
 
@@ -344,17 +448,28 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
 
         let has_tcp = tcp_mode != 0;
 
-        // Device name for remote agents (short suffix from device UUID)
-        let device_name = if is_remote {
-            Some(
-                origin_device_id
-                    .chars()
-                    .take(4)
-                    .collect::<String>()
-                    .to_uppercase(),
-            )
+        // Remote rows are stored namespaced as "base:SHORT" (SHORT = the origin
+        // device's relay short-id). Split it back so display_name() re-appends
+        // the real short-id rather than a UUID prefix that doesn't match.
+        let (name, device_name) = if is_remote {
+            match name.rsplit_once(':') {
+                Some((base, short)) if !base.is_empty() && !short.is_empty() => {
+                    (base.to_string(), Some(short.to_string()))
+                }
+                // Fallback for an unexpectedly un-namespaced remote row.
+                _ => (
+                    name,
+                    Some(
+                        origin_device_id
+                            .chars()
+                            .take(4)
+                            .collect::<String>()
+                            .to_uppercase(),
+                    ),
+                ),
+            }
         } else {
-            None
+            (name, None)
         };
 
         // Sync age for remote agents from KV
@@ -633,48 +748,39 @@ fn load_stopped(conn: &Connection, now: f64, max_age_secs: Option<f64>) -> Vec<A
 
 // ── Orphan processes ────────────────────────────────────────────
 
+/// Alive pidtrack entry with the fields needed to decide whether a live row owns it.
+#[derive(Clone)]
+struct TrackedPty {
+    orphan: OrphanProcess,
+    process_id: String,
+    session_id: String,
+}
+
 /// 5-second TTL cache for pidtrack data to avoid excessive I/O in TUI polling.
-static ORPHAN_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<OrphanProcess>)>> =
+static ORPHAN_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<TrackedPty>)>> =
     std::sync::Mutex::new(None);
 const ORPHAN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
-    // Check cache first
-    if let Ok(guard) = ORPHAN_CACHE.lock() {
-        if let Some((ts, ref cached)) = *guard {
-            if ts.elapsed() < ORPHAN_CACHE_TTL {
-                // Still need to filter by active DB PIDs
-                let active_db_pids: Vec<u32> = conn
-                    .prepare("SELECT pid FROM instances WHERE pid IS NOT NULL")
-                    .ok()
-                    .and_then(|mut stmt| {
-                        stmt.query_map([], |row| row.get::<_, i64>(0))
-                            .ok()
-                            .map(|rows| rows.flatten().map(|p| p as u32).collect())
-                    })
-                    .unwrap_or_default();
-                return cached
-                    .iter()
-                    .filter(|o| !active_db_pids.contains(&o.pid))
-                    .cloned()
-                    .collect();
+    let cached = ORPHAN_CACHE.lock().ok().and_then(|guard| match *guard {
+        Some((ts, ref cached)) if ts.elapsed() < ORPHAN_CACHE_TTL => Some(cached.clone()),
+        _ => None,
+    });
+    let tracked = match cached {
+        Some(tracked) => tracked,
+        None => {
+            // A missing or unreadable pidfile is retried on the next load.
+            let Some(tracked) = read_tracked_ptys() else {
+                return vec![];
+            };
+            if let Ok(mut guard) = ORPHAN_CACHE.lock() {
+                *guard = Some((std::time::Instant::now(), tracked.clone()));
             }
+            tracked
         }
-    }
-
-    let path = paths::pidtrack_path();
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
     };
 
-    let pidmap: std::collections::HashMap<String, serde_json::Value> =
-        match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(_) => return vec![],
-        };
-
-    // Get active instance PIDs from DB
+    // Ownership is checked on every call: the DB changes faster than the cache.
     let active_db_pids: Vec<u32> = conn
         .prepare("SELECT pid FROM instances WHERE pid IS NOT NULL")
         .ok()
@@ -684,16 +790,25 @@ fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
                 .map(|rows| rows.flatten().map(|p| p as u32).collect())
         })
         .unwrap_or_default();
+    tracked
+        .into_iter()
+        .filter(|t| !active_db_pids.contains(&t.orphan.pid))
+        .filter(|t| crate::pidtrack::owning_instance(conn, &t.process_id, &t.session_id).is_none())
+        .map(|t| t.orphan)
+        .collect()
+}
 
-    // Build all alive orphans (before active_pids filter) for caching
-    let mut all_alive = Vec::new();
+fn read_tracked_ptys() -> Option<Vec<TrackedPty>> {
+    let content = std::fs::read_to_string(paths::pidtrack_path()).ok()?;
+    let pidmap: std::collections::HashMap<String, serde_json::Value> =
+        serde_json::from_str(&content).ok()?;
+
+    let mut tracked = Vec::new();
     for (pid_str, info) in &pidmap {
         let pid: u32 = match pid_str.parse() {
             Ok(p) => p,
             Err(_) => continue,
         };
-
-        // Check if PID is still alive
         if !crate::pidtrack::is_alive(pid) {
             continue;
         }
@@ -714,23 +829,19 @@ fn load_orphans(conn: &Connection) -> Vec<OrphanProcess> {
             .unwrap_or(0.0);
         let directory = json_str(info, "directory", "").to_string();
 
-        all_alive.push(OrphanProcess {
-            pid,
-            tool: parse_tool(tool_s),
-            names,
-            launched_at,
-            directory,
+        tracked.push(TrackedPty {
+            orphan: OrphanProcess {
+                pid,
+                tool: parse_tool(tool_s),
+                names,
+                launched_at,
+                directory,
+            },
+            process_id: json_str(info, "process_id", "").to_string(),
+            session_id: json_str(info, "session_id", "").to_string(),
         });
     }
-
-    // Update cache with all alive processes
-    if let Ok(mut guard) = ORPHAN_CACHE.lock() {
-        *guard = Some((std::time::Instant::now(), all_alive.clone()));
-    }
-
-    // Filter out active DB PIDs for return
-    all_alive.retain(|o| !active_db_pids.contains(&o.pid));
-    all_alive
+    Some(tracked)
 }
 
 // ── Timeline ────────────────────────────────────────────────────
@@ -1268,6 +1379,12 @@ const BUILTIN_PRESETS: &[PresetDef] = &[
         platforms: &["Linux"],
     },
     PresetDef {
+        name: "ptyxis",
+        binary: Some("ptyxis"),
+        app_name: "",
+        platforms: &["Linux"],
+    },
+    PresetDef {
         name: "konsole",
         binary: Some("konsole"),
         app_name: "",
@@ -1382,17 +1499,16 @@ pub fn get_available_presets() -> Vec<String> {
     }
 
     // User-defined presets from config.toml [terminal.presets.*]
-    if let Some(table) = read_config_toml() {
-        if let Some(presets_table) = table
+    if let Some(table) = read_config_toml()
+        && let Some(presets_table) = table
             .get("terminal")
             .and_then(|v| v.as_table())
             .and_then(|t| t.get("presets"))
             .and_then(|v| v.as_table())
-        {
-            for name in presets_table.keys() {
-                if !result.iter().any(|r| r == name) {
-                    result.push(name.clone());
-                }
+    {
+        for name in presets_table.keys() {
+            if !result.iter().any(|r| r == name) {
+                result.push(name.clone());
             }
         }
     }
@@ -1404,12 +1520,125 @@ pub fn get_available_presets() -> Vec<String> {
 mod tests {
     use super::{
         compute_unread_batch, count_gt, load_instances, load_recently_stopped, parse_message_row,
-        parse_status_or_life_row,
+        parse_status_or_life_row, parse_tool,
     };
     use crate::tui::model::{
         ActivityKind, Agent, AgentStatus, EventKind, MessageScope, SenderKind, Tool,
     };
     use rusqlite::Connection;
+
+    // Blocker 1 regression: the no-arg TUI must route through the owner-only
+    // permission boundary rather than leaving/creating a broad database. `db_path`
+    // is pinned to the isolated temp rather than left to be re-read from global
+    // `Config` mid-test, whose process-wide cache other parallel tests can reset.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_conn_secures_existing_broad_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        // Pre-existing broad db (legacy install opened only through the TUI).
+        let db_path = hcom_dir.join("hcom.db");
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Opening the TUI data source must run the permission boundary, which
+        // secures the db with a lock-free chmod before any connection is
+        // opened. Assert on the resulting mode, not the connection: whether the
+        // read open itself succeeds is irrelevant to the security invariant and
+        // would otherwise couple the test to SQLite locking under parallel load.
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path.clone();
+        let _ = ds.ensure_conn();
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&db_path),
+            0o600,
+            "TUI open left db broad: {:?}",
+            ds.last_error
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnects_when_database_is_replaced_during_or_after_open() {
+        // Private tempdir, not isolated_test_env: that points the process-wide
+        // HCOM_DIR here, so unguarded parallel tests resolving the default db
+        // could open or lock these files mid-replacement.
+        let tmp = tempfile::tempdir().unwrap();
+        let hcom_dir = tmp.path().join(".hcom");
+        std::fs::create_dir_all(&hcom_dir).unwrap();
+        let db_path = hcom_dir.join("hcom.db");
+
+        let first = Connection::open(&db_path).unwrap();
+        first.execute_batch("PRAGMA application_id = 101;").unwrap();
+        drop(first);
+
+        let mut ds = super::DbDataSource::new();
+        ds.db_path = db_path.clone();
+
+        let replacement_path = hcom_dir.join("replacement.db");
+        let replacement = Connection::open(&replacement_path).unwrap();
+        replacement
+            .execute_batch("PRAGMA application_id = 202;")
+            .unwrap();
+        drop(replacement);
+
+        // Force the narrow race: SQLite has opened the old 101 database, but
+        // reset replaces the pathname before DbDataSource records its identity.
+        let source_path = replacement_path.clone();
+        let target_path = db_path.clone();
+        ds.after_next_open = Some(Box::new(move || {
+            for sidecar in [
+                target_path.with_file_name("hcom.db-wal"),
+                target_path.with_file_name("hcom.db-shm"),
+            ] {
+                let _ = std::fs::remove_file(sidecar);
+            }
+            std::fs::rename(source_path, target_path).unwrap();
+        }));
+        assert!(
+            ds.ensure_conn().is_some(),
+            "raced open failed: {:?}",
+            ds.last_error
+        );
+        let raced_replacement_id: i64 = ds
+            .conn
+            .as_ref()
+            .unwrap()
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raced_replacement_id, 202);
+
+        let later_replacement_path = hcom_dir.join("later-replacement.db");
+        let later_replacement = Connection::open(&later_replacement_path).unwrap();
+        later_replacement
+            .execute_batch("PRAGMA application_id = 303;")
+            .unwrap();
+        drop(later_replacement);
+        for sidecar in [
+            db_path.with_file_name("hcom.db-wal"),
+            db_path.with_file_name("hcom.db-shm"),
+        ] {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        std::fs::rename(&later_replacement_path, &db_path).unwrap();
+
+        assert!(ds.reconnect_if_database_replaced());
+        assert!(
+            ds.ensure_conn().is_some(),
+            "reopen failed: {:?}",
+            ds.last_error
+        );
+        let later_replacement_id: i64 = ds
+            .conn
+            .as_ref()
+            .unwrap()
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(later_replacement_id, 303);
+    }
 
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1429,6 +1658,14 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn parse_tool_preserves_unknown_persisted_value() {
+        assert_eq!(
+            parse_tool("future-tool"),
+            Tool::Unknown("future-tool".to_string())
+        );
     }
 
     fn make_agent(name: &str, last_event_id: u64) -> Agent {

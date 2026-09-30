@@ -12,7 +12,7 @@ AI agents running in separate terminals are isolated. hcom connects them via hoo
 
 ```bash
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode
+hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor-agent, hcom kimi, hcom copilot, hcom grok
 hcom              # TUI dashboard
 ```
 
@@ -56,6 +56,11 @@ run `hcom --help` for full command syntax and flags.
 | gemini cli (>= 0.26.0) | automatic | `hcom gemini` |
 | codex | automatic | `hcom codex` |
 | opencode | automatic | `hcom opencode` |
+| kilo code | automatic | `hcom kilo` |
+| antigravity | automatic | `hcom agy` |
+| cursor | automatic | `hcom cursor-agent` |
+| copilot | automatic | `hcom copilot` |
+| grok build | automatic | `hcom grok` |
 | any other ai tool | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 session binding (hcom transcript, hcom r/f by session id) happens on first message or first prompt for all hcom-launched tools.
@@ -107,7 +112,7 @@ hcom claude          # fresh start
 |---------|-----------|-----|
 | agent not in `hcom list` | agent stopped or never bound | relaunch or wait for binding |
 | message sent but not delivered | check `hcom events --last 5` | verify @mention matches agent name/tag |
-| wrong agent receives message | @mention ambiguity | use `@tag-` prefix for reliable routing |
+| message reaches more than one agent | duplicate base name across tags | target the full `@tag-name` to hit exactly one |
 | messages leaking between workflows | no thread isolation | always use `--thread` |
 
 ### intent system
@@ -138,7 +143,7 @@ place scripts in `~/.hcom/scripts/` as `.sh` or `.py`. run with `hcom run <name>
 - **always use `trap cleanup ERR INT TERM`** — orphan headless agents run indefinitely
 - **always use `hcom kill` for cleanup** (not `stop`) — kill also closes the terminal pane
 - **always forward `--name`** — hcom injects it, scripts must propagate it
-- **always use `--go`** on launch/kill — without it, scripts hang on confirmation prompt
+- **always use `--go`** on launch commands — without it, scripts hang on confirmation prompt (`hcom kill` never prompts, so `--go` is optional there)
 
 ### agent topologies
 
@@ -170,7 +175,7 @@ with `HCOM_DIR` set, uses that path instead of `~/.hcom`.
 | file | when to read |
 |------|-------------|
 | `references/patterns.md` | writing multi-agent scripts — 6 tested patterns with full code and real event JSON |
-| `references/cross-tool.md` | claude + codex + gemini + opencode collaboration details and per-tool quirks |
+| `references/cross-tool.md` | claude + codex + gemini + opencode + kilo + pi + omp + antigravity + cursor + kimi + copilot + grok collaboration details and per-tool quirks |
 | `references/gotchas.md` | debugging scripts — timing, message delivery, intent system, cleanup |
 | `references/script-template.md` | writing a new script from scratch — full template with commentary |
 | `references/scripts/` | 6 tested, working example scripts |

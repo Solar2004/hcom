@@ -129,11 +129,21 @@ impl Confirm {
     pub fn is_expired(&self) -> bool {
         std::time::Instant::now() >= self.expires_at
     }
+
+    pub fn is_inline_agent_action(&self) -> bool {
+        matches!(
+            self.action,
+            ConfirmAction::KillAgents(_)
+                | ConfirmAction::ForkAgents(_)
+                | ConfirmAction::ResumeAgents(_)
+        )
+    }
 }
 
 pub enum ConfirmAction {
     KillAgents(Vec<String>),
     ForkAgents(Vec<String>),
+    ResumeAgents(Vec<String>),
     KillOrphan(u32),
     /// Orphan chooser: selected=false → Kill, selected=true → Recover
     OrphanAction(u32),

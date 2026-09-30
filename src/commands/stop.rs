@@ -7,10 +7,8 @@
 use crate::db::HcomDb;
 use crate::hooks::common::stop_instance;
 use crate::identity;
-use crate::instances::{
-    get_full_name, is_remote_instance, is_subagent_instance, parse_running_tasks,
-    resolve_display_name,
-};
+use crate::identity::{get_full_name, resolve_display_name};
+use crate::instances::{is_remote_instance, is_subagent_instance};
 use crate::log::log_info;
 use crate::shared::{CommandContext, SENDER, SenderKind, is_inside_ai_tool};
 
@@ -28,17 +26,16 @@ fn resolve_initiator(
     ctx: Option<&CommandContext>,
     explicit_name: Option<&str>,
 ) -> String {
-    if let Some(c) = ctx {
-        if let Some(ref id) = c.identity {
-            if matches!(id.kind, SenderKind::Instance) {
-                return id.name.clone();
-            }
-        }
+    if let Some(c) = ctx
+        && let Some(ref id) = c.identity
+        && matches!(id.kind, SenderKind::Instance)
+    {
+        return id.name.clone();
     }
     if let Some(name) = explicit_name {
         return name.to_string();
     }
-    match identity::resolve_identity(db, None, None, None, None, None, None) {
+    match identity::resolve_identity(db, None, None, None, None, None) {
         Ok(id) => id.name,
         Err(_) => "cli".to_string(),
     }
@@ -49,6 +46,10 @@ fn resolve_initiator(
 /// Returns exit code (0 = success, 1 = error).
 pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i32 {
     let explicit_name = ctx.and_then(|c| c.explicit_name.as_deref());
+
+    // Give rejoined PTYs back their pid first, so stopping one tracks its
+    // process under the name it runs as now.
+    crate::pidtrack::claim_orphans(db, &crate::paths::hcom_dir());
 
     let targets: Vec<&str> = args.targets.iter().map(|s| s.as_str()).collect();
 
@@ -193,6 +194,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     if targets.len() > 1 {
         let mut instances_to_stop = Vec::new();
         let mut not_found = Vec::new();
+        let mut already_stopped = Vec::new();
 
         for t in &targets {
             if t.starts_with("tag:") {
@@ -203,16 +205,24 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             let name = resolved.as_deref().unwrap_or(t);
             match db.get_instance_full(name) {
                 Ok(Some(data)) => instances_to_stop.push(data),
-                _ => {
-                    not_found.push(t.to_string());
-                }
+                _ => match identity::last_stopped(db, t) {
+                    Some(stopped) => already_stopped.push((t.to_string(), stopped)),
+                    None => not_found.push(t.to_string()),
+                },
             }
         }
 
         if !not_found.is_empty() {
-            let plural = if not_found.len() > 1 { "s" } else { "" };
-            eprintln!("Error: Agent{plural} not found: {}", not_found.join(", "));
+            for t in &not_found {
+                eprintln!("Error: {}", identity::describe_missing_agent(db, t));
+            }
             return 1;
+        }
+        for (t, stopped) in &already_stopped {
+            print_already_stopped(t, stopped);
+        }
+        if instances_to_stop.is_empty() {
+            return 0;
         }
 
         // Confirmation gate
@@ -262,32 +272,21 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             if let Some(ref id) = c.identity {
                 Some(id.clone())
             } else {
-                identity::resolve_identity(db, explicit_name, None, None, None, None, None).ok()
+                identity::resolve_identity(db, explicit_name, None, None, None, None).ok()
             }
         } else {
-            identity::resolve_identity(db, None, None, None, None, None, None).ok()
+            identity::resolve_identity(db, None, None, None, None, None).ok()
         };
 
-        let name = match identity {
+        match identity {
             Some(id) => id.name,
             None => {
                 eprintln!(
-                    "Error: Cannot determine identity\nUsage: hcom stop <name> | hcom stop all | run 'hcom stop' inside Claude/Gemini/Codex"
+                    "Error: Cannot determine identity\nUsage: hcom stop <name> | hcom stop all | run 'hcom stop' inside Claude/Gemini/Codex/Antigravity"
                 );
                 return 1;
             }
-        };
-
-        // Guard: block subagents from stopping their parent (in_subagent_context check)
-        if let Ok(Some(inst_data)) = db.get_instance_full(&name) {
-            let rt = parse_running_tasks(inst_data.running_tasks.as_deref());
-            if rt.active {
-                eprintln!("Error: Cannot run hcom stop from within a Task subagent");
-                return 1;
-            }
         }
-
-        name
     };
 
     // Handle SENDER (not real instance)
@@ -300,7 +299,14 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     let position = match db.get_instance_full(&instance_name) {
         Ok(Some(data)) => data,
         _ => {
-            eprintln!("Error: '{instance_name}' not found");
+            if let Some(stopped) = identity::last_stopped(db, &instance_name) {
+                print_already_stopped(&instance_name, &stopped);
+                return 0;
+            }
+            eprintln!(
+                "Error: {}",
+                identity::describe_missing_agent(db, &instance_name)
+            );
             return 1;
         }
     };
@@ -368,4 +374,20 @@ fn print_stop_preview(scope: &str, cmd_suffix: &str, instances: &[crate::db::Ins
     println!("Instance data preserved in events table (life.stopped with snapshot).\n");
     println!("Add --go flag and run again to proceed:");
     println!("  hcom --go stop {cmd_suffix}\n");
+}
+
+/// A stop can leave the PTY process running (tracked as an orphan), so an
+/// earlier stop event alone doesn't mean nothing is left to end.
+fn print_already_stopped(target: &str, stopped: &identity::StoppedAgent) {
+    println!("'{target}' {}", stopped.summary());
+    // Match by session, not name: a reused base name must not attribute
+    // another incarnation's process to the stop described above.
+    let display = stopped.display_name();
+    match crate::commands::kill::find_orphan_for_session(&stopped.session_id) {
+        Some(orphan) => println!(
+            "  Its process is still running (pid {pid}). To end it: hcom kill {pid}",
+            pid = orphan.pid
+        ),
+        None => println!("  To resume: hcom r {display}"),
+    }
 }
