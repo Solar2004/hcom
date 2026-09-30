@@ -257,22 +257,25 @@ impl HcomDb {
         let pid_identity = crate::sys::process::identity(pid)
             .ok_or_else(|| anyhow::anyhow!("process {pid} has no observable identity"))?;
 
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.conn
+            .execute_batch("SAVEPOINT hcom_update_instance_pid_with_fields")?;
         let result = (|| -> Result<()> {
             self.update_instance_fields(name, updates)?;
             self.update_instance_pid_with_identity(name, pid, &pid_identity)
         })();
 
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
+        if let Err(error) = result {
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO hcom_update_instance_pid_with_fields");
+            let _ = self
+                .conn
+                .execute_batch("RELEASE hcom_update_instance_pid_with_fields");
+            return Err(error);
         }
+        self.conn
+            .execute_batch("RELEASE hcom_update_instance_pid_with_fields")?;
+        Ok(())
     }
 
     /// Stored process incarnation for an instance PID.
@@ -1282,6 +1285,43 @@ mod tests {
             .unwrap();
         assert_eq!(pid, None);
         assert_eq!(db.get_instance_pid_identity("luna").unwrap(), None);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_update_instance_pid_with_fields_can_join_outer_transaction() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+
+        let pid = std::process::id();
+        let mut updates = serde_json::Map::new();
+        updates.insert(
+            "background_log_file".into(),
+            serde_json::json!("runner.log"),
+        );
+
+        let outer = db.conn.unchecked_transaction().unwrap();
+        db.update_instance_pid_with_fields("luna", pid, &updates)
+            .unwrap();
+        outer.commit().unwrap();
+
+        let (stored_pid, log_file): (Option<i64>, String) = db
+            .conn
+            .query_row(
+                "SELECT pid, background_log_file FROM instances WHERE name = 'luna'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_pid, Some(pid as i64));
+        assert_eq!(log_file, "runner.log");
+        assert!(db.get_instance_pid_identity("luna").unwrap().is_some());
 
         cleanup_test_db(db_path);
     }
