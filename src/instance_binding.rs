@@ -393,9 +393,9 @@ fn retire_switched_identity(
     old_data: Option<&InstanceRow>,
 ) {
     migrate_placeholder_runtime_state(db, new_name, old_data);
-    let mut clear_pid = serde_json::Map::new();
-    clear_pid.insert("pid".into(), serde_json::Value::Null);
-    update_instance_position(db, name, &clear_pid);
+    if let Err(e) = db.clear_instance_pid(name) {
+        crate::log::log_error("binding", "session_switch.clear_pid", &format!("{e}"));
+    }
     crate::hooks::common::soft_finalize_session(db, name, "session_switch", None, false);
     if let Err(e) = db.delete_session_bindings_for_instance(name) {
         crate::log::log_error(

@@ -437,7 +437,6 @@ fn attach_runtime_state(
     }
 
     let mut updates = serde_json::Map::new();
-    updates.insert("pid".into(), serde_json::json!(orphan.pid));
     if !orphan.terminal_preset.is_empty() {
         updates.insert(
             "terminal_preset_effective".into(),
@@ -481,6 +480,13 @@ fn attach_runtime_state(
         );
     }
     db.update_instance_fields(instance_name, &updates)
+        .map_err(|e| {
+            format!(
+                "failed to attach runtime state to '{}': {}",
+                instance_name, e
+            )
+        })?;
+    db.update_instance_pid(instance_name, orphan.pid)
         .map_err(|e| format!("failed to attach pid to '{}': {}", instance_name, e))?;
     Ok(())
 }

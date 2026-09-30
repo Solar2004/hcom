@@ -220,13 +220,69 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Update instance PID after spawn
+    /// Update instance PID after spawn, recording the exact process incarnation.
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
+        let pid_identity = crate::sys::process::identity(pid);
         self.conn.execute(
-            "UPDATE instances SET pid = ? WHERE name = ?",
-            params![pid as i64, name],
+            "UPDATE instances
+             SET pid = ?,
+                 launch_context = json_set(
+                     CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                     '$.pid_identity', ?
+                 )
+             WHERE name = ?",
+            params![pid as i64, pid_identity, name],
         )?;
         Ok(())
+    }
+
+    /// Stored process incarnation for an instance PID.
+    pub fn get_instance_pid_identity(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(launch_context)
+                        THEN json_extract(launch_context, '$.pid_identity') END
+                 FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Clear a PID and its stored process identity.
+    pub fn clear_instance_pid(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances
+             SET pid = NULL,
+                 launch_context = CASE
+                     WHEN json_valid(launch_context)
+                     THEN json_remove(launch_context, '$.pid_identity')
+                     ELSE launch_context
+                 END
+             WHERE name = ?",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Drop a stale PID only if the row still owns the exact incarnation we inspected.
+    pub fn clear_instance_pid_if_identity(
+        &self,
+        name: &str,
+        pid: u32,
+        expected_identity: &str,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE instances
+             SET pid = NULL,
+                 launch_context = json_remove(launch_context, '$.pid_identity')
+             WHERE name = ? AND pid = ?
+               AND json_valid(launch_context)
+               AND json_extract(launch_context, '$.pid_identity') = ?",
+            params![name, pid as i64, expected_identity],
+        )? == 1)
     }
 
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
@@ -1082,6 +1138,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ready_count, 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_pid_identity_lives_in_launch_context_and_clears_with_pid() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, launch_context)
+                 VALUES ('luna', 1.0, '{\"pane_id\":\"42\"}')",
+                [],
+            )
+            .unwrap();
+
+        let pid = std::process::id();
+        let expected = crate::sys::process::identity(pid).expect("current process has identity");
+        db.update_instance_pid("luna", pid).unwrap();
+
+        assert_eq!(
+            db.get_instance_pid_identity("luna").unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+        let launch_context: String = db
+            .conn
+            .query_row(
+                "SELECT launch_context FROM instances WHERE name = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
+        assert_eq!(launch_context["pane_id"], "42");
+        assert_eq!(launch_context["pid_identity"], expected);
+
+        db.clear_instance_pid("luna").unwrap();
+        let (pid, launch_context): (Option<i64>, String) = db
+            .conn
+            .query_row(
+                "SELECT pid, launch_context FROM instances WHERE name = 'luna'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, None);
+        let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
+        assert_eq!(launch_context["pane_id"], "42");
+        assert!(launch_context.get("pid_identity").is_none());
 
         cleanup_test_db(db_path);
     }

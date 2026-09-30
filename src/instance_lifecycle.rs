@@ -763,16 +763,77 @@ pub fn cleanup_stale_instances(
 ) -> i32 {
     // Short-lived callers dominate this path (it runs from `hcom list`), and
     // they cannot detect a wake on their own — see is_in_wake_grace_shared.
-    if is_in_wake_grace_shared(db) {
-        return 0;
+    // Wake grace only suppresses clock-based inference below; a stored process
+    // identity mismatch is direct evidence that the original process is gone.
+    let in_wake_grace = is_in_wake_grace_shared(db);
+    if !in_wake_grace {
+        cleanup_stale_remote_instances(db);
     }
-
-    cleanup_stale_remote_instances(db);
 
     let mut deleted = 0;
 
     if let Ok(instances) = db.iter_instances_full() {
         for data in &instances {
+            // A stored process identity makes PID reuse observable. If this PID
+            // now belongs to a different incarnation (or is gone), clear it with
+            // a compare-and-swap before teardown so stop_instance never signals
+            // or records an unrelated recycled process.
+            if data.status != ST_INACTIVE
+                && data.status != ST_LAUNCHING
+                && data.origin_device_id.is_none()
+                && let Some(pid) = data.pid.and_then(|pid| u32::try_from(pid).ok())
+                && let Ok(Some(expected_identity)) = db.get_instance_pid_identity(&data.name)
+            {
+                let current_identity = crate::sys::process::identity(pid);
+                let original_process_gone = match current_identity.as_deref() {
+                    Some(current) => current != expected_identity,
+                    None => !crate::sys::process::is_alive(pid),
+                };
+
+                if original_process_gone {
+                    match db.clear_instance_pid_if_identity(&data.name, pid, &expected_identity) {
+                        Ok(true) => {
+                            crate::log::log_info(
+                                "cleanup",
+                                "process_identity_gone",
+                                &format!(
+                                    "instance={} pid={} expected={} current={}",
+                                    data.name,
+                                    pid,
+                                    expected_identity,
+                                    current_identity.as_deref().unwrap_or("<gone>")
+                                ),
+                            );
+                            if crate::hooks::common::stop_instance(
+                                db,
+                                &data.name,
+                                "system",
+                                "process_exit",
+                            ) == crate::hooks::common::StopOutcome::Stopped
+                            {
+                                deleted += 1;
+                            }
+                        }
+                        Ok(false) => {
+                            // Another process rebound or stopped this row after
+                            // our read. Leave the winner's state alone.
+                        }
+                        Err(e) => {
+                            crate::log::log_warn(
+                                "cleanup",
+                                "process_identity_clear_failed",
+                                &format!("instance={} pid={} err={}", data.name, pid, e),
+                            );
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            if in_wake_grace {
+                continue;
+            }
+
             let computed = get_instance_status(data, db);
 
             if computed.status != ST_INACTIVE {
@@ -870,105 +931,6 @@ fn cleanup_stale_remote_instances(db: &HcomDb) {
     }
 }
 
-/// Detect and clean up instances whose processes died (e.g. system reboot).
-///
-/// After a reboot, hcom instances with PIDs in the DB are stale — their
-/// processes no longer exist. This function finds them, saves a stopped
-/// snapshot for resume, and removes the dead row. Hook-based agents without
-/// tracked PIDs are handled by the existing heartbeat staleness detection
-/// the next time `hcom list` runs.
-///
-/// Returns the number of instances marked dead.
-pub fn mark_dead_instances(db: &HcomDb) -> i32 {
-    let Ok(instances) = db.iter_instances_full() else {
-        return 0;
-    };
-    let mut marked = 0;
-
-    for inst in &instances {
-        if inst.status == ST_INACTIVE || inst.status == ST_LAUNCHING {
-            continue;
-        }
-
-        let is_remote = inst.origin_device_id.as_deref().is_some_and(|v| !v.is_empty());
-        if is_remote {
-            continue;
-        }
-
-        let pid = match inst.pid {
-            Some(p) if p > 0 => p as u32,
-            _ => continue,
-        };
-
-        if crate::pidtrack::is_alive(pid) {
-            continue;
-        }
-
-        let snapshot = serde_json::json!({
-            "name": inst.name,
-            "transcript_path": inst.transcript_path,
-            "session_id": inst.session_id,
-            "tool": inst.tool,
-            "directory": inst.directory,
-            "parent_name": inst.parent_name,
-            "tag": inst.tag,
-            "wait_timeout": inst.wait_timeout,
-            "subagent_timeout": inst.subagent_timeout,
-            "hints": inst.hints,
-            "pid": inst.pid,
-            "created_at": inst.created_at,
-            "background": inst.background,
-            "agent_id": inst.agent_id,
-            "launch_args": inst.launch_args,
-            "origin_device_id": inst.origin_device_id,
-            "background_log_file": inst.background_log_file,
-            "last_event_id": inst.last_event_id,
-        });
-
-        if let Some(ref session_id) = inst.session_id {
-            let _ = db.conn().execute(
-                "DELETE FROM session_bindings WHERE session_id = ?",
-                rusqlite::params![session_id],
-            );
-            let _ = db.conn().execute(
-                "DELETE FROM process_bindings WHERE session_id = ?",
-                rusqlite::params![session_id],
-            );
-        }
-
-        let _ = db.conn().execute(
-            "DELETE FROM process_bindings WHERE instance_name = ?",
-            rusqlite::params![inst.name],
-        );
-        let _ = db.delete_notify_endpoints(&inst.name);
-        let _ = db.cleanup_subscriptions(&inst.name);
-
-        if db
-            .log_life_event(
-                &inst.name,
-                "stopped",
-                "system",
-                "exit:reboot",
-                Some(snapshot),
-            )
-            .is_ok()
-        {
-            let _ = db.delete_instance(&inst.name);
-            marked += 1;
-            crate::log::log_info(
-                "lifecycle",
-                "mark_dead",
-                &format!(
-                    "instance={} pid={} tool={}",
-                    inst.name, pid, inst.tool,
-                ),
-            );
-        }
-    }
-
-    marked
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1048,6 +1010,72 @@ mod tests {
 
         assert_eq!(deleted, 0, "a live process must never be unlinked");
         assert!(instance_exists(&db, "alive"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_cleanup_reaps_recycled_pid_before_stale_timeout() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        let pid = std::process::id() as i64;
+        insert_stale_active(&db, "recycled", 1, 1, pid);
+        db.conn()
+            .execute(
+                "UPDATE instances
+                 SET launch_context = '{\"pid_identity\":\"different-process-incarnation\"}'
+                 WHERE name = 'recycled'",
+                [],
+            )
+            .unwrap();
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 1);
+        assert!(!instance_exists(&db, "recycled"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_cleanup_reaps_identity_mismatch_during_wake_grace() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        let pid = std::process::id() as i64;
+        insert_stale_active(&db, "rebooted", 1, 1, pid);
+        db.conn()
+            .execute(
+                "UPDATE instances
+                 SET launch_context = '{\"pid_identity\":\"previous-boot-process\"}'
+                 WHERE name = 'rebooted'",
+                [],
+            )
+            .unwrap();
+        let grace_until = now_epoch_f64() + WAKE_GRACE_PERIOD;
+        db.kv_set("_wake_grace_until", Some(&grace_until.to_string()))
+            .unwrap();
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 1, "process identity is stronger than wake grace");
+        assert!(!instance_exists(&db, "rebooted"));
+        reset_wake_state_for_test();
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_cleanup_spares_matching_process_identity() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        let pid = std::process::id();
+        insert_stale_active(&db, "same-process", 3700, 3700, pid as i64);
+        db.update_instance_pid("same-process", pid).unwrap();
+
+        let deleted = cleanup_stale_instances(&db, 3600, 3600);
+
+        assert_eq!(deleted, 0);
+        assert!(instance_exists(&db, "same-process"));
         cleanup(path);
     }
 
