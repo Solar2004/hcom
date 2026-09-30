@@ -395,8 +395,10 @@ fn retire_true_placeholder_after_canonical_bind(
         return true;
     }
 
+    // A notify migration failure only keeps the placeholder row (which still
+    // owns its PID); it is not a PID-ownership failure, so the bind proceeds.
     if !migrate_placeholder_notify(db, ph_name, canonical_name) {
-        return false;
+        return true;
     }
 
     delete_true_placeholder_if_migrated(db, ph_name, canonical_name, placeholder_data)
@@ -558,6 +560,8 @@ pub fn bind_session_to_process(
                     }
                 }
 
+                // Without notify migration the placeholder is kept and still owns
+                // its PID, so only a failed runtime-state migration blocks the bind.
                 if migrated {
                     ownership_migrated = delete_true_placeholder_if_migrated(
                         db,
@@ -565,8 +569,6 @@ pub fn bind_session_to_process(
                         canonical_name,
                         placeholder_data.as_ref(),
                     );
-                } else {
-                    ownership_migrated = false;
                 }
             } else {
                 // Path 1b: Session switch — retire the real old identity. Unlike a true

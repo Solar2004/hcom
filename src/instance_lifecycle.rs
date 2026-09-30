@@ -854,9 +854,10 @@ pub fn cleanup_stale_instances(
             // PID. Exit contexts are exempt: those record an end that was
             // observed, not inferred.
             //
-            // Tradeoff: a recycled PID can keep a dead row listed. That costs a
-            // stale line in `hcom list`; the opposite mistake costs a running
-            // agent.
+            // Rows with a stored pid_identity already had PID reuse ruled out
+            // above. For legacy rows without one, a recycled PID can keep a dead
+            // row listed. That costs a stale line in `hcom list`; the opposite
+            // mistake costs a running agent.
             if reason != "exit_cleanup"
                 && let Some(pid) = data.pid
                 && crate::sys::process::is_alive(pid as u32)
