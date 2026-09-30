@@ -754,6 +754,92 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
     deleted
 }
 
+/// Minimum spacing between opportunistic dead-process sweeps (see
+/// [`reap_dead_processes_throttled`]).
+const DEAD_PROCESS_SWEEP_INTERVAL_SECS: f64 = 30.0;
+const DEAD_PROCESS_SWEEP_KV: &str = "_dead_process_sweep_at";
+
+/// If `data`'s tracked process is verifiably gone (its PID is dead or now
+/// belongs to a different process incarnation), stop the row and return
+/// `Some(stopped)`. Returns `None` when the row isn't eligible or its process
+/// is still the one it launched. Rows without a stored identity are left to
+/// the clock-based cleanup: plain liveness can't rule out PID reuse.
+fn reap_if_process_gone(db: &HcomDb, data: &crate::db::InstanceRow) -> Option<bool> {
+    if data.status == ST_INACTIVE
+        || data.status == ST_LAUNCHING
+        || crate::instances::is_launching_placeholder(data)
+        || data.origin_device_id.is_some()
+    {
+        return None;
+    }
+    let pid = data.pid.and_then(|pid| u32::try_from(pid).ok())?;
+    let expected_identity = db.get_instance_pid_identity(&data.name).ok()??;
+    let current_identity = crate::sys::process::identity(pid);
+    let original_process_gone = match current_identity.as_deref() {
+        Some(current) => current != expected_identity,
+        None => !crate::sys::process::is_alive(pid),
+    };
+    if !original_process_gone {
+        return None;
+    }
+
+    crate::log::log_info(
+        "cleanup",
+        "process_identity_gone",
+        &format!(
+            "instance={} pid={} expected={} current={}",
+            data.name,
+            pid,
+            expected_identity,
+            current_identity.as_deref().unwrap_or("<gone>")
+        ),
+    );
+    // Guarded by the inspected incarnation: never signals, and loses to any
+    // concurrent rebind of the row to a new process.
+    Some(
+        crate::hooks::common::stop_instance_if_pid_identity(
+            db,
+            &data.name,
+            "system",
+            "process_exit",
+            pid,
+            &expected_identity,
+        ) == crate::hooks::common::StopOutcome::Stopped,
+    )
+}
+
+/// Stop every local instance whose tracked process is verifiably gone.
+/// Identity-only: no clock inference, so it is safe during wake grace.
+pub fn reap_dead_processes(db: &HcomDb) -> i32 {
+    let Ok(instances) = db.iter_instances_full() else {
+        return 0;
+    };
+    instances
+        .iter()
+        .filter_map(|data| reap_if_process_gone(db, data))
+        .filter(|stopped| *stopped)
+        .count() as i32
+}
+
+/// [`reap_dead_processes`], at most once per interval across all hcom
+/// processes. Cheap enough for every CLI command: one KV read in the common
+/// case, and after a reboot or crash the first command clears the dead rows.
+pub fn reap_dead_processes_throttled(db: &HcomDb) -> i32 {
+    let now = crate::shared::time::now_epoch_f64();
+    let last = db
+        .kv_get(DEAD_PROCESS_SWEEP_KV)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    // A last-sweep time in the future means the clock moved backwards.
+    if last <= now && now - last < DEAD_PROCESS_SWEEP_INTERVAL_SECS {
+        return 0;
+    }
+    let _ = db.kv_set(DEAD_PROCESS_SWEEP_KV, Some(&now.to_string()));
+    reap_dead_processes(db)
+}
+
 /// Delete instances that have been inactive too long.
 /// Three tiers: exit contexts (1 min), stale (1 hr), other inactive (12 hr).
 pub fn cleanup_stale_instances(
@@ -774,48 +860,10 @@ pub fn cleanup_stale_instances(
 
     if let Ok(instances) = db.iter_instances_full() {
         for data in &instances {
-            // A stored process identity makes PID reuse observable. If this PID
-            // now belongs to a different incarnation (or is gone), clear it with
-            // a compare-and-swap before teardown so stop_instance never signals
-            // or records an unrelated recycled process.
-            if data.status != ST_INACTIVE
-                && data.status != ST_LAUNCHING
-                && !crate::instances::is_launching_placeholder(data)
-                && data.origin_device_id.is_none()
-                && let Some(pid) = data.pid.and_then(|pid| u32::try_from(pid).ok())
-                && let Ok(Some(expected_identity)) = db.get_instance_pid_identity(&data.name)
-            {
-                let current_identity = crate::sys::process::identity(pid);
-                let original_process_gone = match current_identity.as_deref() {
-                    Some(current) => current != expected_identity,
-                    None => !crate::sys::process::is_alive(pid),
-                };
-
-                if original_process_gone {
-                    crate::log::log_info(
-                        "cleanup",
-                        "process_identity_gone",
-                        &format!(
-                            "instance={} pid={} expected={} current={}",
-                            data.name,
-                            pid,
-                            expected_identity,
-                            current_identity.as_deref().unwrap_or("<gone>")
-                        ),
-                    );
-                    if crate::hooks::common::stop_instance_if_pid_identity(
-                        db,
-                        &data.name,
-                        "system",
-                        "process_exit",
-                        pid,
-                        &expected_identity,
-                    ) == crate::hooks::common::StopOutcome::Stopped
-                    {
-                        deleted += 1;
-                    }
-                    continue;
-                }
+            // Direct evidence beats clock inference, even inside wake grace.
+            if let Some(stopped) = reap_if_process_gone(db, data) {
+                deleted += stopped as i32;
+                continue;
             }
 
             if in_wake_grace {
@@ -1102,6 +1150,106 @@ mod tests {
 
         assert_eq!(deleted, 0);
         assert!(instance_exists(&db, "same-process"));
+        cleanup(path);
+    }
+
+    fn insert_with_identity(db: &HcomDb, name: &str, pid: u32, identity: &str) {
+        insert_stale_active(db, name, 0, 0, pid as i64);
+        db.update_instance_pid_with_identity(name, pid, Some(identity))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_throttled_sweep_reaps_once_per_interval() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let pid = std::process::id();
+
+        // Fresh heartbeat: only the identity mismatch can retire these rows.
+        insert_with_identity(&db, "first", pid, "previous-boot-process");
+        assert_eq!(reap_dead_processes_throttled(&db), 1);
+        assert!(!instance_exists(&db, "first"));
+
+        insert_with_identity(&db, "second", pid, "previous-boot-process");
+        assert_eq!(
+            reap_dead_processes_throttled(&db),
+            0,
+            "a sweep inside the interval must be skipped"
+        );
+        assert!(instance_exists(&db, "second"));
+
+        // A last-sweep stamp from the future (clock moved back) doesn't block.
+        db.kv_set(
+            DEAD_PROCESS_SWEEP_KV,
+            Some(&(now_epoch_f64() + 3600.0).to_string()),
+        )
+        .unwrap();
+        assert_eq!(reap_dead_processes_throttled(&db), 1);
+        assert!(!instance_exists(&db, "second"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_sweep_leaves_rows_without_identity_to_clock_cleanup() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        insert_stale_active(&db, "legacy", 0, 0, DEAD_PID);
+
+        assert_eq!(reap_dead_processes(&db), 0);
+        assert!(instance_exists(&db, "legacy"));
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_instance_still_owns_pid() {
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+        let pid = std::process::id();
+
+        insert_stale_active(&db, "mine", 0, 0, pid as i64);
+        db.update_instance_pid("mine", pid).unwrap();
+        assert!(db.instance_still_owns_pid("mine", pid));
+
+        insert_with_identity(&db, "reused", pid, "previous-boot-process");
+        assert!(!db.instance_still_owns_pid("reused", pid));
+
+        // No stored identity: plain liveness, as before identities existed.
+        insert_stale_active(&db, "legacy", 0, 0, pid as i64);
+        assert!(db.instance_still_owns_pid("legacy", pid));
+        cleanup(path);
+    }
+
+    /// A headless row whose PID now belongs to an unrelated process must be
+    /// stopped without signalling that process's group.
+    #[cfg(unix)]
+    #[test]
+    fn test_stop_does_not_signal_reused_headless_pid() {
+        use std::os::unix::process::CommandExt;
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = bystander.id();
+        insert_with_identity(&db, "ghost", pid, "previous-boot-process");
+        db.conn()
+            .execute(
+                "UPDATE instances SET background = 1 WHERE name = 'ghost'",
+                [],
+            )
+            .unwrap();
+
+        crate::hooks::common::stop_instance(&db, "ghost", "test", "killed");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let still_running = bystander.try_wait().unwrap().is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        assert!(still_running, "stop signalled a process it doesn't own");
+        assert!(!instance_exists(&db, "ghost"));
         cleanup(path);
     }
 

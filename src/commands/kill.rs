@@ -721,6 +721,22 @@ fn kill_instance(
             &format!("name={name} err={e}"),
         );
     }
+    // The row's process is already gone and the PID may belong to something
+    // else now (reboot, crash). Don't signal it or close a pane by it.
+    if !db.instance_still_owns_pid(name, pid) {
+        log_info(
+            "kill",
+            "lifecycle.kill_not_owned",
+            &format!("name={name} pid={pid} tracked process is gone; not signalling"),
+        );
+        return (
+            terminal::KillResult::AlreadyDead,
+            false,
+            None,
+            String::new(),
+            String::new(),
+        );
+    }
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed, pane_retry_command) =

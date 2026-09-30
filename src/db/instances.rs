@@ -318,6 +318,22 @@ impl HcomDb {
         })
     }
 
+    /// Whether `pid` is still the process this instance recorded, i.e. safe to
+    /// signal on its behalf. With a stored identity this rules out PID reuse;
+    /// rows without one (legacy, or identity unobservable) fall back to plain
+    /// liveness, as before identities existed.
+    pub fn instance_still_owns_pid(&self, name: &str, pid: u32) -> bool {
+        match self.get_instance_pid_identity(name) {
+            // Same rule as the dead-process sweep, so a row it keeps is never
+            // one that kill/stop refuse to signal.
+            Ok(Some(expected)) => match crate::sys::process::identity(pid) {
+                Some(current) => current == expected,
+                None => crate::sys::process::is_alive(pid),
+            },
+            _ => crate::sys::process::is_alive(pid),
+        }
+    }
+
     /// Stored process incarnation for an instance PID.
     pub fn get_instance_pid_identity(&self, name: &str) -> Result<Option<String>> {
         Ok(self
