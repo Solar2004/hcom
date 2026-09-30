@@ -368,14 +368,17 @@ fn delete_true_placeholder_if_migrated(
     placeholder_name: &str,
     canonical_name: &str,
     placeholder_data: Option<&InstanceRow>,
-) {
+) -> bool {
     if is_true_launch_placeholder(placeholder_data) {
         // Move pid/launch_context to the canonical row before dropping the placeholder
         // so the restored agent stays killable and its pane closeable.
         if migrate_placeholder_runtime_state(db, canonical_name, placeholder_data) {
             delete_true_placeholder_instance(db, placeholder_name);
+            return true;
         }
+        return false;
     }
+    true
 }
 
 /// Path 2: after restore_stopped bind, merge notify ports and drop the launch placeholder.
@@ -384,19 +387,19 @@ fn retire_true_placeholder_after_canonical_bind(
     placeholder_name: Option<&String>,
     canonical_name: &str,
     placeholder_data: Option<&InstanceRow>,
-) {
+) -> bool {
     let Some(ph_name) = placeholder_name else {
-        return;
+        return true;
     };
     if ph_name == canonical_name {
-        return;
+        return true;
     }
 
     if !migrate_placeholder_notify(db, ph_name, canonical_name) {
-        return;
+        return false;
     }
 
-    delete_true_placeholder_if_migrated(db, ph_name, canonical_name, placeholder_data);
+    delete_true_placeholder_if_migrated(db, ph_name, canonical_name, placeholder_data)
 }
 
 /// Retire a live identity whose process switched to another session's identity.
@@ -411,9 +414,9 @@ fn retire_switched_identity(
     name: &str,
     new_name: &str,
     old_data: Option<&InstanceRow>,
-) {
+) -> bool {
     if !migrate_placeholder_runtime_state(db, new_name, old_data) {
-        return;
+        return false;
     }
     if let Err(e) = db.clear_instance_pid(name) {
         crate::log::log_error("binding", "session_switch.clear_pid", &format!("{e}"));
@@ -426,6 +429,7 @@ fn retire_switched_identity(
             &format!("{e}"),
         );
     }
+    true
 }
 
 /// Recreate a missing instance row from an active placeholder (resume after stop/kill).
@@ -529,6 +533,7 @@ pub fn bind_session_to_process(
         let mut resume_updates = serde_json::Map::new();
         resume_updates.insert("last_stop".into(), serde_json::json!(now));
 
+        let mut ownership_migrated = true;
         if let Some(ref ph_name) = placeholder_name
             && ph_name != canonical_name
         {
@@ -554,12 +559,14 @@ pub fn bind_session_to_process(
                 }
 
                 if migrated {
-                    delete_true_placeholder_if_migrated(
+                    ownership_migrated = delete_true_placeholder_if_migrated(
                         db,
                         ph_name,
                         canonical_name,
                         placeholder_data.as_ref(),
                     );
+                } else {
+                    ownership_migrated = false;
                 }
             } else {
                 // Path 1b: Session switch — retire the real old identity. Unlike a true
@@ -575,12 +582,20 @@ pub fn bind_session_to_process(
                         &format!("endpoints may remain on {ph_name}; retiring identity anyway"),
                     );
                 }
-                retire_switched_identity(db, ph_name, canonical_name, placeholder_data.as_ref());
+                ownership_migrated = retire_switched_identity(
+                    db,
+                    ph_name,
+                    canonical_name,
+                    placeholder_data.as_ref(),
+                );
             }
         }
 
         update_instance_position(db, canonical_name, &resume_updates);
 
+        if !ownership_migrated {
+            return None;
+        }
         if let Some(pid) = process_id
             && let Err(e) = db.set_process_binding(pid, session_id, canonical_name)
         {
@@ -630,17 +645,7 @@ pub fn bind_session_to_process(
         if let Err(e) = db.rebind_session(session_id, &stopped_name) {
             crate::log::log_error("binding", "restore_stopped.rebind_session", &format!("{e}"));
         }
-        if let Some(pid) = process_id
-            && let Err(e) = db.set_process_binding(pid, session_id, &stopped_name)
-        {
-            crate::log::log_error(
-                "binding",
-                "restore_stopped.set_process_binding",
-                &format!("{e}"),
-            );
-        }
-
-        retire_true_placeholder_after_canonical_bind(
+        let mut ownership_migrated = retire_true_placeholder_after_canonical_bind(
             db,
             placeholder_name.as_ref(),
             &stopped_name,
@@ -653,7 +658,21 @@ pub fn bind_session_to_process(
             && placeholder_data.is_some()
             && !is_true_launch_placeholder(placeholder_data.as_ref())
         {
-            retire_switched_identity(db, ph_name, &stopped_name, placeholder_data.as_ref());
+            ownership_migrated =
+                retire_switched_identity(db, ph_name, &stopped_name, placeholder_data.as_ref());
+        }
+
+        if !ownership_migrated {
+            return None;
+        }
+        if let Some(pid) = process_id
+            && let Err(e) = db.set_process_binding(pid, session_id, &stopped_name)
+        {
+            crate::log::log_error(
+                "binding",
+                "restore_stopped.set_process_binding",
+                &format!("{e}"),
+            );
         }
 
         return Some(stopped_name);

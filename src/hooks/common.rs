@@ -1348,9 +1348,17 @@ fn stop_instance_inner(
         }
     };
 
-    // A guarded stale-stop must win its PID-incarnation CAS before causing
-    // side effects in child rows. An unguarded stop keeps the historical
-    // children-first behavior so a child failure leaves the parent retryable.
+    // A guarded stale-stop must not mutate children before winning its
+    // PID-incarnation CAS, and deleting the parent first would make a failed
+    // child stop non-retryable. Leave the parent in place while it still has
+    // children; their own cleanup can retire them independently, after which a
+    // later pass can safely finalize the parent.
+    if pid_guard.is_some() && (!session_subagents.is_empty() || !native_children.is_empty()) {
+        return StopOutcome::RetryableError(format!(
+            "guarded stop deferred while {instance_name} still has child instances"
+        ));
+    }
+
     if pid_guard.is_none() {
         for sub_name in &session_subagents {
             if let StopOutcome::RetryableError(error) = stop_instance_inner(
@@ -1437,26 +1445,6 @@ fn stop_instance_inner(
             return StopOutcome::RetryableError(format!(
                 "could not finalize stop for {instance_name}: {e}"
             ));
-        }
-    }
-
-    if pid_guard.is_some() {
-        for child in session_subagents.iter().chain(native_children.iter()) {
-            if let StopOutcome::RetryableError(error) = stop_instance_inner(
-                db,
-                child,
-                initiated_by,
-                "parent_stopped",
-                false,
-                depth + 1,
-                None,
-            ) {
-                log::log_warn(
-                    "hooks",
-                    "finalize.child_stop_incomplete",
-                    &format!("parent={instance_name} child={child} err={error}"),
-                );
-            }
         }
     }
 

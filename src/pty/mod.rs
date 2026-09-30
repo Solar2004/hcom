@@ -704,10 +704,12 @@ impl Proxy {
                 .spawn()
                 .context("spawn failed")?
         };
+        let child_pid = child.id();
+        let child_identity = crate::sys::process::identity(child_pid);
         let spawned_at = Instant::now();
         shared::log_spawned(
             config.instance_name.as_deref(),
-            Some(child.id()),
+            Some(child_pid),
             spawned_at.duration_since(spawn_started),
             command,
         );
@@ -717,7 +719,10 @@ impl Proxy {
         if let Some(ref instance_name) = config.instance_name {
             let persist_result = (|| -> Result<()> {
                 let db = crate::db::HcomDb::open()?;
-                db.update_instance_pid(instance_name, child.id())?;
+                let identity = child_identity.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("spawned process {child_pid} has no observable identity")
+                })?;
+                db.update_instance_pid_with_identity(instance_name, child_pid, identity)?;
 
                 // Capture minimal launch context early so kill can close the terminal pane.
                 // The start hook may later overwrite with richer context (git_branch, tty, env).
@@ -726,8 +731,13 @@ impl Proxy {
                 Ok(())
             })();
             if let Err(error) = persist_result {
-                let _ = crate::sys::process::kill_group(child.id());
-                let _ = child.kill();
+                if let Some(expected_identity) = child_identity.as_deref()
+                    && crate::sys::process::identity(child_pid).as_deref()
+                        == Some(expected_identity)
+                {
+                    let _ = crate::sys::process::kill_group(child_pid);
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
                 return Err(error.context("failed to persist PTY process identity"));
             }
