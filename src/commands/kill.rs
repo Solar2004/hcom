@@ -721,13 +721,14 @@ fn kill_instance(
             &format!("name={name} err={e}"),
         );
     }
-    // The row's process is already gone and the PID may belong to something
-    // else now (reboot, crash). Don't signal it or close a pane by it.
-    if !db.instance_still_owns_pid(name, pid) {
+    // The PID now belongs to an unrelated process (reboot, crash): don't
+    // signal it or resolve a pane through it. A merely dead PID falls through
+    // so its group and pane are still cleaned up.
+    if db.instance_pid_reused(name, pid) {
         log_info(
             "kill",
-            "lifecycle.kill_not_owned",
-            &format!("name={name} pid={pid} tracked process is gone; not signalling"),
+            "lifecycle.kill_pid_reused",
+            &format!("name={name} pid={pid} now belongs to another process; not signalling"),
         );
         return (
             terminal::KillResult::AlreadyDead,

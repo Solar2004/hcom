@@ -810,18 +810,19 @@ fn reap_if_process_gone(db: &HcomDb, data: &crate::db::InstanceRow) -> Option<bo
 
 /// Stop every local instance whose tracked process is verifiably gone.
 /// Identity-only: no clock inference, so it is safe during wake grace.
-pub fn reap_dead_processes(db: &HcomDb) -> i32 {
-    let Ok(instances) = db.iter_instances_full() else {
-        return 0;
-    };
-    instances
-        .iter()
-        .filter_map(|data| reap_if_process_gone(db, data))
-        .filter(|stopped| *stopped)
-        .count() as i32
+/// Returns the number stopped, or `None` if instances couldn't be listed.
+fn reap_dead_processes(db: &HcomDb) -> Option<i32> {
+    let instances = db.iter_instances_full().ok()?;
+    Some(
+        instances
+            .iter()
+            .filter_map(|data| reap_if_process_gone(db, data))
+            .filter(|stopped| *stopped)
+            .count() as i32,
+    )
 }
 
-/// [`reap_dead_processes`], at most once per interval across all hcom
+/// Stop dead-process rows (see [`reap_if_process_gone`]) at most once per interval across all hcom
 /// processes. Cheap enough for every CLI command: one KV read in the common
 /// case, and after a reboot or crash the first command clears the dead rows.
 pub fn reap_dead_processes_throttled(db: &HcomDb) -> i32 {
@@ -836,8 +837,14 @@ pub fn reap_dead_processes_throttled(db: &HcomDb) -> i32 {
     if last <= now && now - last < DEAD_PROCESS_SWEEP_INTERVAL_SECS {
         return 0;
     }
+    let Some(reaped) = reap_dead_processes(db) else {
+        // Enumeration failed: leave the stamp so the next command retries.
+        return 0;
+    };
+    // Stamp only a completed sweep; an interrupted one is retried next time.
+    // Concurrent duplicate sweeps are harmless (every stop is guarded).
     let _ = db.kv_set(DEAD_PROCESS_SWEEP_KV, Some(&now.to_string()));
-    reap_dead_processes(db)
+    reaped
 }
 
 /// Delete instances that have been inactive too long.
@@ -1195,27 +1202,84 @@ mod tests {
         let (db, path) = setup_test_db();
         insert_stale_active(&db, "legacy", 0, 0, DEAD_PID);
 
-        assert_eq!(reap_dead_processes(&db), 0);
+        assert_eq!(reap_dead_processes(&db), Some(0));
         assert!(instance_exists(&db, "legacy"));
         cleanup(path);
     }
 
     #[test]
-    fn test_instance_still_owns_pid() {
+    fn test_instance_pid_reused() {
         let _guard = wake_test_guard();
         let (db, path) = setup_test_db();
         let pid = std::process::id();
 
         insert_stale_active(&db, "mine", 0, 0, pid as i64);
         db.update_instance_pid("mine", pid).unwrap();
-        assert!(db.instance_still_owns_pid("mine", pid));
+        assert!(!db.instance_pid_reused("mine", pid));
 
         insert_with_identity(&db, "reused", pid, "previous-boot-process");
-        assert!(!db.instance_still_owns_pid("reused", pid));
+        assert!(db.instance_pid_reused("reused", pid));
 
-        // No stored identity: plain liveness, as before identities existed.
+        // Gone is not reused: its group/pane may still need cleanup.
+        insert_with_identity(&db, "gone", DEAD_PID as u32, "exited-process");
+        assert!(!db.instance_pid_reused("gone", DEAD_PID as u32));
+
+        // No stored identity: can't tell, behave as before identities existed.
         insert_stale_active(&db, "legacy", 0, 0, pid as i64);
-        assert!(db.instance_still_owns_pid("legacy", pid));
+        assert!(!db.instance_pid_reused("legacy", pid));
+        cleanup(path);
+    }
+
+    /// A headless runner whose group leader died must still have its group
+    /// signalled on stop, or the children it left behind run on unowned.
+    #[cfg(unix)]
+    #[test]
+    fn test_stop_signals_group_of_dead_headless_leader() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let _guard = wake_test_guard();
+        let (db, path) = setup_test_db();
+
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; exit 0"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let leader_pid = leader.id();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let child_pid: u32 = line.trim().parse().unwrap();
+        leader.wait().unwrap();
+        assert!(crate::sys::process::is_alive(child_pid));
+
+        insert_with_identity(&db, "runner", leader_pid, "exited-leader");
+        db.conn()
+            .execute(
+                "UPDATE instances SET background = 1 WHERE name = 'runner'",
+                [],
+            )
+            .unwrap();
+
+        crate::hooks::common::stop_instance(&db, "runner", "test", "killed");
+
+        let mut child_gone = false;
+        for _ in 0..30 {
+            if !crate::sys::process::is_alive(child_pid) {
+                child_gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !child_gone {
+            unsafe { libc::kill(child_pid as i32, libc::SIGKILL) };
+        }
+        assert!(
+            child_gone,
+            "surviving child of a dead leader was not signalled"
+        );
         cleanup(path);
     }
 

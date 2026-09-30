@@ -1197,12 +1197,13 @@ fn stop_instance_inner(
     // Kill headless processes (background=true)
     let pid = instance_data.pid;
     let is_headless = instance_data.background != 0;
-    // Only act on a PID that is still this instance's process: after a reboot
-    // or crash it may belong to an unrelated process now (stored identity
-    // mismatch), which must be neither signalled nor tracked as an orphan.
+    // After a reboot or crash the PID may belong to an unrelated process now
+    // (stored identity mismatch): never signal it or track it as an orphan.
+    // A merely dead leader still gets its group signalled, which reaches any
+    // children it left behind.
     if pid_guard.is_none()
         && let Some(pid_val) = pid
-        && db.instance_still_owns_pid(instance_name, pid_val as u32)
+        && !db.instance_pid_reused(instance_name, pid_val as u32)
     {
         let pid_u32 = pid_val as u32;
         if is_headless {

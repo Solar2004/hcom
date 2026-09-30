@@ -318,19 +318,19 @@ impl HcomDb {
         })
     }
 
-    /// Whether `pid` is still the process this instance recorded, i.e. safe to
-    /// signal on its behalf. With a stored identity this rules out PID reuse;
-    /// rows without one (legacy, or identity unobservable) fall back to plain
-    /// liveness, as before identities existed.
-    pub fn instance_still_owns_pid(&self, name: &str, pid: u32) -> bool {
+    /// Whether a *different* live process now holds this instance's PID
+    /// (stored identity mismatch), so it must not be signalled on the
+    /// instance's behalf. A PID that is simply gone is not "reused": its
+    /// process group can outlive the leader, and a PID isn't recycled while
+    /// that group exists, so group signals and pane cleanup stay safe there.
+    /// Rows without a stored identity can't tell and report `false`, as
+    /// before identities existed.
+    pub fn instance_pid_reused(&self, name: &str, pid: u32) -> bool {
         match self.get_instance_pid_identity(name) {
-            // Same rule as the dead-process sweep, so a row it keeps is never
-            // one that kill/stop refuse to signal.
-            Ok(Some(expected)) => match crate::sys::process::identity(pid) {
-                Some(current) => current == expected,
-                None => crate::sys::process::is_alive(pid),
-            },
-            _ => crate::sys::process::is_alive(pid),
+            Ok(Some(expected)) => {
+                crate::sys::process::identity(pid).is_some_and(|current| current != expected)
+            }
+            _ => false,
         }
     }
 
