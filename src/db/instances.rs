@@ -222,7 +222,18 @@ impl HcomDb {
 
     /// Update instance PID after spawn, recording the exact process incarnation.
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
-        let pid_identity = crate::sys::process::identity(pid);
+        let pid_identity = crate::sys::process::identity(pid)
+            .ok_or_else(|| anyhow::anyhow!("process {pid} has no observable identity"))?;
+        self.update_instance_pid_with_identity(name, pid, &pid_identity)
+    }
+
+    /// Update an instance PID while preserving an already-observed process incarnation.
+    pub fn update_instance_pid_with_identity(
+        &self,
+        name: &str,
+        pid: u32,
+        pid_identity: &str,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE instances
              SET pid = ?,
@@ -234,6 +245,34 @@ impl HcomDb {
             params![pid as i64, pid_identity, name],
         )?;
         Ok(())
+    }
+
+    /// Atomically persist PID ownership together with related instance fields.
+    pub fn update_instance_pid_with_fields(
+        &self,
+        name: &str,
+        pid: u32,
+        updates: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        let pid_identity = crate::sys::process::identity(pid)
+            .ok_or_else(|| anyhow::anyhow!("process {pid} has no observable identity"))?;
+
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.update_instance_fields(name, updates)?;
+            self.update_instance_pid_with_identity(name, pid, &pid_identity)
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Stored process incarnation for an instance PID.
@@ -265,24 +304,6 @@ impl HcomDb {
             params![name],
         )?;
         Ok(())
-    }
-
-    /// Drop a stale PID only if the row still owns the exact incarnation we inspected.
-    pub fn clear_instance_pid_if_identity(
-        &self,
-        name: &str,
-        pid: u32,
-        expected_identity: &str,
-    ) -> Result<bool> {
-        Ok(self.conn.execute(
-            "UPDATE instances
-             SET pid = NULL,
-                 launch_context = json_remove(launch_context, '$.pid_identity')
-             WHERE name = ? AND pid = ?
-               AND json_valid(launch_context)
-               AND json_extract(launch_context, '$.pid_identity') = ?",
-            params![name, pid as i64, expected_identity],
-        )? == 1)
     }
 
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
@@ -477,18 +498,70 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
     ) -> Result<bool> {
+        self.finalize_instance_stop_inner(name, created_at, session_id, agent_id, None, event_data)
+    }
+
+    /// Finalize a stop only while the row still owns the inspected PID incarnation.
+    pub fn finalize_instance_stop_if_pid_identity(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        pid: u32,
+        pid_identity: &str,
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
+        self.finalize_instance_stop_inner(
+            name,
+            created_at,
+            session_id,
+            agent_id,
+            Some((pid, pid_identity)),
+            event_data,
+        )
+    }
+
+    fn finalize_instance_stop_inner(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        pid_guard: Option<(u32, &str)>,
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
 
         let won = self.with_immediate_transaction(|tx| {
             // Stamp after taking the write lock so timestamp order matches id order.
             let timestamp = chrono_now_iso();
-            let deleted = tx.execute(
-                "DELETE FROM instances
-                 WHERE name = ? AND created_at = ?
-                   AND session_id IS ? AND agent_id IS ?",
-                params![name, created_at, session_id, agent_id],
-            )?;
+            let deleted = if let Some((pid, pid_identity)) = pid_guard {
+                tx.execute(
+                    "DELETE FROM instances
+                     WHERE name = ? AND created_at = ?
+                       AND session_id IS ? AND agent_id IS ?
+                       AND pid = ?
+                       AND json_valid(launch_context)
+                       AND json_extract(launch_context, '$.pid_identity') = ?",
+                    params![
+                        name,
+                        created_at,
+                        session_id,
+                        agent_id,
+                        pid as i64,
+                        pid_identity
+                    ],
+                )?
+            } else {
+                tx.execute(
+                    "DELETE FROM instances
+                     WHERE name = ? AND created_at = ?
+                       AND session_id IS ? AND agent_id IS ?",
+                    params![name, created_at, session_id, agent_id],
+                )?
+            };
             if deleted == 0 {
                 return Ok(false);
             }
@@ -1186,6 +1259,97 @@ mod tests {
         let launch_context: serde_json::Value = serde_json::from_str(&launch_context).unwrap();
         assert_eq!(launch_context["pane_id"], "42");
         assert!(launch_context.get("pid_identity").is_none());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_update_instance_pid_rejects_unobservable_process() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+
+        assert!(db.update_instance_pid("luna", u32::MAX).is_err());
+        let pid: Option<i64> = db
+            .conn
+            .query_row("SELECT pid FROM instances WHERE name = 'luna'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pid, None);
+        assert_eq!(db.get_instance_pid_identity("luna").unwrap(), None);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_update_instance_pid_with_fields_is_atomic_on_identity_failure() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at, background_log_file)
+                 VALUES ('luna', 1.0, 'before.log')",
+                [],
+            )
+            .unwrap();
+
+        let mut updates = serde_json::Map::new();
+        updates.insert("background_log_file".into(), serde_json::json!("after.log"));
+        assert!(
+            db.update_instance_pid_with_fields("luna", u32::MAX, &updates)
+                .is_err()
+        );
+
+        let (pid, log_file): (Option<i64>, String) = db
+            .conn
+            .query_row(
+                "SELECT pid, background_log_file FROM instances WHERE name = 'luna'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, None);
+        assert_eq!(log_file, "before.log");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_finalize_instance_stop_pid_identity_guard_rejects_rebind() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1.0)",
+                [],
+            )
+            .unwrap();
+        let pid = std::process::id();
+        db.update_instance_pid("luna", pid).unwrap();
+        let original_identity = db
+            .get_instance_pid_identity("luna")
+            .unwrap()
+            .expect("current process identity");
+
+        db.update_instance_pid_with_identity("luna", pid, "replacement-incarnation")
+            .unwrap();
+        let event = serde_json::json!({"action": "stopped", "reason": "process_exit"});
+        assert!(
+            !db.finalize_instance_stop_if_pid_identity(
+                "luna",
+                1.0,
+                None,
+                None,
+                pid,
+                &original_identity,
+                &event,
+            )
+            .unwrap()
+        );
+        assert!(db.get_instance_full("luna").unwrap().is_some());
 
         cleanup_test_db(db_path);
     }

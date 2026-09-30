@@ -94,6 +94,7 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         "kitty_listen_on",
         "process_id",
         "terminal_preset_effective",
+        "pid_identity",
     ];
     let mut ctx = new_ctx;
 
@@ -329,9 +330,24 @@ fn migrate_placeholder_runtime_state(
     };
     if let Some(pid) = ph.pid
         && let Ok(pid_u32) = u32::try_from(pid)
-        && let Err(e) = db.update_instance_pid(canonical_name, pid_u32)
     {
-        crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
+        let update_result = match db.get_instance_pid_identity(&ph.name) {
+            Ok(Some(identity)) => {
+                db.update_instance_pid_with_identity(canonical_name, pid_u32, &identity)
+            }
+            Ok(None) => db.update_instance_pid(canonical_name, pid_u32),
+            Err(e) => {
+                crate::log::log_error(
+                    "binding",
+                    "placeholder.read_pid_identity",
+                    &format!("placeholder={} err={e}", ph.name),
+                );
+                return;
+            }
+        };
+        if let Err(e) = update_result {
+            crate::log::log_error("binding", "placeholder.migrate_pid", &format!("{e}"));
+        }
     }
     if let Some(ref ctx) = ph.launch_context
         && let Err(e) = db.store_launch_context(canonical_name, ctx)
@@ -1370,7 +1386,7 @@ mod tests {
                     "luna",
                     "claude",
                     1.0f64,
-                    r#"{"terminal_preset_effective":"herdr","pane_id":"p_7","process_id":"proc-1"}"#
+                    r#"{"terminal_preset_effective":"herdr","pane_id":"p_7","process_id":"proc-1","pid_identity":"spawn-1"}"#
                 ],
             )
             .unwrap();
@@ -1391,6 +1407,10 @@ mod tests {
         assert_eq!(
             ctx.get("process_id").and_then(|v| v.as_str()),
             Some("proc-1")
+        );
+        assert_eq!(
+            ctx.get("pid_identity").and_then(|v| v.as_str()),
+            Some("spawn-1")
         );
 
         cleanup(path);
@@ -1801,8 +1821,9 @@ mod tests {
         nene.insert("session_id".into(), serde_json::json!("ses-nene"));
         nene.insert("created_at".into(), serde_json::json!(now));
         nene.insert("status".into(), serde_json::json!("listening"));
-        nene.insert("pid".into(), serde_json::json!(4242));
         db.save_instance_named("nene", &nene).unwrap();
+        let live_pid = std::process::id();
+        db.update_instance_pid("nene", live_pid).unwrap();
         db.rebind_session("ses-nene", "nene").unwrap();
         db.set_process_binding("pid-pi", "ses-nene", "nene")
             .unwrap();
@@ -1828,7 +1849,11 @@ mod tests {
         assert_eq!(db.get_session_binding("ses-nene").unwrap(), None);
         assert_eq!(nene.pid, None, "retired identity must not keep the process");
         let zumi = db.get_instance_full("zumi").unwrap().unwrap();
-        assert_eq!(zumi.pid, Some(4242), "new identity must stay killable");
+        assert_eq!(
+            zumi.pid,
+            Some(live_pid as i64),
+            "new identity must stay killable"
+        );
 
         // Resuming the previous session switches back to its original identity.
         let result = bind_session_to_process(&db, "ses-nene", Some("pid-pi"));
@@ -1843,7 +1868,7 @@ mod tests {
         );
         assert_eq!(db.get_session_binding("ses-zumi").unwrap(), None);
         let nene = db.get_instance_full("nene").unwrap().unwrap();
-        assert_eq!(nene.pid, Some(4242));
+        assert_eq!(nene.pid, Some(live_pid as i64));
         let zumi = db.get_instance_full("zumi").unwrap().unwrap();
         assert_eq!(zumi.status_context, "exit:session_switch");
         assert_eq!(zumi.pid, None);
@@ -1882,7 +1907,8 @@ mod tests {
         mozi_data.insert("status_context".into(), serde_json::json!("new"));
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc", "", "mozi").unwrap();
-        db.update_instance_pid("mozi", 4242).unwrap();
+        db.update_instance_pid_with_identity("mozi", 4242, "spawn-incarnation")
+            .unwrap();
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-99"}"#)
             .unwrap();
 
@@ -1894,6 +1920,10 @@ mod tests {
         assert!(db.get_instance_full("mozi").unwrap().is_none());
         let fano = db.get_instance_full("fano").unwrap().unwrap();
         assert_eq!(fano.pid, Some(4242));
+        assert_eq!(
+            db.get_instance_pid_identity("fano").unwrap().as_deref(),
+            Some("spawn-incarnation")
+        );
         assert!(
             fano.launch_context
                 .as_deref()
@@ -1938,7 +1968,8 @@ mod tests {
         mozi_data.insert("status_context".into(), serde_json::json!("start"));
         db.save_instance_named("mozi", &mozi_data).unwrap();
         db.set_process_binding("pid-oc-ready", "", "mozi").unwrap();
-        db.update_instance_pid("mozi", 4343).unwrap();
+        db.update_instance_pid_with_identity("mozi", 4343, "ready-incarnation")
+            .unwrap();
         db.store_launch_context("mozi", r#"{"pane_id":"kitty-101"}"#)
             .unwrap();
 

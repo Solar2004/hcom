@@ -791,40 +791,27 @@ pub fn cleanup_stale_instances(
                 };
 
                 if original_process_gone {
-                    match db.clear_instance_pid_if_identity(&data.name, pid, &expected_identity) {
-                        Ok(true) => {
-                            crate::log::log_info(
-                                "cleanup",
-                                "process_identity_gone",
-                                &format!(
-                                    "instance={} pid={} expected={} current={}",
-                                    data.name,
-                                    pid,
-                                    expected_identity,
-                                    current_identity.as_deref().unwrap_or("<gone>")
-                                ),
-                            );
-                            if crate::hooks::common::stop_instance(
-                                db,
-                                &data.name,
-                                "system",
-                                "process_exit",
-                            ) == crate::hooks::common::StopOutcome::Stopped
-                            {
-                                deleted += 1;
-                            }
-                        }
-                        Ok(false) => {
-                            // Another process rebound or stopped this row after
-                            // our read. Leave the winner's state alone.
-                        }
-                        Err(e) => {
-                            crate::log::log_warn(
-                                "cleanup",
-                                "process_identity_clear_failed",
-                                &format!("instance={} pid={} err={}", data.name, pid, e),
-                            );
-                        }
+                    crate::log::log_info(
+                        "cleanup",
+                        "process_identity_gone",
+                        &format!(
+                            "instance={} pid={} expected={} current={}",
+                            data.name,
+                            pid,
+                            expected_identity,
+                            current_identity.as_deref().unwrap_or("<gone>")
+                        ),
+                    );
+                    if crate::hooks::common::stop_instance_if_pid_identity(
+                        db,
+                        &data.name,
+                        "system",
+                        "process_exit",
+                        pid,
+                        &expected_identity,
+                    ) == crate::hooks::common::StopOutcome::Stopped
+                    {
+                        deleted += 1;
                     }
                     continue;
                 }

@@ -1092,7 +1092,27 @@ pub fn stop_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, false, 0, None)
+}
+
+/// Stop a row only while it still owns the inspected dead process incarnation.
+pub(crate) fn stop_instance_if_pid_identity(
+    db: &HcomDb,
+    instance_name: &str,
+    initiated_by: &str,
+    reason: &str,
+    pid: u32,
+    pid_identity: &str,
+) -> StopOutcome {
+    stop_instance_inner(
+        db,
+        instance_name,
+        initiated_by,
+        reason,
+        false,
+        0,
+        Some((pid, pid_identity)),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1108,7 +1128,7 @@ pub(crate) fn stop_placeholder_instance(
     initiated_by: &str,
     reason: &str,
 ) -> StopOutcome {
-    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0)
+    stop_instance_inner(db, instance_name, initiated_by, reason, true, 0, None)
 }
 
 /// Max recursion depth for subagent cleanup. Prevents stack overflow if DB
@@ -1133,6 +1153,7 @@ fn stop_instance_inner(
     reason: &str,
     placeholder: bool,
     depth: u32,
+    pid_guard: Option<(u32, &str)>,
 ) -> StopOutcome {
     if depth >= MAX_STOP_DEPTH {
         log::log_warn(
@@ -1158,10 +1179,27 @@ fn stop_instance_inner(
         }
     };
 
+    if let Some((expected_pid, expected_identity)) = pid_guard {
+        if instance_data.pid != Some(expected_pid as i64) {
+            return StopOutcome::AlreadyStopped;
+        }
+        match db.get_instance_pid_identity(instance_name) {
+            Ok(Some(identity)) if identity == expected_identity => {}
+            Ok(_) => return StopOutcome::AlreadyStopped,
+            Err(e) => {
+                return StopOutcome::RetryableError(format!(
+                    "could not verify process identity for {instance_name}: {e}"
+                ));
+            }
+        }
+    }
+
     // Kill headless processes (background=true)
     let pid = instance_data.pid;
     let is_headless = instance_data.background != 0;
-    if let Some(pid_val) = pid {
+    if pid_guard.is_none()
+        && let Some(pid_val) = pid
+    {
         let pid_u32 = pid_val as u32;
         if is_headless {
             // Graceful-then-forceful group kill: terminate_group (Unix: SIGTERM;
@@ -1321,6 +1359,7 @@ fn stop_instance_inner(
             "parent_stopped",
             false,
             depth + 1,
+            None,
         ) {
             log::log_warn(
                 "hooks",
@@ -1337,9 +1376,15 @@ fn stop_instance_inner(
     // as parent_session_id, so only parent_name links nested children. A row
     // already stopped via the session set is a no-op here.
     for child in native_children {
-        if let StopOutcome::RetryableError(error) =
-            stop_instance_inner(db, &child, initiated_by, "parent_stopped", false, depth + 1)
-        {
+        if let StopOutcome::RetryableError(error) = stop_instance_inner(
+            db,
+            &child,
+            initiated_by,
+            "parent_stopped",
+            false,
+            depth + 1,
+            None,
+        ) {
             log::log_warn(
                 "hooks",
                 "finalize.child_stop_incomplete",
@@ -1361,13 +1406,26 @@ fn stop_instance_inner(
     if placeholder {
         event_data["placeholder"] = serde_json::json!(true);
     }
-    match db.finalize_instance_stop(
-        instance_name,
-        instance_data.created_at,
-        instance_data.session_id.as_deref(),
-        instance_data.agent_id.as_deref(),
-        &event_data,
-    ) {
+    let finalize_result = if let Some((expected_pid, expected_identity)) = pid_guard {
+        db.finalize_instance_stop_if_pid_identity(
+            instance_name,
+            instance_data.created_at,
+            instance_data.session_id.as_deref(),
+            instance_data.agent_id.as_deref(),
+            expected_pid,
+            expected_identity,
+            &event_data,
+        )
+    } else {
+        db.finalize_instance_stop(
+            instance_name,
+            instance_data.created_at,
+            instance_data.session_id.as_deref(),
+            instance_data.agent_id.as_deref(),
+            &event_data,
+        )
+    };
+    match finalize_result {
         Ok(true) => {}
         Ok(false) => return StopOutcome::AlreadyStopped,
         Err(e) => {

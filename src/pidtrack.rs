@@ -479,15 +479,13 @@ fn attach_runtime_state(
             ),
         );
     }
-    db.update_instance_fields(instance_name, &updates)
+    db.update_instance_pid_with_fields(instance_name, orphan.pid, &updates)
         .map_err(|e| {
             format!(
                 "failed to attach runtime state to '{}': {}",
                 instance_name, e
             )
         })?;
-    db.update_instance_pid(instance_name, orphan.pid)
-        .map_err(|e| format!("failed to attach pid to '{}': {}", instance_name, e))?;
     Ok(())
 }
 

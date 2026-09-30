@@ -279,7 +279,8 @@ fn start_from_orphan(
     };
 
     // Core DB registration
-    let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+    pidtrack::recover_single_orphan_to_db(db, orphan, &name)
+        .map_err(|e| anyhow::anyhow!("Failed to recover orphan PID {pid}: {e}"))?;
 
     db.log_event(
         "life",

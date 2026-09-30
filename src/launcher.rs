@@ -1395,12 +1395,12 @@ fn finalize_background_launch(
         &effective_preset,
         Some(ctx.process_id),
     );
-    instances::update_instance_position(
-        ctx.db,
-        ctx.instance_name,
-        &serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]),
-    );
-    if let Err(e) = ctx.db.update_instance_pid(ctx.instance_name, pid) {
+    let updates =
+        serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]);
+    if let Err(e) = ctx
+        .db
+        .update_instance_pid_with_fields(ctx.instance_name, pid, &updates)
+    {
         crate::log::log_error(
             "launcher",
             "background.persist_pid",
